@@ -1,3 +1,6 @@
+// 先加载 .env（若存在），使 `npm run migrate` 能读到只写在 .env 里的 DATABASE_URL。
+// drizzle-kit CLI 进程不走 src/config/env，故此处独立加载；CI 无 .env 时 no-op，用注入的 env。
+import 'dotenv/config';
 import { defineConfig } from 'drizzle-kit';
 
 /**

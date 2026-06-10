@@ -1,3 +1,7 @@
+// 先加载 .env（若存在）到 process.env，再做下方校验。
+// dotenv 默认不覆盖已存在的 process.env，故 CI / shell 注入的变量仍优先，
+// 本地 `cp .env.example .env` 填好后 `npm run dev` 等脚本即可读到（修复 README 快速开始）。
+import 'dotenv/config';
 import { z } from 'zod';
 
 /**
