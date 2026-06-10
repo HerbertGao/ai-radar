@@ -1,0 +1,89 @@
+schema: spec-driven
+
+# 项目上下文：在创建工件（提案/规格/任务）时向 AI 显示，作为单一事实来源（SOT）。
+context: |
+  项目名称：ai-radar
+  定位：AI 行业情报流水线 + AI 工具选型顾问（不是单纯的“新闻聚合 Agent”）。
+  完整需求与设计来源：仓库根目录 QA.md。
+  权威性约定：QA.md 对【需求、定位、架构原则、数据模型、不变量】权威，冲突以 QA.md 为准；
+  但【技术栈语言/框架选型】以本文件为准——经评估后从 QA.md 的 Python 默认改为 TypeScript（理由见下方“技术栈决策记录”）。
+
+  ## 核心目标
+  - 聚合国内外 AI 新闻、技术动态、产品、开源项目、论文与工具更新。
+  - 跨来源去重 + 当天不重复推送（飞书 / Telegram）。
+  - 中文摘要与价值判断，精选内容沉淀进知识库支持历史查询。
+  - 未来扩展为“AI 工具选型顾问”，回答“做某某工作用哪个 AI 工具更合适”。
+
+  ## 第一架构原则（不可违背）
+  确定性工作流 + 数据库状态 + Agent 语义判断 + RAG 证据检索。
+  - 不做“全 Agent 自治流”。去重、推送状态、幂等、唯一约束由程序和数据库保障，不交给 LLM。
+  - 职责边界：
+    - Workflow 控制流程
+    - Database 控制事实和状态（事实以 DB 为准，唯一索引决定是否重复）
+    - Agent 控制语义判断（分类 / 摘要 / 价值评分 / 推荐解释）
+    - RAG 控制证据检索
+    - MCP 控制外部访问（查询和人工干预入口，不参与主流程调度）
+    - Push Dispatcher 控制推送幂等
+  - 所有 Agent 输出必须是结构化 JSON 并做 schema 校验。
+  - 所有外部 API 调用必须有重试和错误日志。
+
+  ## 技术栈（定稿，TypeScript）
+  - 语言/运行时：TypeScript + Node.js
+  - API：Hono（轻量、类型友好；如需更成熟的插件生态可选 Fastify）
+  - 数据库：PostgreSQL + pgvector；ORM 用 Drizzle（SQL-first，原生支持 ON CONFLICT 与 pgvector）
+  - 迁移：Drizzle Kit（drizzle-kit migrate）
+  - LLM / 结构化输出：Vercel AI SDK（generateObject / embed / embedMany）+ Zod（schema 即类型即校验）
+  - 编排/调度/队列：BullMQ（Redis 支撑，自带重试与幂等任务）；不使用 LangGraph（理由见决策记录）
+  - 知识库：短新闻/产品卡片用 Dify 或自建 pgvector；长文档/报告/PDF 用 RAGFlow——均以 HTTP API 消费，作为可替换黑盒
+  - Telegram：grammY（现代、强类型）
+  - 飞书：原生 fetch + 签名 Webhook
+  - 查询入口：MCP Server（@modelcontextprotocol/sdk，官方 TS-first）
+  - 本地 ML 逃生舱：若未来需要本地 embedding / rerank 模型，单独起 Python sidecar 微服务，主应用通过 HTTP 调用（不改变主应用语言）
+
+  ## 技术栈决策记录（为什么用 TS 而非 QA.md 的 Python）
+  - 主负载是 I/O 编排（HTTP 采集、DB 约束、幂等推送），不是 ML 计算；两种语言都胜任，故按其他因素决策。
+  - 决定性因素：本项目大量由 AI（VibeCoding）生成代码、不逐行 review。TS 静态类型在编译期拦截 AI 高频错误
+    （字段名/数据 shape/null/LLM 返回结构不符），是免费的正确性防线；Python 类型 opt-in，错误多在运行时暴露。
+  - 项目硬要求“所有 Agent 输出必须结构化 JSON 并校验”：Zod + AI SDK generateObject 是当前 DX 最佳实现，正中命门。
+  - 不用 LangGraph：本流水线是线性的，Agent 部分均为单次结构化 LLM 调用，无复杂图编排；LangGraph 属过度设计，
+    且其 API 迭代快、AI 易生成过时代码，对 VibeCoding 是负担。改用 BullMQ + 显式工作流函数。
+  - Dify/RAGFlow 不构成 Python 锁定：通过 HTTP API 消费（docker-compose 起服务 + 调接口），主应用语言无关。
+    评估“未来 fork/魔改 Dify/RAGFlow 内核”的概率为低（全生命周期约 10–15%）——设计已把它们置于 interface 后当可替换黑盒，
+    高价值逻辑（产品库/任务模式库/召回规则/评分）都在自有 PostgreSQL + 应用代码里。需求增长时的出口是“替换为自建 pgvector
+    或小解析服务 / 旁挂 sidecar”，而非改其内核。因此 Dify/RAGFlow 是 Python 这一点不应被用来推翻主应用的 TS 选型。
+  - Web 控制台（人工干预面板）非第一期必要；一旦要做，TS 可前后端同语言并复用 Zod schema。
+
+  ## 流水线
+  Scheduler → Collectors → Normalizer → Dedup → Value Judge Agent →
+  Chinese Digest Agent → Push Dispatcher（飞书/Telegram）→ KB Ingestion → MCP/API/Chat Query
+
+  ## 关键不变量（实现与评审必须守住）
+  - 推送幂等：UNIQUE(target_type, target_id, channel, push_date)；先写 push_records=pending，
+    唯一键冲突即跳过，成功后置 success，失败置 failed 保留错误信息可重试。
+  - 分层去重：硬去重(source+guid / canonical_url / github_repo / product_hunt_slug / canonical_domain)
+    → 标题归一化(title_hash) → embedding 相似度 → LLM 判断 → DB 唯一约束兜底。
+  - URL 规范化必须移除 utm/ref/gclid/fbclid/spm 等追踪参数生成 canonical_url。
+  - 知识库不是垃圾桶：只入精选（long_term_value >= 70），不入每条 RSS 原文/转载/营销稿/标题党。
+  - 推荐逻辑：规则筛选负责“不离谱”、RAG 负责“有依据”、LLM 负责“讲明白”、DB 负责“事实和状态”；
+    不让 LLM 直接拍脑袋推荐工具。
+
+  ## 数据模型（详见 QA.md §8）
+  raw_items, ai_news_events, ai_products, item_event_relations, item_product_relations,
+  push_records, kb_ingestion_records, ai_tools, task_patterns
+
+  ## 实施路线
+  阶段一 MVP（跑通信息流）→ 阶段二 抽核心服务（去重/评分/产品合并/推送幂等）→
+  阶段三 AI 工具选型顾问（产品库 + 任务模式库 + 评分 + 推荐 + MCP）
+
+  ## 约定
+  - GitHub CLI 一律用 `\gh`（反斜杠前缀）。
+  - 中文为主要书写语言。
+
+# 每个工件的规则（可选）：为特定工件添加自定义规则。
+rules:
+  proposal:
+    - 必须对齐 QA.md 的定位与第一架构原则；冲突以 QA.md 为准。
+    - 始终包含"非目标"部分，明确不把确定性状态交给 LLM。
+  tasks:
+    - 将任务分解为最多 2 小时的块。
+    - 涉及去重/推送的任务必须显式覆盖幂等与唯一约束验证。

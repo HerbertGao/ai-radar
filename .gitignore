@@ -1,0 +1,30 @@
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Test / coverage
+coverage/
+.vitest/
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp
+
+# Claude Code local-only settings
+.claude/settings.local.json
+.claude/**/settings.local.json

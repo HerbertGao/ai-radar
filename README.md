@@ -1,0 +1,220 @@
+# ai-radar
+
+> **AI 行业情报流水线 + AI 工具选型顾问**
+>
+> 一个可长期运行的系统：聚合国内外 AI 新闻 / 产品 / 开源项目 / 论文 / 工具更新 → 跨来源去重 → 价值判断 → 中文摘要 → 飞书 / Telegram 推送 → 知识库沉淀 → MCP 查询与工具选型问答。
+
+完整需求与设计文档见 [`QA.md`](./QA.md)（权威来源，任何冲突以它为准）。
+
+---
+
+## 这是什么 / 不是什么
+
+- **是**：确定性流水线 + 数据库状态 + Agent 语义判断 + RAG 证据检索。
+- **不是**：一条“全 Agent 自治流”，也不是单纯的新闻聚合工具。
+
+去重、推送状态、幂等与唯一约束由**程序和数据库**保障；LLM 只负责分类、摘要、价值评分、推荐解释。
+
+## 架构
+
+```text
+Scheduler / Workflow Engine
+  ↓
+Collectors (RSS / GitHub / Product Hunt / Hacker News / Reddit / arXiv / Hugging Face / Official Blog)
+  ↓
+Normalizer  →  Dedup Service  →  Value Judge Agent  →  Chinese Digest Agent
+  ↓
+Push Dispatcher (飞书 Bot / Telegram Bot)
+  ↓
+Knowledge Base Ingestion  →  MCP / API / Chat Query
+```
+
+职责边界：
+
+| 组件 | 职责 |
+|---|---|
+| Workflow | 控制流程 |
+| Database | 控制事实和状态（唯一索引决定是否重复） |
+| Agent | 控制语义判断（分类 / 摘要 / 评分 / 推荐解释） |
+| RAG | 控制证据检索 |
+| MCP | 控制外部访问（查询与人工干预入口，不参与主流程调度） |
+| Push Dispatcher | 控制推送幂等 |
+
+## 工作流程图
+
+> 颜色区分职责：🟦 确定性程序 · 🟨 Agent（LLM）· 🟩 数据库/知识库 · 🟥 幂等/去重闸门。
+
+### 每日运行：采集 → 去重 → 判断 → 摘要 → 推送
+
+```mermaid
+flowchart TD
+    CRON([BullMQ 定时/实时触发]):::prog --> COL
+
+    subgraph COL[Collectors · 确定性程序]
+      RSS[RSS]:::prog
+      GH[GitHub]:::prog
+      HN[Hacker News]:::prog
+      MORE[Product Hunt / Reddit / arXiv / HF / 官方Blog]:::prog
+    end
+
+    COL --> RAW[(raw_items)]:::db
+    RAW --> NORM["Normalizer<br/>URL/标题清洗 · canonical_url · title_hash"]:::prog
+    NORM --> DH{"硬去重<br/>唯一键命中?"}:::gate
+    DH -- 命中 --> DROP[跳过 · 标记重复]:::prog
+    DH -- 未命中 --> EMB{"embedding 相似度"}:::gate
+    EMB -- "cos≥0.88 疑似重复" --> MERGE["事件/产品合并"]:::prog
+    EMB -- "0.82~0.88 待定" --> LLMD["LLM 去重判断"]:::agent
+    EMB -- "低于阈值" --> NEW[新事件/新产品]:::prog
+    LLMD --> MERGE
+    LLMD --> NEW
+
+    NEW --> JUDGE
+    MERGE --> JUDGE["Value Judge Agent<br/>是否AI相关 · 分类 · 评分 · should_push"]:::agent
+    JUDGE -- "should_push=true" --> DIGEST["Chinese Digest Agent<br/>中文标题/摘要/适合谁/风险"]:::agent
+    JUDGE -. "long_term_value≥70" .-> KBING
+
+    DIGEST --> GATE{"push_records 幂等闸<br/>UNIQUE 命中?"}:::gate
+    GATE -- 冲突 --> SKIP[跳过推送]:::prog
+    GATE -- "写入 pending" --> DISP[Push Dispatcher]:::prog
+    DISP --> TG[Telegram]:::prog
+    DISP --> FS[飞书]:::prog
+    DISP --> RES["成功置 success<br/>失败置 failed（可重试）"]:::db
+
+    KBING["KB Ingestion<br/>只入精选"]:::prog --> KB[("知识库<br/>Dify / RAGFlow / pgvector")]:::db
+
+    classDef prog fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
+    classDef agent fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+    classDef db fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef gate fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;
+```
+
+### 查询与选型：用户主动发起（不参与上面的调度主流程）
+
+```mermaid
+flowchart LR
+    USER([用户 · Claude/Cursor/ChatGPT]):::prog --> MCP[MCP Server]:::prog
+    MCP --> Q1[get_today_ai_digest]:::prog
+    MCP --> Q2[search_ai_events / products]:::prog
+    MCP --> Q3[recommend_ai_tools_for_task]:::prog
+    Q1 --> DB[(PostgreSQL)]:::db
+    Q2 --> DB
+    Q3 --> RECO["推荐引擎<br/>规则召回 → RAG 证据 → LLM 解释"]:::agent
+    RECO --> DB
+    RECO --> KB[(知识库)]:::db
+    RECO --> OUT["首选 / 备选 / 不推荐 / 落地步骤"]:::prog
+
+    classDef prog fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
+    classDef agent fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+    classDef db fill:#dcfce7,stroke:#16a34a,color:#14532d;
+```
+
+读图要点：**事实只存数据库**（🟩），去重与推送是否重复由**唯一键闸门**（🟥）裁决，LLM（🟨）只做语义判断不碰状态——这正是"确定性流程 + DB 控状态 + Agent 控语义"原则的可视化。
+
+## 技术栈
+
+> **采用 TypeScript**（经评估后从 `QA.md` 的 Python 默认改选,理由见 [技术栈决策](#技术栈决策为什么用-typescript-而非-qamd-的-python)）。
+
+| 层 | 选型 | 说明 |
+|---|---|---|
+| 语言 / 运行时 | **TypeScript + Node.js** | 静态类型为 AI 生成代码兜底 |
+| API | **Hono**(或 Fastify) | 轻量、类型友好;Fastify 插件生态更成熟 |
+| 数据库 / ORM | **PostgreSQL + pgvector + Drizzle** | SQL-first,原生支持 `ON CONFLICT` 与 pgvector |
+| 迁移 | **Drizzle Kit** | `drizzle-kit migrate` |
+| LLM / 结构化输出 | **Vercel AI SDK + Zod** | `generateObject` / `embed`,schema 即类型即校验,多 provider |
+| 编排 / 调度 / 队列 | **BullMQ**(Redis) | 自带重试与幂等任务;**不用 LangGraph** |
+| Telegram | **grammY** | 现代、强类型 |
+| 飞书 | 原生 fetch + 签名 Webhook | — |
+| 知识库 | Dify / RAGFlow（HTTP API） | 当可替换黑盒消费 |
+| 查询入口 | **MCP Server**(@modelcontextprotocol/sdk) | 官方 TS-first |
+| 本地 ML 逃生舱 | Python sidecar(按需) | 仅当未来需本地 embedding/rerank 模型时,经 HTTP 旁挂 |
+
+## 技术栈决策：为什么用 TypeScript 而非 QA.md 的 Python
+
+`QA.md` 默认推荐 Python,但经评估后本项目主应用选 **TypeScript**:
+
+- **主负载是 I/O 编排**(HTTP 采集、DB 约束、幂等推送),不是 ML 计算,两种语言都胜任。
+- **决定性因素 — VibeCoding**:大量代码由 AI 生成且不逐行 review,TS 静态类型在**编译期**拦截 AI 高频错误(字段名 / 数据 shape / null / LLM 返回结构不符),是一道免费的正确性防线;Python 类型 opt-in,错误多在运行时才暴露。
+- **正中硬要求**:项目反复要求"所有 Agent 输出必须结构化 JSON 并校验",**Zod + AI SDK `generateObject`** 是当前 DX 最佳实现。
+- **不用 LangGraph**:流水线是线性的,Agent 部分都是单次结构化调用,LangGraph 属过度设计且迭代快(AI 易生成过时代码),改用 BullMQ + 显式工作流函数。
+- **Dify/RAGFlow 不构成 Python 锁定**:通过 HTTP API 消费,主应用语言无关。评估未来 fork/魔改其内核的概率为**低(约 10–15%)**——它们被设计成 interface 后的可替换黑盒,高价值逻辑都在自有 PostgreSQL + 应用代码里;需求增长的出口是"替换为自建 pgvector / 旁挂 sidecar",而非改其内核。
+- **Web 控制台**非第一期必要;一旦要做,TS 可前后端同语言并复用 Zod schema。
+
+## 关键不变量
+
+实现与评审必须守住这些约束（详见 `QA.md` §9 / §12）：
+
+- **推送幂等**：`UNIQUE(target_type, target_id, channel, push_date)`。先写 `push_records=pending`，唯一键冲突即跳过，成功置 `success`，失败置 `failed` 保留错误信息可重试。
+- **分层去重**：硬去重(`source+guid` / `canonical_url` / `github_repo` / `product_hunt_slug` / `canonical_domain`) → 标题归一化(`title_hash`) → embedding 相似度 → LLM 判断 → DB 唯一约束兜底。
+- **URL 规范化**：移除 `utm/ref/gclid/fbclid/spm` 等追踪参数生成 `canonical_url`。
+- **知识库不是垃圾桶**：只入精选（`long_term_value >= 70`），不入每条 RSS 原文 / 转载 / 营销稿 / 标题党。
+- **推荐逻辑**：规则筛选负责“不离谱”、RAG 负责“有依据”、LLM 负责“讲明白”、DB 负责“事实和状态”。不让 LLM 直接拍脑袋推荐工具。
+
+## 数据模型
+
+核心表（DDL 见 `QA.md` §8）：`raw_items`、`ai_news_events`、`ai_products`、`item_event_relations`、`item_product_relations`、`push_records`、`kb_ingestion_records`、`ai_tools`、`task_patterns`。
+
+## 实施路线 / 排期
+
+完整排期计划表、各期范围、退出标准与风险见 [`ROADMAP.md`](./ROADMAP.md)。概览：
+
+| 期 | 里程碑 | 上线后能用什么 |
+|---|---|---|
+| **P0** | 地基 | 脚手架 + 核心表 + 一次跑通的 Zod 校验 LLM 调用 |
+| **P1** | 最小情报流（**首个真上线**） | 每日去重 + 中文 + 评分的 Telegram 日报，当天不重复 |
+| **P2** | 扩源 + 双通道 + 产品发现 | 多源、飞书也通、每日 AI 产品发现、实时告警、周报 |
+| **P3** | 语义去重 + 知识库 | 跨源/跨语言同事件合并、精选可检索 |
+| **P4** | MCP 查询入口 | 在 Claude/Cursor 里查情报、人工干预（与 P3 并行） |
+| **P5** | AI 工具选型顾问 | "做某事用哪个工具" 的首选/备选/不推荐/落地步骤 |
+| P6 | Web 控制台（可选，延后） | 人工干预面板 |
+
+> 关键路径约 13–17 周；首个可用版本约第 4 周末。MVP 任务拆解与测试用例见 `QA.md` §17 / §18。
+
+## 建议目录结构
+
+> QA.md §16 的目录是 Python 版;下面是对齐 TS 技术栈后的等价结构。
+
+```text
+ai-radar/
+  src/
+    app/          # server.ts (Hono), config.ts
+    db/           # client.ts, schema.ts (Drizzle), migrations/
+    collectors/   # rss / github / producthunt / hackernews / reddit / arxiv / huggingface / officialBlog
+    services/     # normalize / dedup / embeddings / eventMerge / productMerge / scoring / push / kbIngestion / recommendation
+    agents/       # valueJudge / digestZh / productClassifier / toolRecommender  (AI SDK + Zod)
+    channels/     # telegram (grammY) / feishu
+    workflows/    # dailyDigest / realtimeAlert / weeklyReport / ingestKb  (BullMQ jobs)
+    mcp/          # server.ts, tools.ts
+    schemas/      # zod schemas（Agent 输出 / DTO）
+    prompts/      # 提示词
+  drizzle.config.ts
+  tests/          # dedup / pushIdempotency / productMerge / recommendation  (Vitest)
+  docker-compose.yml
+  .env.example
+```
+
+## 环境变量
+
+参考 `QA.md` §19，落地时提供 `.env.example`：
+
+```env
+DATABASE_URL=postgresql://user:password@localhost:5432/ai_radar
+REDIS_URL=redis://localhost:6379/0
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+DEEPSEEK_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+FEISHU_WEBHOOK_URL=
+FEISHU_SECRET=
+DIFY_API_BASE=
+DIFY_API_KEY=
+DIFY_DATASET_ID=
+ENABLE_PGVECTOR=true
+DEFAULT_TIMEZONE=Asia/Shanghai
+```
+
+## 开发约定
+
+本项目采用 **OpenSpec（spec-driven）** 工作流。项目上下文与不变量沉淀在 [`openspec/config.yaml`](./openspec/config.yaml)，需求权威文档为 [`QA.md`](./QA.md)。AI 协作约定见 [`CLAUDE.md`](./CLAUDE.md)。
+
+> 当前仓库处于设计 / 提案阶段，尚未包含运行代码。
