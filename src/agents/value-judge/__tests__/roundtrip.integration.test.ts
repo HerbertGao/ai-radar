@@ -16,9 +16,11 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 
-// 动态 import 的 index/persistence/db 会触发 env.ts 全量校验（含 LLM_*）；本套件 mock LLM，
-// 注入 LLM 占位，使「只设 DATABASE_URL、未设真实 LLM key」时套件能干净运行，
-// 而非在 import 期因 env 校验失败而报错（mock 路径不发起真实 LLM 调用）。
+// 动态 import 的 index/persistence/db 会触发 env.ts **全量**校验（DATABASE_URL/REDIS_URL/LLM_*）；
+// 本套件只 gate 在 DATABASE_URL（真实 DB），不使用 redis、mock LLM。为「设了 DATABASE_URL
+// 但未设 REDIS_URL / LLM key」时套件仍能干净运行（而非 import 期因 env 校验失败误红），
+// 给本套件不依赖的 REDIS_URL 与 LLM 注入占位（仅过校验，运行路径绝不真用 redis / 真调 LLM）。
+process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.LLM_API_KEY ||= 'integration-placeholder';
 process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
