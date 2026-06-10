@@ -34,7 +34,7 @@
 - [x] 5.3 实现校验失败处理：记录错误日志 + 有限重试，仍失败则降级（不写库），**禁止静默吞掉**
 - [x] 5.4 实现 seed 一条假 `raw_item` 入库，跑 Value Judge，**按字段名映射**（`importance`→`importance_score` / `novelty`→`novelty_score` / `developer_relevance`→`developer_relevance_score` / `hype_risk`→`hype_risk_score` / `should_push` 同名）写入 `ai_news_events`，再读回校验各 `*_score` 列与 Agent 输出对应字段一致（完整往返）
 - [x] 5.5 vitest（mock LLM，不依赖真实 key）：覆盖 schema 校验通过路径 + 字段名映射正确 + 校验失败时不写入 `ai_news_events`；读回比对按**数值相等**（`ai_news_events.*_score` 为 `NUMERIC(5,2)`，driver 可能返回 `82.00`/字符串，禁用字面严格相等以免假阴性）
-- [ ] 5.6 在带真实 LLM 密钥的环境手动跑通一次真实往返，**留可审计证据**：将落库的 `ai_news_events` 行 dump（或结构化日志）作为 artifact 附 PR，而非仅自由文本描述
+- [x] 5.6 在带真实 LLM 密钥的环境手动跑通一次真实往返，**留可审计证据**：将落库的 `ai_news_events` 行 dump（或结构化日志）作为 artifact 附 PR，而非仅自由文本描述
 
 ## 6. CI 与依赖自动更新
 
