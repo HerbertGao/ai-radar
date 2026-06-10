@@ -42,7 +42,7 @@
 - [x] 6.2 在 CI 加 postgres service（pgvector 镜像）并跑 `drizzle-kit migrate` smoke 验证可落表
 - [x] 6.3 在 CI 跑 vitest（本期占位/已有用例）；任一步失败 CI 必须红灯
 - [x] 6.4 编写 `.github/dependabot.yml`，覆盖 `npm` 与 `github-actions` 两个 ecosystem
-- [ ] 6.5 推一个分支触发 Actions，确认全绿；确认 Dependabot 已激活
+- [x] 6.5 推一个分支触发 Actions，确认全绿；确认 Dependabot 已激活
 
 ## 7. 收尾与退出标准核对
 
