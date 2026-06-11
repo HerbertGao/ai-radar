@@ -24,7 +24,7 @@ const shutdown = (signal: string): void => {
   console.error(`[web] 收到 ${signal}，关闭 HTTP server…`);
   // close() 停止接收新连接、在途请求处理完后回调退出。但 http.Server.close() **不会**
   // 主动断开空闲 keep-alive 连接（监控/反代常驻探活会保活），否则回调永不触发 → 卡到
-  // SIGKILL。故显式断空闲连接（Node 18.2+），并加超时兜底确保最终退出（须 < stop_grace_period）。
+  // SIGKILL。故显式断空闲连接（Node 18.2+），并加超时兜底确保最终退出（8s < 容器 grace：web 15s）。
   server.close(() => process.exit(0));
   if ('closeIdleConnections' in server) {
     server.closeIdleConnections();

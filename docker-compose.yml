@@ -109,6 +109,8 @@ services:
     command: ["npm", "start"]
     # 同 worker：tini 作 PID1 回收僵尸 + 可靠转发 SIGTERM，使 HTTP server 优雅退出。
     init: true
+    # 显式给 15s（> index.ts 的 8s 兜底超时，留清晰余量；web 只 drain 短 HTTP 请求，无需 90s）。
+    stop_grace_period: 15s
     ports:
       - "${APP_PORT:-3000}:3000"
     depends_on:
