@@ -89,9 +89,10 @@ services:
     # 可靠送达 worker-main.ts 的 SIGTERM 处理器，使 BullMQ worker/queue close、Redis quit 等
     # 优雅关闭真正执行（否则 npm 作 PID1 下信号转发不稳，可能被 SIGKILL 截断）。
     init: true
-    # 给优雅关闭留足时间：docker stop 默认 10s grace 对含 LLM 调用的在途 job 可能不够，
-    # 超时会被 SIGKILL 截断（数据层由推送幂等 + BullMQ 重试/claim 回收兜底，但仍尽量优雅退出）。
-    stop_grace_period: 30s
+    # docker stop 默认 10s grace 对含 LLM 调用的在途 job 不够（LLM_TIMEOUT_MS 默认 60s）。
+    # 给 90s 以覆盖单次 LLM 往返 + 收尾；更长的整链 job 若仍超时被 SIGKILL，由推送幂等 +
+    # BullMQ 重试/claim 回收兜底（数据不破），故 90s 是「尽量优雅」而非「保证排空」。
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
