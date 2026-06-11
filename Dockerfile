@@ -31,6 +31,6 @@ COPY . .
 # 非 root 运行（node:alpine 自带 node 用户；源码与 node_modules 对其只读，运行期不写文件）。
 USER node
 
-# 默认常驻 worker（4 条调度链；周报默认 WEEKLY_REPORT_ENABLED=false）。
-# compose 的 migrate / web 服务用 command 覆盖。
+# 默认常驻 worker（注册 4 条调度链，周报默认禁用 WEEKLY_REPORT_ENABLED=false → 实际 3 条生效）。
+# compose 的 migrate / web 服务用 command 覆盖；常驻服务在 compose 用 init:true 兜住信号转发。
 CMD ["npm", "run", "worker"]

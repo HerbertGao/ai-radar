@@ -85,6 +85,10 @@ services:
     <<: *app
     profiles: ["app"]
     command: ["npm", "run", "worker"]
+    # init=true 让 tini 作 PID1：回收僵尸进程，并把 docker stop 的 SIGTERM 经 tini→npm→node
+    # 可靠送达 worker-main.ts 的 SIGTERM 处理器，使 BullMQ worker/queue close、Redis quit 等
+    # 优雅关闭真正执行（否则 npm 作 PID1 下信号转发不稳，可能被 SIGKILL 截断）。
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -99,6 +103,8 @@ services:
     <<: *app
     profiles: ["app"]
     command: ["npm", "start"]
+    # 同 worker：tini 作 PID1 回收僵尸 + 可靠转发 SIGTERM，使 HTTP server 优雅退出。
+    init: true
     ports:
       - "${APP_PORT:-3000}:3000"
     depends_on:
