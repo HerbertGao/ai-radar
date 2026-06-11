@@ -107,19 +107,28 @@ export function buildDigestMessage(events: readonly SelectedEvent[]): {
     );
   }
 
+  // 截断脚注「…另有 N 条未展示」。N 最多为全部条数，按最坏长度预留空间，
+  // 保证一旦触发截断、追加脚注后**仍不超** MAX_MESSAGE_LENGTH（脚注本身也必须可发送，
+  // 否则恰在 spec 依赖的截断兜底路径上发送失败）。
+  const footerFor = (remaining: number): string =>
+    `\n\n${escapeMarkdownV2(`…另有 ${remaining} 条未展示`)}`;
+  const footerReserve = footerFor(blocks.length).length;
+
   // 按事件块逐个累加，超出上限即停止并标注剩余条数（不切半条，保证可发送）。
   let text = header;
   let included = 0;
   const includedIds: string[] = [];
   for (let i = 0; i < blocks.length; i += 1) {
     const next = `${text}\n\n${blocks[i]!}`;
-    if (next.length > MAX_MESSAGE_LENGTH) break;
+    // 非末块时预留脚注空间：本块之后还有剩余块，可能要追加截断脚注。
+    const reserve = i < blocks.length - 1 ? footerReserve : 0;
+    if (next.length + reserve > MAX_MESSAGE_LENGTH) break;
     text = next;
     included += 1;
     includedIds.push(events[i]!.eventId);
   }
   if (included < blocks.length) {
-    text += `\n\n${escapeMarkdownV2(`…另有 ${blocks.length - included} 条未展示`)}`;
+    text += footerFor(blocks.length - included);
   }
 
   return { text, parseMode: 'MarkdownV2', includedIds };

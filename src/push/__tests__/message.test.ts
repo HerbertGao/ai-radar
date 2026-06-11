@@ -49,6 +49,26 @@ describe('buildDigestMessage includedIds', () => {
     expect(includedIds).toEqual(
       events.slice(0, includedIds.length).map((e) => e.eventId),
     );
+    // 追加脚注后整条仍不超上限（脚注本身也必须可发送）。
+    expect(text.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('截断边界：块累加贴近上限时，追加脚注后整条仍 ≤ MAX_MESSAGE_LENGTH', () => {
+    // 构造每块约 ~395 字，使前若干块累加逼近 4000；若脚注未计入预算会刚好越界。
+    // 末尾留大量条数（剩余 N 三位数）使脚注尽量长，放大「脚注溢出」风险。
+    const block = '甲'.repeat(390);
+    const events = Array.from({ length: 200 }, (_, i) =>
+      ev(`e${i}`, {
+        representativeTitle: block,
+        headlineZh: null,
+        summaryZh: null,
+        canonicalUrl: null,
+      }),
+    );
+    const { text, includedIds } = buildDigestMessage(events);
+    expect(text).toContain('未展示');
+    expect(includedIds.length).toBeLessThan(events.length);
+    expect(text.length).toBeLessThanOrEqual(4000);
   });
 });
 

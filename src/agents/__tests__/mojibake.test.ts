@@ -24,6 +24,13 @@ describe('looksLikeMojibake', () => {
     expect(looksLikeMojibake('正常摘要©2024')).toBe(false);
   });
 
+  it('合法重音拉丁字母（café/naïve/résumé 等）不误判（false）', () => {
+    // 这些字母在 U+00C0–U+00FF，不在续字节区 U+0080–U+00BF，不应触发 mojibake。
+    expect(
+      looksLikeMojibake('café résumé naïve über Beyoncé 的模型发布'),
+    ).toBe(false);
+  });
+
   it('空串为 false', () => {
     expect(looksLikeMojibake('')).toBe(false);
   });
