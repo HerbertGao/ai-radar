@@ -38,7 +38,7 @@ DAILY_DIGEST_CRON=3 8 * * *   # 避开整点/半点，防飞书限流
 WEEKLY_REPORT_ENABLED=false   # 周报暂缓打磨，默认禁用
 ```
 
-数据库口令如需自定义，同时设 `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`（compose 会据此拼 `DATABASE_URL`）。
+数据库口令如需自定义，同时设 `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`（compose 会据此拼 `DATABASE_URL`）。**注意**：`POSTGRES_PASSWORD` 会原样插入 `DATABASE_URL` 不做编码，故须 URL 安全（字母数字等）；若密码含 `@ : / % #` 等保留字符，改为设 `AI_RADAR_DATABASE_URL=postgres://用户:已百分号编码的密码@postgres:5432/库` 整串覆盖（主机名仍用服务名 `postgres`）。
 
 ---
 
