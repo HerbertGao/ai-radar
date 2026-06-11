@@ -63,11 +63,15 @@ async function seedEvent(args: {
   return rows[0]!.event_id;
 }
 
-async function markPushedSuccess(eventId: string, pushDate: string) {
+async function markPushedSuccess(
+  eventId: string,
+  pushDate: string,
+  channel = 'telegram',
+) {
   await pool!.query(
     `INSERT INTO push_records (target_type, target_id, channel, push_date, status, pushed_at)
-     VALUES ('event', $1, 'telegram', $2, 'success', now())`,
-    [eventId, pushDate],
+     VALUES ('event', $1, $2, $3, 'success', now())`,
+    [eventId, channel, pushDate],
   );
 }
 
@@ -110,6 +114,26 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     const ids = top.map((e) => e.eventId);
     expect(ids).toContain(fresh);
     expect(ids).not.toContain(pushed);
+  });
+
+  it('telegram 已 success 的事件仍进入 feishu 候选窗口（候选按 channel 分别判定，跨天维度）', async () => {
+    const ev = await seedEvent({ key: 'dual-chan', importance: 95 });
+    // 在 telegram 通道某 push_date 成功推过（跨天「从未 telegram success」不再成立）。
+    await markPushedSuccess(ev, '2099-01-31', 'telegram');
+
+    // telegram 候选：已 success → 不入选。
+    const tg = await selectTopN(
+      { now: NOW, importanceFloor: 60, windowDays: 3, channel: 'telegram' },
+      db!,
+    );
+    expect(tg.map((e) => e.eventId)).not.toContain(ev);
+
+    // feishu 候选：从未以 feishu success → 仍入选（不被 telegram 已推抑制）。
+    const fs = await selectTopN(
+      { now: NOW, importanceFloor: 60, windowDays: 3, channel: 'feishu' },
+      db!,
+    );
+    expect(fs.map((e) => e.eventId)).toContain(ev);
   });
 
   it('should_push=false 与不在近 N 天窗口的事件不入候选', async () => {

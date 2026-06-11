@@ -23,12 +23,13 @@ import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env } from '../config/env.js';
 import { startOfDayInTimeZone } from '../push/push-date.js';
+import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
 
-/** 推送通道（本期仅 telegram 单通道）。 */
-const CHANNEL = 'telegram';
+/** 默认推送通道（向后兼容 P1：事件日报走 telegram）。 */
+const DEFAULT_CHANNEL: Channel = CHANNEL.telegram;
 
 /** 候选/入选事件的最小视图（供 dispatcher 拼消息 + 排序）。 */
 export interface SelectedEvent {
@@ -59,6 +60,13 @@ export interface SelectTopNOptions {
   windowDays?: number;
   /** 覆盖组合分权重（默认 env.RANK_WEIGHT_*）。 */
   weights?: RankWeights;
+  /**
+   * 目标分发通道（默认 `telegram`）。候选窗口「从未以该 channel success」**按目标通道分别判定**
+   * （P2 多通道关键修正）：同一事件可能在 Telegram 已 success（从 Telegram 候选排除）、却在飞书
+   * 从未 success（仍进入飞书候选）。禁止按事件维度跨 channel 合并去重候选——否则一通道已推会
+   * 错误抑制另一通道待发，违反「同事件不同通道独立幂等」。
+   */
+  channel?: Channel;
 }
 
 /** 组合分权重（hype 为减项的非负幅度）。 */
@@ -157,11 +165,13 @@ export function rankAndSelect(
  *   should_push = true
  *   AND first_seen_at >= 今天（上海）往前第 (windowDays−1) 个自然日的 00:00（上海，换算为 UTC）
  *   AND importance_score >= importanceFloor   ← 下限闸
- *   AND NOT EXISTS (push_records success for this event/channel on any push_date)
+ *   AND NOT EXISTS (push_records success for this event on the **target channel** on any push_date)
  *
  * 排序与取前 N 在程序内完成（compareForTopN），保证确定性 tiebreaker。
+ * 候选窗口「从未 success」按目标 channel 分别判定（options.channel，默认 telegram）——同一事件
+ * 可分别进入 telegram 与 feishu 候选。
  *
- * @param options 可注入 now / topN / 阈值 / 权重（默认读 env）。
+ * @param options 可注入 now / topN / 阈值 / 权重 / channel（默认读 env、channel 默认 telegram）。
  * @param dbh     可注入 db 或事务句柄（默认全局 db）。
  */
 export async function selectTopN(
@@ -173,22 +183,24 @@ export async function selectTopN(
   const importanceFloor = options.importanceFloor ?? env.IMPORTANCE_FLOOR;
   const windowDays = options.windowDays ?? env.FIRST_SEEN_WINDOW_DAYS;
   const weights = options.weights ?? defaultWeights();
+  const channel = options.channel ?? DEFAULT_CHANNEL;
 
   // 「今天」与 push_date 同源：windowLowerBound 经 startOfDayInTimeZone 复用 push-date 的
   // Asia/Shanghai 时区源，下界 = 今天往前第 (windowDays−1) 个上海自然日的 00:00（防口径漂移）。
   const lowerBound = windowLowerBound(now, windowDays);
 
-  // 「从未被任何 push_date 以该 channel success 推送过」用相关子查询 NOT EXISTS 表达——
-  // 跨天/跨次不重推（design D5）。注意是「从未 success」而非「今天未 success」。
+  // 「从未被任何 push_date 以**目标 channel** success 推送过」用相关子查询 NOT EXISTS 表达——
+  // 跨天/跨次不重推（design D5）。注意是「从未 success」而非「今天未 success」；且按目标 channel
+  // 限定——同一事件可分别进入 telegram 与 feishu 候选（P2 多通道，禁止跨 channel 合并去重）。
   const neverSuccessfullyPushed = notExists(
     dbh
       .select({ one: sql`1` })
       .from(pushRecords)
       .where(
         and(
-          eq(pushRecords.targetType, 'event'),
+          eq(pushRecords.targetType, TARGET_TYPE.event),
           eq(pushRecords.targetId, aiNewsEvents.eventId),
-          eq(pushRecords.channel, CHANNEL),
+          eq(pushRecords.channel, channel),
           eq(pushRecords.status, 'success'),
         ),
       ),
