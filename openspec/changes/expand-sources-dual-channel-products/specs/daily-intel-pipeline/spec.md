@@ -22,9 +22,9 @@
 
 ### 需求:Top N 组合分选择
 
-系统必须由程序（而非 LLM）从候选事件中选出每日 Top N。候选窗口必须为 `should_push=true AND first_seen_at 在近 N 天 AND 该 event 从未被任何 push_date 以**任一通道** success 推送过`。「从未 success 推送过」而非「今天未 success」——否则常青高分事件会跨天天天上榜重复推送（退出标准②仅约束「同一天不重复」，但产品语义要求一条事件一生只推一次）。
+系统必须由程序（而非 LLM）从候选事件中选出每日 Top N。候选窗口必须为 `should_push=true AND first_seen_at 在近 N 天 AND 该 event 尚未投递给**所有已配置通道**`（success 覆盖的 distinct 已配置通道数 < 配置通道数）。「尚未投递给所有通道」而非「今天未 success」——否则常青高分事件会跨天天天上榜重复推送（退出标准②仅约束「同一天不重复」，但产品语义要求一条事件一生只成功推一次）。
 
-**统一日报模型（Model B）——选题与通道解耦，绝不可违背**：每日只选**一份** channel-agnostic 的 Top N（候选窗口不按 channel 限定，「从未以任一通道 success 推送过」），由编排层把**同一份**名单发放给**所有已配置通道**（通道只负责投递上游统一选好的信息，不参与选题）。各通道的同日幂等由 dispatcher `computePendingSet`（待发集合排除该 channel 今日已 success）+ `UNIQUE(target_type,target_id,channel,push_date)` 兜底；单通道瞬时发送失败由整 job 同日重试兜底。**禁止按通道分别选题**（早期「telegram 的名单泄漏给飞书」是被本模型纠正的反模式）。一旦某事件投递成功（任一通道）即不再跨天重选——日报是「当天尚未投递过的高价值事件」，不跨天纠缠（某通道在该事件投递日全天失败则该通道当日错过，属可接受取舍）。候选窗口判定「近 N 天」所用的「今天」必须与 telegram-push 的 `push_date` 同源（Asia/Shanghai），禁止两处时区口径漂移。
+**统一日报模型（Model B）——选题与通道解耦 + 各通道可靠补发，绝不可违背**：每日只选**一份** channel-blind 的 Top N（按 `rank_score` 统一排序，不按 channel 分别选题），由编排层把**同一份**名单发放给**所有已配置通道**（通道只负责投递上游统一选好的信息，不参与选题）。**各通道可靠投递（不丢消息）**：dispatcher `computePendingSet` 按 **per-channel 跨天**口径过滤——该 channel **从未** success 过的才进该通道待发；故某通道（如飞书）失败时该事件在该 channel 无 success → 跨天/跨次仍在该通道待发 → **可靠补发**，已 success 的通道（如 telegram）则被排除、绝不跨天重发。候选窗口排除「已投递给**所有**已配置通道」者——只要还差任一通道未 success 就留在统一名单（保住 Top N 名额给仍需投递的事件）；一旦所有已配置通道都 success → 移出名单、不再跨天重选。**禁止按通道分别选题**（早期「telegram 的名单泄漏给飞书」与「任一通道成功即踢出致失败通道丢消息」都是被本模型纠正的反模式）。候选窗口判定「近 N 天」所用的「今天」必须与 telegram-push 的 `push_date` 同源（Asia/Shanghai），禁止两处时区口径漂移。
 
 系统必须按组合分 `rank_score = 0.45*importance + 0.25*developer_relevance + 0.20*novelty − 0.10*hype_risk` 排序（权重必须可经 config 配置），取 Top N（N 可配，约 5–10）。排序必须带确定性 tiebreaker（`published_at DESC NULLS LAST, event_id ASC`）以保证 Top N 边界可复现。系统必须设 importance 下限闸（如 `>= 60`）：低于阈值的事件不入选，宁可当日少于 N 条也不凑数。LLM 的 `should_push` 仅作为候选信号，禁止由 LLM 决定最终推送名单与排序。
 
@@ -32,13 +32,17 @@
 - **当** 候选事件多于 N 条
 - **那么** 系统按 `rank_score` 降序并应用确定性 tiebreaker（`published_at DESC NULLS LAST, event_id ASC`）取前 N 条，对同一批已落库事件多次运行结果一致
 
-#### 场景:已投递过的事件不再被重选（channel-agnostic 跨天去重）
-- **当** 某 event 曾在任一 `push_date`、以**任一通道**（telegram 或 feishu）success 推送，今日仍 `should_push=true` 且在近 N 天窗口内
-- **那么** 该 event 不进入今日 Top N（channel-agnostic「从未 success」候选窗口），不会被跨天重复推送
+#### 场景:已投递给所有已配置通道的事件移出统一名单
+- **当** 某 event 已在所有已配置通道（如 telegram + feishu）均 success 推送过，今日仍 `should_push=true` 且在近 N 天窗口内
+- **那么** 该 event 不进入今日 Top N（已全部投递完毕），不会被跨天重复推送
+
+#### 场景:缺任一通道的事件仍在名单、由该通道跨天补发
+- **当** 某 event 已在 telegram success、飞书 success 失败（飞书无 success），已配置通道为 telegram + feishu
+- **那么** 该 event 仍进入统一 Top N（飞书尚缺）；分发时 telegram 的 `computePendingSet` 排除它（telegram 已 success、不重发）、飞书的 `computePendingSet` 纳入它（飞书从未 success、可靠补发），不丢消息
 
 #### 场景:统一一份 Top N 发放给所有已配置通道
 - **当** 当日选出一份 Top N，已配置通道为 telegram + feishu
-- **那么** 同一份 Top N 名单发放给两个通道（选题与通道解耦）；各通道按其 `computePendingSet` + 四元组独立做同日幂等，不因另一通道而改变选题
+- **那么** 同一份 channel-blind Top N 名单发放给两个通道（选题与通道解耦）；各通道按其 per-channel 跨天 `computePendingSet` + 四元组独立投递，不因另一通道而改变选题
 
 #### 场景:下限闸过滤低分事件
 - **当** 某候选事件 `importance` 低于下限阈值

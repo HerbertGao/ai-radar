@@ -36,9 +36,9 @@ Telegram channel 每条事件的消息内容必须为「代表标题 + 一句话
 
 系统必须以 `push_records` 的 `UNIQUE(target_type, target_id, channel, push_date)` 保障同一天同一条事件在**同一通道**不重复推送。推送记录的主键四元组必须为 `target_type='event'`、`target_id=event_id`、`channel=分发通道`（如 `telegram` / `feishu`，由 dispatcher 参数化传入，禁止写死单一通道值）、`push_date`。`push_date` 必须以 Asia/Shanghai 时区计算「今天」，禁止用 UTC 或机器本地时区导致跨零点把一份日报算成两天。同一事件在不同 channel 上各自独立幂等（一通道已推不抑制另一通道）。
 
-待发集合必须显式定义为「今日 Top N 中该 channel 上 `status ∈ {无记录, pending, failed}` 的事件」（即今日 Top N 排除今日该 channel 已 `success` 的），从而 failed 与崩溃残留的僵尸 `pending` 自动纳入重试，已成功的不再重发。待发集合的 success 排除必须按 channel 限定，禁止跨 channel 误排除（否则 Telegram 已推会错误抑制飞书待发）。
+待发集合必须显式定义为「统一名单中该 channel 上 `status ∈ {无记录, pending, failed}` 的事件」（即统一名单排除该 channel **任一 push_date** 已 `success` 的——**per-channel 跨天**口径），从而 failed 与崩溃残留的僵尸 `pending` 自动纳入重试，该通道已成功的不再重发。待发集合的 success 排除必须**按 channel 限定**，禁止跨 channel 误排除（否则 Telegram 已推会错误抑制飞书待发）。
 
-两层「排除 success」分工不同、叠加不矛盾，实现时不可因「看似重复」删掉其一：候选窗口（daily-intel-pipeline，**统一日报模型 Model B：channel-agnostic**）的「从未被任何 push_date 以**任一通道** success」负责**跨天/跨次不重推**（一条事件一生只成功推一次、不分通道——选题与通道解耦）；本待发集合的「今日**该 channel** success 排除」负责**同一 push_date 内**该通道待发集合混有 failed/pending 与 success 时不重发已成功条目（同日 BullMQ 整 job 重试的兜底，仍按 channel 限定）。`failed` 的重试边界：同一 push_date 内由整 job 重试重新纳入待发集合；跨天则该 push_date 的 failed 行被留存但不再发，事件靠候选窗口（仍「从未 success」）以**新的 push_date** 重新入选获得新一次推送机会。推送流程必须为：在事务内为待发集合中无记录者 `INSERT push_records(status='pending') ON CONFLICT DO NOTHING`；将整个待发集合拼成一条消息发送；单条消息原子送达——成功则该批全部置 `success`，失败则该批全部置 `failed` 并保留 `error_message` 供重试。禁止把已 `success` 的事件重新拼入消息。
+两层职责分工不同、叠加不矛盾，实现时不可因「看似重复」删掉其一：候选窗口（daily-intel-pipeline，**统一日报模型 Model B**）的「尚未投递给**所有已配置通道**」负责**统一名单的成员资格**（一份 channel-blind 名单；事件只要还差任一通道未 success 就留在名单，全部投递完毕才移出——保住 Top N 名额给仍需投递者）；本待发集合的「该 channel **任一 push_date** success 排除」负责**per-channel 跨天可靠投递**——该通道从未 success 过的才发，故某通道（如飞书）失败时该事件在该 channel 无 success → 跨天/跨次仍在该通道待发 → **可靠补发不丢**，已 success 的通道（如 telegram）被排除、绝不跨天重发。`failed` 的重试边界：同一 push_date 内由整 job 重试重新纳入待发集合；跨天则该 channel 因仍「从未 success」继续在后续 push_date 的待发集合里重试，直到该通道 success（届时被排除）或事件移出统一名单（所有通道都 success）。推送流程必须为：在事务内为待发集合中无记录者 `INSERT push_records(status='pending') ON CONFLICT DO NOTHING`；将整个待发集合拼成一条消息发送；单条消息原子送达——成功则该批全部置 `success`，失败则该批全部置 `failed` 并保留 `error_message` 供重试。禁止把已 `success` 的事件重新拼入消息。
 
 #### 场景:当天重跑不重复推送
 - **当** 当日日报已在某 channel 成功推送后，推送任务在同一 `push_date`、同一 channel 再次执行

@@ -308,9 +308,19 @@ export async function runDailyWorkflow(
     // 注意：judge 分母 = 0 时 stageShouldAbort 返回 false——**不中止**，直接进 Top N，
     // 已评分的常青事件仍可入选并推送（禁止误判「今日无候选」）。
 
-    // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。
-    const topN = await selectTopN({ now }, dbh);
-    console.error(`[pipeline] Top N: 入选 ${topN.length} 条`);
+    // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。统一日报模型 Model B：选一份 channel-blind
+    // Top N，候选窗口排除「已投递给所有已配置通道」者（还差任一通道就留在名单、由各通道 per-channel
+    // 跨天补发）。故先解析「已配置通道集」传入 selectTopN（同一份 channelSenders 在阶段 6 复用分发）。
+    const channelSenders = resolveChannelSenders(options);
+    const topN = await selectTopN(
+      { now, channels: channelSenders.map((c) => c.channel) },
+      dbh,
+    );
+    console.error(
+      `[pipeline] Top N: 入选 ${topN.length} 条（已配置通道：${channelSenders
+        .map((c) => c.channel)
+        .join(', ')}）`,
+    );
 
     // ── 阶段 5：中文摘要逐条。分母 = Top N。单条降级回退/剔除（G5 内已处理），绝不推半截。
     const canonicalUrls = await loadCanonicalUrls(
@@ -439,11 +449,10 @@ export async function runDailyWorkflow(
       );
     }
 
-    // 向**所有已配置通道并发分发**（daily-intel-pipeline / feishu-push）。
-    // 「已配置通道集」至少含 telegram（必配）；飞书可选（enabled 时加入）。各通道走 dispatcher
-    // 同一套「待发集合→pending→原子送达→success/failed」状态机（仅 channel 参数不同），
-    // 候选/待发集合按 channel 独立判定，同事件不同通道各自独立幂等（dispatcher 已泛化）。
-    const channelSenders = resolveChannelSenders(options);
+    // 向**所有已配置通道并发分发**（daily-intel-pipeline / feishu-push）。channelSenders 已在阶段 4
+    // 解析（与 selectTopN 候选共用同一通道集）。各通道走 dispatcher 同一套「待发集合→pending→原子
+    // 送达→success/failed」状态机（仅 channel 参数不同）；待发集合按 per-channel 跨天「从未 success」
+    // 判定——失败通道跨天可靠补发、成功通道不重发（统一名单 + 各通道可靠投递）。
     console.error(
       `[pipeline] 推送: 待发 ${pushable.length} 条，向 ${channelSenders.length} 个通道并发分发：` +
         channelSenders.map((c) => c.channel).join(', '),

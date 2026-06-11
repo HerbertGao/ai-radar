@@ -26,7 +26,7 @@
  * - **状态机复用**：告警推送复用 dispatcher 同一「待发→pending→原子送达→success/failed」状态机
  *   （含 headline 缺失回退链——告警事件可能尚无中文摘要），仅 target_type/channel 口径不同。
  */
-import { and, eq, gte, isNotNull, notExists, sql } from 'drizzle-orm';
+import { and, gte, isNotNull, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords } from '../db/schema.js';
 import { env, isFeishuEnabled } from '../config/env.js';
@@ -131,19 +131,24 @@ interface AlertCandidate {
 export async function selectAlertCandidates(
   threshold: number,
   dbh: DbLike = defaultDb,
+  channels: readonly Channel[] = [CHANNEL.telegram],
 ): Promise<AlertCandidate[]> {
-  const neverAlerted = notExists(
-    dbh
-      .select({ one: sql`1` })
-      .from(pushRecords)
-      .where(
-        and(
-          eq(pushRecords.targetType, TARGET_TYPE.alert),
-          eq(pushRecords.targetId, aiNewsEvents.eventId),
-          eq(pushRecords.status, 'success'),
-        ),
-      ),
-  );
+  const cfgChannels = channels.length > 0 ? channels : [CHANNEL.telegram];
+  // Model B + 各通道可靠补发：候选 = 「尚未 alert-success 投递给**所有**已配置通道」——已 alert-success
+  // 的 distinct 通道数 < 配置通道数（还差任一通道）。失败通道使事件留在统一名单、由 dispatcher 按
+  // per-channel 跨天补发该通道告警；一旦所有通道都 alert-success → 移出（不再重选、一生一次）。
+  const alertedChannelCount = sql<number>`(
+    select count(distinct ${pushRecords.channel})
+    from ${pushRecords}
+    where ${pushRecords.targetType} = ${TARGET_TYPE.alert}
+      and ${pushRecords.targetId} = ${aiNewsEvents.eventId}
+      and ${pushRecords.status} = 'success'
+      and ${pushRecords.channel} in (${sql.join(
+        cfgChannels.map((c) => sql`${c}`),
+        sql`, `,
+      )})
+  )`;
+  const notAlertedToAllChannels = sql`${alertedChannelCount} < ${cfgChannels.length}`;
 
   const rows = await dbh
     .select({
@@ -159,7 +164,7 @@ export async function selectAlertCandidates(
         // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
         isNotNull(aiNewsEvents.importanceScore),
         gte(aiNewsEvents.importanceScore, String(threshold)),
-        neverAlerted,
+        notAlertedToAllChannels,
       ),
     );
 
@@ -248,7 +253,11 @@ export async function runAlertScan(
   const dispatched: AlertDispatchOutcome[] = [];
 
   // channel-agnostic 候选：达阈值且从未以任一通道 success 告警过（一生一次、跨天去重）。
-  const candidates = await selectAlertCandidates(threshold, dbh);
+  const candidates = await selectAlertCandidates(
+    threshold,
+    dbh,
+    channelSenders.map((c) => c.channel),
+  );
   log(
     `告警候选: ${candidates.length} 条达阈值(>=${threshold})且从未 success 告警，` +
       `发放给 ${channelSenders.length} 个通道（${channelSenders.map((c) => c.channel).join(', ')}）`,

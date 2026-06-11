@@ -78,23 +78,28 @@ export interface DispatchResult {
 }
 
 /**
- * 计算待发集合：今日待发名单中该 (target_type, channel) 上 status ∈ {无记录, pending, failed}
- * （显式排除今日该 channel 的 success）。
+ * 计算待发集合：统一名单中该 (target_type, channel) 上 **从未** success 的条目
+ * （status ∈ {无记录, pending, failed}；显式排除**任一 push_date** 在该 channel 已 success 的）。
  *
- * 做法：查今日（同 push_date）这批 target 在该 (target_type, channel) 上已 success 的 target_id
- * 集合，从名单中剔除。仅排除「今日该 channel success」——failed / pending / 无记录均纳入
- * （重试僵尸 pending 与上次失败）。**success 排除按 channel 限定**：Telegram 已 success 不抑制
- * 飞书待发（同事件不同通道各自独立幂等）。
+ * **统一日报模型（Model B）——选题与通道解耦、各通道可靠补发**：上游 channel-blind 选出**一份**
+ * 统一名单（候选窗口「尚未投递给所有已配置通道」，见 selectTopN/selectAlertCandidates），同一份发给
+ * 所有通道；本函数按 **per-channel 跨天**口径过滤——该 channel **从未** success 过的才进待发。如此：
+ * - 某通道（如飞书）失败 → 其在该 channel 无 success → 跨天/跨次仍在待发 → **可靠补发**（不丢）；
+ * - 已 success 的通道（如 telegram）→ 排除 → **绝不跨天重发**；
+ * - 一旦所有通道都 success，selectTopN 候选层把该事件移出统一名单（不再重选）。
  *
- * @param topN       今日待发名单（各 selection 路径产出）。
- * @param pushDate   今日 push_date。
+ * 注意：跨天口径**蕴含**同日去重（同日 success 也是 success 之一）；failed/pending/无记录均纳入
+ * （重试僵尸 pending 与上次失败）。`pushDate` 参数保留供日志/INSERT 用，**不再用于 success 过滤**。
+ *
+ * @param topN       统一待发名单（各 selection 路径产出，channel-blind）。
+ * @param pushDate   今日 push_date（用于 INSERT pending 的四元组，非过滤条件）。
  * @param dbh        db 或事务句柄。
  * @param targetType 幂等四元组 target_type（默认 `event`）。
  * @param channel    幂等四元组 channel（默认 `telegram`）。
  */
 export async function computePendingSet(
   topN: readonly SelectedEvent[],
-  pushDate: string,
+  _pushDate: string,
   dbh: DbLike = defaultDb,
   targetType: TargetType = DEFAULT_TARGET_TYPE,
   channel: Channel = DEFAULT_CHANNEL,
@@ -102,6 +107,7 @@ export async function computePendingSet(
   if (topN.length === 0) return [];
 
   const eventIds = topN.map((e) => e.eventId);
+  // 该 (target_type, channel) 上**任一 push_date** 已 success 的 target_id（跨天 per-channel 去重）。
   const successRows = await dbh
     .select({ targetId: pushRecords.targetId })
     .from(pushRecords)
@@ -109,14 +115,13 @@ export async function computePendingSet(
       and(
         eq(pushRecords.targetType, targetType),
         eq(pushRecords.channel, channel),
-        eq(pushRecords.pushDate, pushDate),
         eq(pushRecords.status, 'success'),
         inArray(pushRecords.targetId, eventIds),
       ),
     );
 
-  const succeededToday = new Set(successRows.map((r) => r.targetId));
-  return topN.filter((e) => !succeededToday.has(e.eventId));
+  const everSucceededOnChannel = new Set(successRows.map((r) => r.targetId));
+  return topN.filter((e) => !everSucceededOnChannel.has(e.eventId));
 }
 
 /**

@@ -14,7 +14,7 @@
 
 > 此设计同时满足：① 阈值判定永远在 `importance_score` 写入之后（不 `NULL >= 85` 误判）；② 告警由高频小链路提前评分触发、不等日报，保留实时性；③ 原子 claim 防与日报链双评分。
 
-**P2 局部不变量声明**：本能力的「一事件一生只告警一次（channel-agnostic）」依赖「`importance_score` 一经评分即稳定（Value Judge 不重判已评分）」。这是 **P2 局部不变量**；P3 若引入事件合并/重评分（分数可回填重算），必须重新评估告警幂等口径（届时「跨天再次达阈值」可能变为可达，需重新设计 alert 候选窗口）。
+**P2 局部不变量声明**：本能力的「一事件对每个通道一生只 success 告警一次」依赖「`importance_score` 一经评分即稳定（Value Judge 不重判已评分）」。这是 **P2 局部不变量**；P3 若引入事件合并/重评分（分数可回填重算），必须重新评估告警幂等口径（届时「跨天再次达阈值」可能变为可达，需重新设计 alert 候选窗口）。
 
 #### 场景:高频小链路评分后达阈值的事件被实时告警
 - **当** 高频告警工作流采集/塌缩新事件并经 Value Judge 评分后，某事件 `importance_score IS NOT NULL AND >= 阈值`（默认 85）且尚未告警
@@ -40,7 +40,7 @@
 
 系统必须以 `push_records` 唯一约束保障实时告警不重复推送。告警四元组必须为 `target_type='alert'`、`target_id=event_id`、`channel`、`push_date=告警触发当日（Asia/Shanghai，与日报 push_date 时区同源）`。独立 `target_type='alert'` 使其与日报推送（`target_type='event'`）在 `push_records` 中互不挤占——禁止复用日报四元组，否则「当日日报已 success 推过该事件」会使实时告警因唯一键冲突被静默吞掉（漏告警），反之亦然。
 
-**幂等语义为「一个事件一生只 `success` 告警一次（channel-agnostic）」**（统一模型 Model B：选题与通道解耦）：`ai_news_events.importance_score` 一经 Value Judge 评分即稳定（Value Judge 不重判已评分事件），故告警分数不会跨天变化，「跨天再次达阈值」在本系统结构上不会发生、不设此行为。告警候选必须满足「该 `event_id` **从未以任一通道 `success` 告警过**」（查 `push_records` 中 `target_type='alert'` status='success' 记录，**不按 channel 限定**），由此层保障跨天不重复告警；选出的告警事件**同份发放给所有已配置通道**（通道只投递、不参与选题）。各通道的同日并发由 `UNIQUE(alert, event_id, channel, push_date)` 兜底。**`failed` 告警跨天可重试**：若该事件在所有通道都未 `success`（如全失败），仍满足候选可在新 `push_date` 重试——「一生一次」约束的是 **`success` 唯一**（一旦任一通道 success 即不再重选），不阻止「从未 success」时的跨天重试。
+**幂等语义为「一个事件对每个通道一生只 `success` 告警一次」**（统一模型 Model B：选题与通道解耦 + 各通道可靠补发）：`ai_news_events.importance_score` 一经 Value Judge 评分即稳定（Value Judge 不重判已评分事件），故告警分数不会跨天变化，「跨天再次达阈值」在本系统结构上不会发生、不设此行为。告警候选（channel-blind 选一份）必须满足「该 `event_id` **尚未 alert-success 投递给所有已配置通道**」（alert-success 覆盖的 distinct 已配置通道数 < 配置通道数）——只要还差任一通道未 alert-success 就留在候选；选出的告警事件**同份发放给所有已配置通道**（通道只投递、不参与选题）。**各通道可靠补发（不丢告警）**：各通道经 dispatcher `computePendingSet` 按 **per-channel 跨天**（该 channel 从未 alert-success）独立投递——某通道（如飞书）告警失败时该事件在该 channel 无 success → 跨次扫描仍在该通道待发 → 可靠补发，已 alert-success 的通道（如 telegram）被排除、不重发；同日并发由 `UNIQUE(alert, event_id, channel, push_date)` 兜底。一旦所有已配置通道都 alert-success → 该事件移出告警候选（不再重选）。
 
 告警推送必须**复用 telegram-push/feishu-push 的同一套「待发→`pending`→原子送达→`success`/`failed`」状态机核心**（仅 `target_type` 与幂等键口径不同），禁止另写一套漂移的状态机。告警事件在高频链路评分后可能尚无中文摘要（`headline_zh`/`summary_zh` 为 NULL），故告警消息渲染必须**复用 telegram-push 的 headline 回退链**（`headline_zh` → `summary_zh` 截断 → `representative_title` → 仅标题），不因摘要缺失报错或漏告警。告警推送路径必须带**独立单例锁** `alert:{event_id}`（**per-event，覆盖该事件向所有通道的分发**）或 DB 原子 claim，防两并发实例对同一告警事件重复分发（唯一约束挡不住并发双读双发）；单通道发送失败隔离、不拖垮该事件的其余通道。该锁必须为 job 级短时持有 + 完成/崩溃后可靠释放（带 TTL 或 `finally` 释放）——锁键含 `event_id` 但不含时间，若无 TTL 且崩溃未释放会使该事件告警永久死锁，故释放语义不可省（同 telegram-push 单例锁的 TTL/释放要求）。
 
@@ -48,6 +48,10 @@
 - **当** 某事件当日已作为日报（`target_type='event'`）success 推送
 - **那么** 该事件的实时告警（`target_type='alert'`）不因日报记录而被唯一键冲突吞掉，仍可独立推送
 
-#### 场景:同一事件重复检测只告警一次
-- **当** 同一已评分达阈值事件在后续轮询中被再次扫到（已 success 告警过）
-- **那么** 该事件因「从未以任一通道 success 告警过」候选条件不满足（已 success 告警过）而被排除，不再重复告警；同日并发重复触发亦由 `UNIQUE(alert, event_id, channel, push_date)` 兜底跳过
+#### 场景:已告警给所有通道的事件不再重复告警
+- **当** 同一已评分达阈值事件已 alert-success 投递给所有已配置通道，后续轮询再次扫到
+- **那么** 该事件因「尚未 alert-success 投递给所有已配置通道」候选条件不满足（已全部告警）而被排除，不再重复告警；同日并发重复触发亦由 `UNIQUE(alert, event_id, channel, push_date)` 兜底跳过
+
+#### 场景:某通道告警失败后跨次可靠补发
+- **当** 某达阈值事件 telegram 告警 success、飞书告警失败（飞书无 alert-success），已配置 telegram + feishu
+- **那么** 该事件仍在告警候选（飞书尚缺）；后续扫描其飞书 `computePendingSet` 纳入它（飞书从未 alert-success）可靠补发，telegram 被排除不重发——不丢告警
