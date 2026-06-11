@@ -116,8 +116,6 @@ export async function dispatchDigest(
     return { pushDate, pending: 0, outcome: 'skipped', eventIds: [] };
   }
 
-  const eventIds = pending.map((e) => e.eventId);
-
   // 1. 事务内为待发集合中「无记录者」插 pending（ON CONFLICT DO NOTHING 不覆盖既有行）。
   await dbh.transaction(async (tx) => {
     await tx
@@ -140,11 +138,15 @@ export async function dispatchDigest(
   const { text, parseMode, includedIds } = buildDigestMessage(pending);
 
   if (includedIds.length === 0) {
-    // 理论上不应发生（除非单条事件本身就超长）：不发空消息，相关记录保持 pending 待下次重试。
-    console.error(
-      `[dispatcher] buildDigestMessage 未包含任何事件（单条超长？），不发送，${eventIds.length} 条保持 pending。pushDate=${pushDate}`,
+    // 不变量：buildDigestMessage 对非空 pending 必至少含一条——单块已按 TITLE_MAX/HEADLINE_MAX
+    // 与 MAX_URL_LENGTH 有界（见 message.ts），首块恒可装下。走到此处说明不变量被破坏。
+    // **绝不**静默返回 'skipped'：那会被 run-daily-workflow 误映射为 'skipped-no-candidates' →
+    // job 成功 → BullMQ 不重试 → 这批 pending 永久不发、唯一信号只剩一行日志（静默漏推）。
+    // 改为抛错使整 job 可见失败（BullMQ 重试 + 错误冒泡），记录保持 pending 安全。
+    throw new Error(
+      `dispatchDigest: pending=${pending.length} 但渲染出 0 条可发事件（单块超限不变量被破坏），` +
+        `不静默跳过，抛错使整 job 失败可见。pushDate=${pushDate}`,
     );
-    return { pushDate, pending: pending.length, outcome: 'skipped', eventIds: [] };
   }
 
   // 已知限制（可观测告警）：单条 Telegram 消息上限导致截断时，尾部事件（不在 includedIds）

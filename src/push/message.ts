@@ -25,6 +25,15 @@ const TITLE_MAX = 120;
 /** headline 缺失时回退用 summary_zh 的截断字数（按 code point）。 */
 const SUMMARY_FALLBACK_MAX = 80;
 
+/**
+ * 原文链接 URL 长度上限。URL 是单条事件块内**唯一无长度上限**的来源（标题/要点已分别按
+ * TITLE_MAX / HEADLINE_MAX code point 截断有界）；超此长度即丢弃链接，保证任一事件单独成块
+ * 都远小于 MAX_MESSAGE_LENGTH，杜绝「单块超限 → buildDigestMessage 按序遇首块即停 →
+ * 后续事件轮不到、includedIds 为 0 → 整条 digest 卡住静默不发」。
+ * 规范化（剥离 utm/ref 等）后的链接远短于此，仅挡异常超长 URL。
+ */
+const MAX_URL_LENGTH = 2000;
+
 /** 截断后省略号。 */
 const ELLIPSIS = '…';
 
@@ -97,10 +106,19 @@ export function buildDigestMessage(events: readonly SelectedEvent[]): {
       : '';
 
     // 链接：canonical_url 用专用 URL 转义器；缺失则不渲染链接（仅标题+要点）。
+    // URL 超长（远超正常规范化链接）会撑爆单块、卡住整条 digest → 丢弃链接仅渲染标题+要点并告警，
+    // 保证单块恒可发（见 MAX_URL_LENGTH）。
     const url = e.canonicalUrl?.trim();
-    const linkLine = url
-      ? `\n[原文](${escapeMarkdownV2Url(url)})`
-      : '';
+    let linkLine = '';
+    if (url) {
+      if (url.length <= MAX_URL_LENGTH) {
+        linkLine = `\n[原文](${escapeMarkdownV2Url(url)})`;
+      } else {
+        console.error(
+          `[push] canonical_url 超长（${url.length} 字符 > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
+        );
+      }
+    }
 
     blocks.push(
       `${escapeMarkdownV2(`${i + 1}.`)} *${title}*${headlineLine}${linkLine}`,

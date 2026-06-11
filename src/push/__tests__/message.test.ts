@@ -144,6 +144,22 @@ describe('buildDigestMessage headline 渲染与回退链（4.2）', () => {
     expect(block.split('\n')).toHaveLength(1);
   });
 
+  it('canonical_url 超长（>2000）→ 丢弃链接仅标题+要点，单块仍可发、事件不丢', () => {
+    // 超长 URL 是块内唯一无界来源；不丢弃则单块超限会使该事件卡住整条 digest（includedIds 为 0）。
+    const hugeUrl = 'https://ex.com/' + 'a'.repeat(3000);
+    const events = [
+      ev('e1', { representativeTitle: 'T', headlineZh: '要点', canonicalUrl: hugeUrl }),
+    ];
+    const { text, includedIds } = buildDigestMessage(events);
+    // 该事件仍被渲染（不因 URL 超长被丢）。
+    expect(includedIds).toEqual(['e1']);
+    expect(text).toContain('*T*');
+    expect(text).toContain('要点');
+    // 链接被丢弃（不出现 [原文] 内联链接），整条不超上限。
+    expect(text).not.toContain('[原文]');
+    expect(text.length).toBeLessThanOrEqual(4000);
+  });
+
   it('canonical_url 缺失 → 仅标题+要点，不渲染链接', () => {
     const events = [
       ev('e1', { representativeTitle: 'T', headlineZh: '要点', canonicalUrl: null }),
