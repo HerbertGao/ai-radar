@@ -47,6 +47,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/ai-radar
+          # latest=false 关掉 metadata-action 默认的 latest=auto：否则推 v* semver tag 时会自动
+          # 再打一个 :latest，覆盖「跟随 main 的滚动镜像」。改由下方 type=raw 仅在 main 打 latest。
+          flavor: |
+            latest=false
+          # semver tag 形如 v1.2.3 → 产出 :1.2.3（{{version}} 去掉 v 前缀）；另产 :sha-<短哈希>。
           tags: |
             type=ref,event=branch
             type=ref,event=pr
