@@ -38,7 +38,7 @@ Telegram channel 每条事件的消息内容必须为「代表标题 + 一句话
 
 待发集合必须显式定义为「今日 Top N 中该 channel 上 `status ∈ {无记录, pending, failed}` 的事件」（即今日 Top N 排除今日该 channel 已 `success` 的），从而 failed 与崩溃残留的僵尸 `pending` 自动纳入重试，已成功的不再重发。待发集合的 success 排除必须按 channel 限定，禁止跨 channel 误排除（否则 Telegram 已推会错误抑制飞书待发）。
 
-两层「排除 success」分工不同、叠加不矛盾，实现时不可因「看似重复」删掉其一：候选窗口（daily-intel-pipeline）的「从未被任何 push_date 以该 channel success」负责**跨天/跨次不重推**（一条事件在一个通道一生只成功推一次）；本待发集合的「今日该 channel success 排除」负责**同一 push_date 内**待发集合混有 failed/pending 与 success 时不重发已成功条目（同日 BullMQ 整 job 重试的兜底）。`failed` 的重试边界：同一 push_date 内由整 job 重试重新纳入待发集合；跨天则该 push_date 的 failed 行被留存但不再发，事件靠候选窗口（仍「从未 success」）以**新的 push_date** 重新入选获得新一次推送机会。推送流程必须为：在事务内为待发集合中无记录者 `INSERT push_records(status='pending') ON CONFLICT DO NOTHING`；将整个待发集合拼成一条消息发送；单条消息原子送达——成功则该批全部置 `success`，失败则该批全部置 `failed` 并保留 `error_message` 供重试。禁止把已 `success` 的事件重新拼入消息。
+两层「排除 success」分工不同、叠加不矛盾，实现时不可因「看似重复」删掉其一：候选窗口（daily-intel-pipeline，**统一日报模型 Model B：channel-agnostic**）的「从未被任何 push_date 以**任一通道** success」负责**跨天/跨次不重推**（一条事件一生只成功推一次、不分通道——选题与通道解耦）；本待发集合的「今日**该 channel** success 排除」负责**同一 push_date 内**该通道待发集合混有 failed/pending 与 success 时不重发已成功条目（同日 BullMQ 整 job 重试的兜底，仍按 channel 限定）。`failed` 的重试边界：同一 push_date 内由整 job 重试重新纳入待发集合；跨天则该 push_date 的 failed 行被留存但不再发，事件靠候选窗口（仍「从未 success」）以**新的 push_date** 重新入选获得新一次推送机会。推送流程必须为：在事务内为待发集合中无记录者 `INSERT push_records(status='pending') ON CONFLICT DO NOTHING`；将整个待发集合拼成一条消息发送；单条消息原子送达——成功则该批全部置 `success`，失败则该批全部置 `failed` 并保留 `error_message` 供重试。禁止把已 `success` 的事件重新拼入消息。
 
 #### 场景:当天重跑不重复推送
 - **当** 当日日报已在某 channel 成功推送后，推送任务在同一 `push_date`、同一 channel 再次执行

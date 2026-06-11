@@ -24,11 +24,11 @@
 
 ### 需求:飞书推送幂等按 channel 独立
 
-系统必须以 `push_records` 的 `UNIQUE(target_type, target_id, channel, push_date)` 保障飞书通道推送幂等，飞书推送记录的 `channel` 必须为 `feishu`。同一事件/产品在 Telegram 与飞书两通道上必须各自独立幂等：在一个通道已 success 不影响另一通道的待发与推送（候选窗口「从未被任何 push_date 以**该 channel** success 推送过」对每个 channel 独立判定）。飞书推送必须沿用「先写 `pending` → 调 API → 成功 `success` / 失败 `failed` 保留错误信息可重试」，唯一键冲突即跳过。
+系统必须以 `push_records` 的 `UNIQUE(target_type, target_id, channel, push_date)` 保障飞书通道推送幂等，飞书推送记录的 `channel` 必须为 `feishu`。**选题统一（Model B，channel-agnostic）**：每日只选一份 Top N（不按 channel 选题，见 daily-intel「Top N 组合分选择」），同一份**同日**发放给 Telegram 与飞书；**各通道仅在 dispatch 层做同日 per-channel 幂等**——`computePendingSet` 按 channel 排除「该 channel 今日已 success」+ `UNIQUE` 四元组兜底，故同一份日报里 Telegram 已 success 不抑制飞书当日仍发该事件（两通道各发一次）。飞书推送必须沿用「先写 `pending` → 调 API → 成功 `success` / 失败 `failed` 保留错误信息可重试」，唯一键冲突即跳过。
 
-#### 场景:同事件双通道各推一次互不抑制
-- **当** 某事件已在 Telegram 通道 success，飞书通道尚未推送
-- **那么** 该事件在飞书通道仍进入待发集合并被推送，不因 Telegram 已推而被抑制
+#### 场景:同一份日报当日发放两通道各发一次
+- **当** 当日一份统一 Top N 发放给 Telegram + 飞书，Telegram 已 success、飞书当日待发集合仍含该事件（如整 job 重试中）
+- **那么** 该事件在飞书通道仍进入待发集合并被发送（同日 per-channel 幂等，不因 Telegram 已 success 而被抑制），两通道各发一次
 
 #### 场景:飞书当天重跑不重复推送
 - **当** 飞书通道当日日报已 success 后，在同一 `push_date`、`channel='feishu'` 再次执行

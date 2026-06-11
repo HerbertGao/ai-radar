@@ -22,9 +22,9 @@
 
 ### 需求:Top N 组合分选择
 
-系统必须由程序（而非 LLM）从候选事件中选出每日 Top N。候选窗口必须为 `should_push=true AND first_seen_at 在近 N 天 AND 该 event 从未被任何 push_date 以**目标分发 channel** success 推送过`。「从未 success 推送过」而非「今天未 success」——否则常青高分事件会跨天天天上榜重复推送（退出标准②仅约束「同一天不重复」，但产品语义要求一条事件在一个通道一生只推一次）。
+系统必须由程序（而非 LLM）从候选事件中选出每日 Top N。候选窗口必须为 `should_push=true AND first_seen_at 在近 N 天 AND 该 event 从未被任何 push_date 以**任一通道** success 推送过`。「从未 success 推送过」而非「今天未 success」——否则常青高分事件会跨天天天上榜重复推送（退出标准②仅约束「同一天不重复」，但产品语义要求一条事件一生只推一次）。
 
-**候选窗口必须按目标分发通道分别判定（P2 多通道关键修正）**：P2 引入飞书后，同一份 Top N 名单要分发到 Telegram 与飞书两通道，候选窗口的「从未以该 channel success」必须**针对每个目标通道各算一次**——同一事件可能在 Telegram 通道已 success（从 Telegram 候选中排除）、却在飞书通道从未 success（仍进入飞书候选）。**禁止按事件维度（跨 channel 合并）去重候选**，否则一通道已推会错误抑制另一通道的待发，直接违反 telegram-push/feishu-push「同事件不同通道独立幂等」。候选窗口判定「近 N 天」所用的「今天」必须与 telegram-push 的 `push_date` 同源（Asia/Shanghai），禁止两处时区口径漂移。
+**统一日报模型（Model B）——选题与通道解耦，绝不可违背**：每日只选**一份** channel-agnostic 的 Top N（候选窗口不按 channel 限定，「从未以任一通道 success 推送过」），由编排层把**同一份**名单发放给**所有已配置通道**（通道只负责投递上游统一选好的信息，不参与选题）。各通道的同日幂等由 dispatcher `computePendingSet`（待发集合排除该 channel 今日已 success）+ `UNIQUE(target_type,target_id,channel,push_date)` 兜底；单通道瞬时发送失败由整 job 同日重试兜底。**禁止按通道分别选题**（早期「telegram 的名单泄漏给飞书」是被本模型纠正的反模式）。一旦某事件投递成功（任一通道）即不再跨天重选——日报是「当天尚未投递过的高价值事件」，不跨天纠缠（某通道在该事件投递日全天失败则该通道当日错过，属可接受取舍）。候选窗口判定「近 N 天」所用的「今天」必须与 telegram-push 的 `push_date` 同源（Asia/Shanghai），禁止两处时区口径漂移。
 
 系统必须按组合分 `rank_score = 0.45*importance + 0.25*developer_relevance + 0.20*novelty − 0.10*hype_risk` 排序（权重必须可经 config 配置），取 Top N（N 可配，约 5–10）。排序必须带确定性 tiebreaker（`published_at DESC NULLS LAST, event_id ASC`）以保证 Top N 边界可复现。系统必须设 importance 下限闸（如 `>= 60`）：低于阈值的事件不入选，宁可当日少于 N 条也不凑数。LLM 的 `should_push` 仅作为候选信号，禁止由 LLM 决定最终推送名单与排序。
 
@@ -32,13 +32,13 @@
 - **当** 候选事件多于 N 条
 - **那么** 系统按 `rank_score` 降序并应用确定性 tiebreaker（`published_at DESC NULLS LAST, event_id ASC`）取前 N 条，对同一批已落库事件多次运行结果一致
 
-#### 场景:已 success 推送过的事件在该通道不再入选
-- **当** 某 event 曾在任一 `push_date` 以某 channel success 推送，今日仍 `should_push=true` 且在近 N 天窗口内
-- **那么** 该 event 不进入今日该 channel 的候选，不会被该通道跨天重复推送
+#### 场景:已投递过的事件不再被重选（channel-agnostic 跨天去重）
+- **当** 某 event 曾在任一 `push_date`、以**任一通道**（telegram 或 feishu）success 推送，今日仍 `should_push=true` 且在近 N 天窗口内
+- **那么** 该 event 不进入今日 Top N（channel-agnostic「从未 success」候选窗口），不会被跨天重复推送
 
-#### 场景:一通道已推的事件仍进入另一通道候选
-- **当** 某事件已在 Telegram 通道 success、在飞书通道从未 success，今日仍 `should_push=true` 且在窗口内
-- **那么** 该事件不进入 Telegram 候选、但仍进入飞书候选窗口，使飞书能补推该事件
+#### 场景:统一一份 Top N 发放给所有已配置通道
+- **当** 当日选出一份 Top N，已配置通道为 telegram + feishu
+- **那么** 同一份 Top N 名单发放给两个通道（选题与通道解耦）；各通道按其 `computePendingSet` + 四元组独立做同日幂等，不因另一通道而改变选题
 
 #### 场景:下限闸过滤低分事件
 - **当** 某候选事件 `importance` 低于下限阈值
