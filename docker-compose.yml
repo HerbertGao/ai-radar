@@ -1,13 +1,35 @@
-# ai-radar P0 本地基础设施编排
+# ai-radar 编排
 #
-# 一键启动：docker compose up -d
-# 健康查看：docker compose ps（两服务均应进入 healthy）
-# 停止清理：docker compose down（加 -v 可一并删卷）
+# 两种用法：
+#  1) 本地开发（只起依赖，应用在宿主机用 tsx 跑）：
+#       docker compose up -d            # 仅 postgres + redis
+#       docker compose ps               # 两服务均应进入 healthy
+#  2) 整机部署（目标主机全栈容器化）：
+#       docker compose --profile app up -d --build
+#       # 起 postgres + redis + migrate(一次性) + worker(常驻) + web(/health)
+#       # 详见 DEPLOY.md
+#  停止清理：docker compose down（加 -v 可一并删卷）
+#
+# 设计：应用三服务（migrate/worker/web）归入 `app` profile——不带 --profile 时
+# 不启动，使「本地只要依赖」的开发用法保持不变；DB/Redis 连接串在 app 服务里用
+# 容器网络服务名（postgres/redis）覆盖 .env 中的 localhost。
 #
 # 不变量（来自 platform-foundation spec）：
 # - postgres 使用 pgvector/pgvector 镜像作为地基，但本期零向量：
 #   不挂任何 init SQL 去 CREATE EXTENSION vector，不建 vector 列。
 #   pgvector 镜像默认不会自动启用扩展，此处也不引入任何启用逻辑。
+
+# 应用三服务共享的构建与环境（YAML 锚点；merge key 只并顶层键，故各服务不再覆盖 environment）。
+x-app: &app
+  build: .
+  # 本地 build 与 CI 推送（GHCR）共用此 tag：`up --build` 本地构建、`pull` 拉 CI 多架构镜像。
+  image: ghcr.io/herbertgao/ai-radar:latest
+  env_file:
+    - .env
+  environment:
+    # 覆盖 .env 里的 localhost：容器内经服务名互联。
+    DATABASE_URL: postgres://${POSTGRES_USER:-ai_radar}:${POSTGRES_PASSWORD:-ai_radar}@postgres:5432/${POSTGRES_DB:-ai_radar}
+    REDIS_URL: redis://redis:6379
 
 services:
   postgres:
@@ -41,6 +63,46 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+
+  # ── 应用：迁移（一次性，profile=app）。worker/web 依赖它成功完成后再起。
+  migrate:
+    <<: *app
+    profiles: ["app"]
+    command: ["npm", "run", "migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── 应用：常驻 worker（profile=app）。四条调度链；周报默认禁用。
+  worker:
+    <<: *app
+    profiles: ["app"]
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── 应用：HTTP 健康端点（profile=app）。暴露 /health 供监控/Tailscale 探活。
+  web:
+    <<: *app
+    profiles: ["app"]
+    command: ["npm", "start"]
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
 volumes:
   postgres_data:
