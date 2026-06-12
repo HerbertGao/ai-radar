@@ -44,7 +44,7 @@ import {
   scheduleWeeklyReport,
   createWeeklyReportWorker,
 } from './weekly-report.js';
-import { isWeeklyReportEnabled } from '../config/env.js';
+import { isAlertScanEnabled, isWeeklyReportEnabled } from '../config/env.js';
 
 /** 一条调度链的运行时句柄（worker + queue + 其复用的连接），供统一优雅关闭。 */
 interface ScheduledLane {
@@ -79,7 +79,8 @@ async function main(): Promise<void> {
   }
 
   // ── 链 3：实时告警 alert-scan（高频轮询，独立连接 buildAlertConnection）。
-  {
+  //    默认禁用（ALERT_SCAN_ENABLED='false'，canonicalUrl + 中文摘要打磨完再启用）；改 env 即启用。
+  if (isAlertScanEnabled()) {
     const connection = buildAlertConnection();
     const queue = createAlertScanQueue(connection);
     await scheduleAlertScan(queue);

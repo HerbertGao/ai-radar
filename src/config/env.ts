@@ -185,6 +185,9 @@ const envSchema = z.object({
   COLLECTOR_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
 
   // --- 实时重大发布告警（realtime-alerts，design D6）---
+  // 实时告警总开关。默认 'false'（功能打磨期关闭）；设为 'true' 才注册 alert-scan 队列与 worker。
+  // 关闭时 worker-main.ts 完全跳过该调度链，不注册 BullMQ 队列/worker。
+  ALERT_SCAN_ENABLED: z.enum(['true', 'false']).default('false'),
   // 「重大发布」实时告警阈值：评分**后**判 `importance_score IS NOT NULL AND >= 此值` 才告警。
   // 默认 85，严于日报候选 should_push 的 importance>=75 与 Top N 下限闸>=60（实时门槛更高防刷屏）。
   // 判定纯程序阈值，禁止 LLM 决定是否告警。
@@ -298,4 +301,8 @@ export function isFeishuEnabled(e: Env = env): boolean {
  */
 export function isWeeklyReportEnabled(e: Env = env): boolean {
   return e.WEEKLY_REPORT_ENABLED === 'true';
+}
+
+export function isAlertScanEnabled(e: Env = env): boolean {
+  return e.ALERT_SCAN_ENABLED === 'true';
 }
