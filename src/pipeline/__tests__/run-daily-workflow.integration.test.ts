@@ -114,16 +114,17 @@ function inferMock(opts: { publishedAt: string | null; throwError?: boolean }) {
   };
 }
 
-/** 注入 collector：rss 返回给定条目，hn/github/arxiv/product_hunt 返回空（或全挂）。 */
+/** 注入 collector：rss 返回给定条目，hn/github/arxiv/product_hunt/show_hn 返回空（或全挂）。 */
 function collectorsReturning(items: CollectedItem[]) {
   return {
     rss: async () => items,
     hackerNews: async () => [],
     github: async () => [],
-    // arXiv / Product Hunt 自 P2 起进 registry；测试用空桩，避免落到真实
-    // OAI-PMH / PH GraphQL 网络调用（带真实 token 时会拉到真数据污染断言）。
+    // arXiv / Product Hunt / Show HN 自 P2 起进 registry；测试用空桩，避免落到真实
+    // OAI-PMH / PH GraphQL / HN Algolia 网络调用（带真实 token 时会拉到真数据污染断言）。
     arxiv: async () => [],
     productHunt: async () => [],
+    showHn: async () => [],
   };
 }
 
@@ -144,6 +145,9 @@ function collectorsAllFail() {
     },
     productHunt: async () => {
       throw new Error('ph down');
+    },
+    showHn: async () => {
+      throw new Error('show_hn down');
     },
   };
 }
@@ -215,6 +219,7 @@ function collectorsArxivPaperOnly(papers: CollectedItem[]) {
     github: async () => [],
     arxiv: async () => papers,
     productHunt: async () => [],
+    showHn: async () => [],
   };
 }
 

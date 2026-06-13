@@ -25,8 +25,8 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiProducts, rawItems } from '../db/schema.js';
-import { normalizeUrl } from '../dedup/normalize.js';
-import { extractCanonicalDomain } from './product-hunt.js';
+import { extractProductMergeKeys } from './product-keys.js';
+import type { ProductMergeKeys } from './product-keys.js';
 import { defaultLogError, type LogError } from './types.js';
 
 type DbLike = typeof defaultDb;
@@ -56,68 +56,11 @@ export interface ProductCollapseOutcome {
   keys: ProductMergeKeys;
 }
 
-/** 三个硬合并归一化键（任一可为 null，null 键不参与约束）。 */
-export interface ProductMergeKeys {
-  canonicalDomain: string | null;
-  githubRepo: string | null;
-  productHuntSlug: string | null;
-}
-
-function asString(v: unknown): string | null {
-  if (typeof v !== 'string') return null;
-  const t = v.trim();
-  return t.length > 0 ? t : null;
-}
-
 /**
- * 把 github.com 仓库 URL 归一为 `owner/name`（小写 host 判定，去 .git 后缀与尾斜杠）。
- * 非 github.com URL / 路径不足两段 → null（该键不参与合并）。
+ * 三个硬合并归一化键 `ProductMergeKeys` 与提键纯函数 `extractProductMergeKeys`
+ * （含 `normalizeGithubRepo` / `extractCanonicalDomain` / F1 github.com 抑制）现迁入叶子纯模块
+ * `product-keys.ts`（design D7：避免纯采集器经 product-collapse 传递拉入 PG 连接池）。本文件直接 import 复用。
  */
-export function normalizeGithubRepo(rawUrl: string | null | undefined): string | null {
-  if (!rawUrl) return null;
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl.trim());
-  } catch {
-    return null;
-  }
-  const host = parsed.host.toLowerCase().replace(/^www\./, '');
-  if (host !== 'github.com') return null;
-  const segments = parsed.pathname
-    .split('/')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (segments.length < 2) return null;
-  const owner = segments[0]!.toLowerCase();
-  const name = segments[1]!.replace(/\.git$/i, '').toLowerCase();
-  if (owner.length === 0 || name.length === 0) return null;
-  return `${owner}/${name}`;
-}
-
-/**
- * 从 product raw_item 提取三个非空归一化键（确定性纯函数）。
- * - product_hunt_slug：metadata.product_hunt_slug（PH 原生 slug）。
- * - canonical_domain：由 metadata.website（或 url）经 normalizeUrl + extractCanonicalDomain 提取。
- * - github_repo：若 website/url 是 github.com 仓库 URL，则归一 owner/name；否则 metadata.github_repo。
- */
-export function extractProductMergeKeys(item: ProductRawItem): ProductMergeKeys {
-  const meta = item.metadata ?? {};
-  const slug = asString(meta.product_hunt_slug);
-  const website = asString(meta.website) ?? asString(item.url);
-
-  const canonicalUrl = normalizeUrl(website);
-  const canonicalDomain =
-    asString(meta.canonical_domain) ?? extractCanonicalDomain(canonicalUrl);
-
-  const githubRepo =
-    normalizeGithubRepo(website) ?? asString(meta.github_repo);
-
-  return {
-    canonicalDomain,
-    githubRepo,
-    productHuntSlug: slug,
-  };
-}
 
 /** name 兜底链：产品名(title) → slug → canonical_domain → 终极占位（绝不留空，NOT NULL）。 */
 function resolveName(item: ProductRawItem, keys: ProductMergeKeys): string {

@@ -13,7 +13,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 
 let phMod: typeof import('../product-hunt.js');
-let collapseMod: typeof import('../product-collapse.js');
+let keysMod: typeof import('../product-keys.js');
 let indexMod: typeof import('../index.js');
 
 beforeAll(async () => {
@@ -26,7 +26,10 @@ beforeAll(async () => {
   process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
   process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
   phMod = await import('../product-hunt.js');
-  collapseMod = await import('../product-collapse.js');
+  // extractCanonicalDomain / normalizeGithubRepo / extractProductMergeKeys 已迁入叶子纯模块
+  // product-keys.ts（design D7）；这三符号一律从此处 import（product-hunt 不再 re-export
+  // extractCanonicalDomain、product-collapse 不再本地声明这些符号）。
+  keysMod = await import('../product-keys.js');
   indexMod = await import('../index.js');
 });
 
@@ -96,28 +99,26 @@ describe('mapProductHuntPost 映射统一结构', () => {
 
 describe('extractCanonicalDomain / normalizeGithubRepo 归一化纯函数', () => {
   it('canonical_domain 去 www、小写', () => {
-    expect(phMod.extractCanonicalDomain('https://WWW.Example.com/path')).toBe(
+    expect(keysMod.extractCanonicalDomain('https://WWW.Example.com/path')).toBe(
       'example.com',
     );
-    expect(phMod.extractCanonicalDomain(null)).toBeNull();
+    expect(keysMod.extractCanonicalDomain(null)).toBeNull();
   });
   it('github_repo 归一 owner/name（去 .git、小写）', () => {
-    expect(collapseMod.normalizeGithubRepo('https://github.com/OpenAI/Whisper')).toBe(
+    expect(keysMod.normalizeGithubRepo('https://github.com/OpenAI/Whisper')).toBe(
       'openai/whisper',
     );
-    expect(collapseMod.normalizeGithubRepo('https://github.com/a/b.git')).toBe('a/b');
+    expect(keysMod.normalizeGithubRepo('https://github.com/a/b.git')).toBe('a/b');
     // 非 github URL → null（该键不参与合并）。
-    expect(collapseMod.normalizeGithubRepo('https://gitlab.com/a/b')).toBeNull();
+    expect(keysMod.normalizeGithubRepo('https://gitlab.com/a/b')).toBeNull();
     // 路径不足两段 → null。
-    expect(collapseMod.normalizeGithubRepo('https://github.com/onlyowner')).toBeNull();
+    expect(keysMod.normalizeGithubRepo('https://github.com/onlyowner')).toBeNull();
   });
 });
 
 describe('extractProductMergeKeys 提取三键', () => {
   it('从 PH metadata 提 slug + canonical_domain；website 非 github → repo 为 null', () => {
-    const keys = collapseMod.extractProductMergeKeys({
-      id: 1n,
-      title: 'T',
+    const keys = keysMod.extractProductMergeKeys({
       url: 'https://prod.example.com',
       metadata: { product_hunt_slug: 'prod-x', website: 'https://prod.example.com' },
     });
@@ -126,9 +127,7 @@ describe('extractProductMergeKeys 提取三键', () => {
     expect(keys.githubRepo).toBeNull();
   });
   it('website 是 github 仓库 → github_repo 归一 owner/name', () => {
-    const keys = collapseMod.extractProductMergeKeys({
-      id: 2n,
-      title: 'OSS Tool',
+    const keys = keysMod.extractProductMergeKeys({
       url: 'https://github.com/Acme/Tool',
       metadata: { product_hunt_slug: 'oss-tool', website: 'https://github.com/Acme/Tool' },
     });
@@ -136,9 +135,7 @@ describe('extractProductMergeKeys 提取三键', () => {
     expect(keys.productHuntSlug).toBe('oss-tool');
   });
   it('全部键缺失 → 三键皆 null（NULL 键不参与约束）', () => {
-    const keys = collapseMod.extractProductMergeKeys({
-      id: 3n,
-      title: 'Bare',
+    const keys = keysMod.extractProductMergeKeys({
       url: null,
       metadata: null,
     });
@@ -296,6 +293,8 @@ describe('PH 注册进 registry（单源失败隔离）', () => {
         productHunt: async () => {
           throw new Error('PH down');
         },
+        // show_hn 注入空桩，隔离真实 HN Algolia（漏桩会拉真数据使 items 断言失败）。
+        showHn: async () => [],
       },
     });
     // PH 失败被隔离。

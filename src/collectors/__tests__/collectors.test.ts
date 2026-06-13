@@ -255,8 +255,9 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         arxiv: async () => {
           throw new Error('arXiv 429 放弃');
         },
-        // product_hunt 注入空桩，隔离真实 PH GraphQL（带真实 token 时会拉真数据污染断言）。
+        // product_hunt / show_hn 注入空桩，隔离真实 PH GraphQL / HN Algolia（漏桩会拉真数据污染断言）。
         productHunt: async () => [],
+        showHn: async () => [],
       },
     });
     expect(result.items.map((i) => i.sourceItemId).sort()).toEqual(['h1', 'r1']);
@@ -275,14 +276,15 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
     };
     const result = await mod.collectAllSources({
       logError: () => {},
-      // 全部 registry 源都注入桩（含 product_hunt），避免漏桩源落到真实网络（带真实
-      // PRODUCT_HUNT_TOKEN 时会拉到真数据使「items 为空」断言失败）。
+      // 全部 registry 源都注入桩（含 product_hunt / show_hn），避免漏桩源落到真实网络（带真实
+      // PRODUCT_HUNT_TOKEN / HN Algolia 时会拉到真数据使「items 为空」断言失败）。
       collectors: {
         rss: fail,
         hackerNews: fail,
         github: fail,
         arxiv: fail,
         productHunt: fail,
+        showHn: fail,
       },
     });
     expect(result.items).toHaveLength(0);
@@ -291,6 +293,7 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
     expect(result.perSource.github?.ok).toBe(false);
     expect(result.perSource.arxiv?.ok).toBe(false);
     expect(result.perSource.product_hunt?.ok).toBe(false);
+    expect(result.perSource.show_hn?.ok).toBe(false);
   });
 
   it('registry 注册即接入：新增一源后被并发调用（buildRegistry 含全部 source）', () => {
@@ -302,6 +305,7 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
       'hacker_news',
       'product_hunt',
       'rss',
+      'show_hn',
     ]);
   });
 
@@ -323,6 +327,7 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         github: slow('c'),
         arxiv: slow('d'),
         productHunt: slow('e'),
+        showHn: slow('f'),
       },
     });
     // 并发执行 → 同时在跑的源数 > 1（若串行则恒为 1）。

@@ -3,7 +3,7 @@
  *
  * **独立调度任务（对齐 daily-intel-pipeline，绝不塞进 runDailyWorkflow 的日报顺序链）**：
  * 产品发现是与日报并列的独立 BullMQ 调度任务，其**内部**是一条顺序子流程
- *   采集 PH → 产品塌缩 → 选名单 → 推送
+ *   采集产品源（PH + Show HN）→ 产品塌缩 → 选名单 → 推送
  * 但整体独立于日报链运行（见本文件 queue/worker 工厂）。
  *
  * 关键不变量（绝不可违背，spec product-discovery）：
@@ -38,9 +38,10 @@ import { db as defaultDb } from '../db/index.js';
 import { aiProducts, pushRecords } from '../db/schema.js';
 import { env, isFeishuEnabled } from '../config/env.js';
 import {
-  collectProductHunt,
-  type ProductHuntCollectorOptions,
-} from '../collectors/product-hunt.js';
+  collectSources,
+  PRODUCT_SOURCES,
+  type CollectAllOptions,
+} from '../collectors/index.js';
 import { storeCollectedItems } from '../collectors/store.js';
 import { collapseUncollapsedProductRawItems } from '../collectors/product-collapse.js';
 import {
@@ -243,7 +244,7 @@ export async function acquireProductDigestLock(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// 产品发现推送 workflow（顺序子流程：采集 PH → 塌缩 → 选名单 → 推送）
+// 产品发现推送 workflow（顺序子流程：采集产品源（PH + Show HN）→ 塌缩 → 选名单 → 推送）
 // ──────────────────────────────────────────────────────────────────────────
 
 /** 单通道分发结果（供汇总/可观测/测试断言）。 */
@@ -260,8 +261,13 @@ export interface RunProductDigestOptions {
   now?: Date;
   /** 注入 db 或事务句柄（默认全局 db）。 */
   dbh?: DbLike;
-  /** Product Hunt 采集选项（注入 mock fetchGraphql / token 等；测试可不触网）。 */
-  collect?: ProductHuntCollectorOptions;
+  /**
+   * 产品源采集选项（注入 mock；测试可不触网）。采集经 `collectSources(PRODUCT_SOURCES, ...)`，
+   * 故 PH 选项须在 `collectOptions.productHunt`、Show HN 选项在 `collectOptions.showHn`
+   * （`CollectAllOptions` 形状；禁止把单源 `ProductHuntCollectorOptions` 直接当此值传——会落顶层被
+   * `buildRegistry` 读 `options.productHunt`=undefined 而静默丢失注入，design D6）。
+   */
+  collectOptions?: CollectAllOptions;
   /**
    * 跳过采集 + 塌缩，直接选名单 + 推送（测试用：库内已有 ai_products 时只验推送候选/幂等）。
    * 生产恒走完整子流程。
@@ -284,7 +290,7 @@ export interface RunProductDigestOptions {
 
 export interface RunProductDigestResult {
   pushDate: string;
-  /** 本轮采集返回的 PH 产品条数（skipCollectAndCollapse 时为 0）。 */
+  /** 本轮采集返回的产品条数（PH + Show HN，skipCollectAndCollapse 时为 0）。 */
   collectedCount: number;
   /** 本轮塌缩的 product raw_items 条数（skipCollectAndCollapse 时为 0）。 */
   collapsedCount: number;
@@ -317,7 +323,7 @@ function resolveChannelSenders(
 }
 
 /**
- * 跑一次完整产品发现推送（顺序子流程：采集 PH → 塌缩 → 选名单 → 推送）。
+ * 跑一次完整产品发现推送（顺序子流程：采集产品源（PH + Show HN）→ 塌缩 → 选名单 → 推送）。
  *
  * 顺序不可乱（spec）：候选查询必须在塌缩之后，确保 merge_conflict 标记对候选可见。
  * 每个 channel 各自独立单例锁 `product-digest:{channel}:{push_date}`（job 级 + finally 释放），
@@ -336,13 +342,14 @@ export async function runProductDigest(
   let collectedCount = 0;
   let collapsedCount = 0;
 
-  // ── 顺序子流程阶段 1+2：采集 PH → 落 raw_items → 产品塌缩进 ai_products。
-  //    候选查询必须在塌缩之后（merge_conflict 标记对候选可见，spec）。
+  // ── 顺序子流程阶段 1+2：采集全部产品源（PH + Show HN）→ 落 raw_items → 产品塌缩进 ai_products。
+  //    经 collectSources(PRODUCT_SOURCES) 使产品源在同一链被采集 → 紧接同链塌缩（链路显式闭合，
+  //    design D6）。候选查询必须在塌缩之后（merge_conflict 标记对候选可见，spec）。
   if (!options.skipCollectAndCollapse) {
-    const collected = await collectProductHunt(options.collect ?? {});
-    collectedCount = collected.length;
-    if (collected.length > 0) {
-      await storeCollectedItems(collected, { dbh });
+    const collected = await collectSources(PRODUCT_SOURCES, options.collectOptions);
+    collectedCount = collected.items.length;
+    if (collected.items.length > 0) {
+      await storeCollectedItems(collected.items, { dbh });
     }
     const collapseOutcomes = await collapseUncollapsedProductRawItems(dbh);
     collapsedCount = collapseOutcomes.length;

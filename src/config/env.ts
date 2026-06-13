@@ -194,6 +194,16 @@ const envSchema = z.object({
   // 单次源网络调用（fetch / RSS parseURL）超时毫秒数；防实网挂起无限期卡死整个采集。
   COLLECTOR_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
 
+  // --- Show HN 产品采集（HN Algolia，source-collectors / design D1/D4）---
+  // 众投质量闸：仅采 points >= 此值的 Show HN（HN 群体投票信号，**非内容语义判断**，
+  // 与 GitHub collector「按 star 倒序」同属确定性群体信号；区别：这是绝对阈值，某轮可能 0 条达标
+  // → 返回空，属预期、不触发告警）。默认 10（实测拍的保守值）；非法值（NaN/负/0）启动即报错。
+  SHOW_HN_MIN_POINTS: z.coerce.number().int().positive().default(10),
+  // 单轮采集上限（Algolia hitsPerPage，本期不翻页）。时间窗（借 FIRST_SEEN_WINDOW_DAYS 天）
+  // **仅采集期控量**——产品选品按 ai_products.last_seen_at、不经 published_at 时效窗（见 product-digest）。
+  // 默认 30（10 points 阈值下近 3 天有裕量）；非法值启动即报错。
+  SHOW_HN_MAX_PER_RUN: z.coerce.number().int().positive().default(30),
+
   // --- 实时重大发布告警（realtime-alerts，design D6）---
   // 实时告警总开关。默认 'false'（功能打磨期关闭）；设为 'true' 才注册 alert-scan 队列与 worker。
   // 关闭时 worker-main.ts 完全跳过该调度链，不注册 BullMQ 队列/worker。
