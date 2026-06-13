@@ -25,6 +25,7 @@
 import { env } from '../config/env.js';
 import { normalizeUrl } from '../dedup/normalize.js';
 import { startOfDayInTimeZone } from '../push/push-date.js';
+import { extractCanonicalDomain } from './product-keys.js';
 import {
   contentHash,
   defaultLogError,
@@ -219,23 +220,6 @@ export function mapProductHuntPost(post: ProductHuntPost): CollectedItem {
     rawType: 'product',
     metadata,
   };
-}
-
-/**
- * 从 canonical_url 提取 canonical_domain：host 小写、去 `www.` 前缀。
- * normalizeUrl 已做 host 小写化与追踪参数清理；此处只取 host 并剥 www，口径与下游塌缩一致。
- * 输入为 null（无可用 URL）→ 返回 null（该键不参与合并）。
- */
-export function extractCanonicalDomain(canonicalUrl: string | null): string | null {
-  if (!canonicalUrl) return null;
-  let host: string;
-  try {
-    host = new URL(canonicalUrl).host.toLowerCase();
-  } catch {
-    return null;
-  }
-  if (host.length === 0) return null;
-  return host.startsWith('www.') ? host.slice(4) : host;
 }
 
 /** 当日上榜产品的 GraphQL 查询（按票数倒序，postedAfter=今日）。 */

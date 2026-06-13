@@ -6,9 +6,13 @@
  * source 字段聚合 `perSource`。新增一个写 `raw_items` 的源**只需向 registry 注册**该 collector，
  * 不改既有源的编排分支（消除「加一源改两处」，对齐 spec「registry 注册即接入新源」）。
  *
- * registry 支持**按 source 筛选子集**（`collectSources(registry, allowed)`）：日报工作流调全集，
- * 实时告警高频工作流只调实时新闻源子集 `{rss, hacker_news, github}`（避免高频链被迫连 arXiv
- * 非实时 / PH 配额受限一起跑，见 realtime-alerts）。
+ * registry 支持**按 source 筛选子集**（`collectSources(registry, allowed)`）。三视图（design D6）：
+ *   - **全集**（`collectAllSources` / `buildRegistry` 全量）：日报工作流采全部已注册源（含 arXiv 仅沉淀）。
+ *   - **实时新闻子集** `REALTIME_NEWS_SOURCES = {rss, hacker_news, github}`：实时告警高频链只调这三源
+ *     （避免高频链被迫连 arXiv 非实时 / PH 配额受限一起跑，见 realtime-alerts）。
+ *   - **产品源子集** `PRODUCT_SOURCES = {product_hunt, show_hn}`：product-digest 产品发现链采全部产品源
+ *     → 紧接同链产品塌缩（链路显式闭合，见 product-discovery / design D6）。
+ * 两子集均为手工维护的字面量，**有意不归属任一子集的源**（如 arXiv 仅日报全集沉淀、无实时/产品消费）。
  *
  * 单源失败隔离（不变量）：某源抛错（如 GitHub 限流 / arXiv 429 达上限放弃 / 鉴权）被记错误日志、
  * 其余源照常完成，整批采集不中止。塌缩成 event 是下游职责。
@@ -28,6 +32,10 @@ import {
   type ProductHuntCollectorOptions,
 } from './product-hunt.js';
 import {
+  collectShowHn,
+  type ShowHnCollectorOptions,
+} from './show-hn.js';
+import {
   storeCollectedItems,
   type StoreOptions,
   type StoreResult,
@@ -45,6 +53,7 @@ export { collectHackerNews } from './hacker-news.js';
 export { collectGitHub } from './github.js';
 export { collectArxiv, harvestArxiv } from './arxiv.js';
 export { collectProductHunt } from './product-hunt.js';
+export { collectShowHn } from './show-hn.js';
 export { storeCollectedItems } from './store.js';
 
 /** 单个源在本轮采集中可用的注入选项（按 source 路由）。 */
@@ -54,6 +63,7 @@ export interface PerSourceOptions {
   github?: GitHubCollectorOptions;
   arxiv?: ArxivCollectorOptions;
   productHunt?: ProductHuntCollectorOptions;
+  showHn?: ShowHnCollectorOptions;
 }
 
 /** registry 单项契约（design D1）：标记 source + 无参可调的 collect 闭包。 */
@@ -79,6 +89,7 @@ export interface CollectAllOptions extends PerSourceOptions {
     productHunt?: (
       opts?: ProductHuntCollectorOptions,
     ) => Promise<CollectedItem[]>;
+    showHn?: (opts?: ShowHnCollectorOptions) => Promise<CollectedItem[]>;
   };
 }
 
@@ -112,17 +123,40 @@ export function buildRegistry(
       collect: () =>
         (c.productHunt ?? collectProductHunt)(options.productHunt),
     },
+    {
+      source: 'show_hn',
+      collect: () => (c.showHn ?? collectShowHn)(options.showHn),
+    },
   ];
 }
 
 /**
  * 实时新闻源子集（design D6 / realtime-alerts）：高频告警链路只采这三源
  * （排除 arXiv 非实时、Product Hunt 配额受限）。供 `collectSources` 按 source 过滤复用。
+ *
+ * **维护对称性（前向脆弱护栏，design D6）**：本子集与 `PRODUCT_SOURCES`（见下）均为手工维护的
+ * `CollectorSource[]` 字面量，与 `buildRegistry` 源全集独立。新增源（如非目标里预告的 Reddit）须显式
+ * 决定归属哪个子集（或有意不归属任一子集，如 arXiv 仅日报全集沉淀、无实时/产品消费）——否则会被静默
+ * 排除出实时/产品链。`show_hn` **有意不在此子集**：实时告警消费 ai_news_events，product 不进事件塌缩
+ * → 天然不进告警评分链（真正的告警隔离闸是 `raw_type='product'` 路由，非子集成员资格）。
  */
 export const REALTIME_NEWS_SOURCES: readonly CollectorSource[] = [
   'rss',
   'hacker_news',
   'github',
+];
+
+/**
+ * 产品源子集（design D6 / product-discovery）：产品发现链路（product-digest）经
+ * `collectSources(PRODUCT_SOURCES, ...)` 采全部产品源 → 紧接同链 `collapseUncollapsedProductRawItems`
+ * 塌缩进 ai_products（链路显式闭合，不依赖跨 workflow 隐式时序）。
+ *
+ * 与 `REALTIME_NEWS_SOURCES`（见上）对称的手工维护字面量；`show_hn` 与 `product_hunt` 同属产品源。
+ * 有意不归属任一子集的源（如 arXiv 仅日报全集沉淀）不出现在这两个子集里。
+ */
+export const PRODUCT_SOURCES: readonly CollectorSource[] = [
+  'product_hunt',
+  'show_hn',
 ];
 
 /**

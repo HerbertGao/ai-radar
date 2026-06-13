@@ -1,0 +1,138 @@
+{
+    "exhaustive": {
+        "nbHits": false,
+        "typo": true
+    },
+    "exhaustiveNbHits": false,
+    "exhaustiveTypo": true,
+    "hits": [
+        {
+            "_highlightResult": {
+                "author": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "yassros16"
+                },
+                "title": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "Show HN: Galdor \u2013 a Go LLM agent framework with built-in tracing and replay"
+                },
+                "url": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "https://github.com/YasserCR/galdor"
+                }
+            },
+            "_tags": [
+                "story",
+                "author_yassros16",
+                "story_48520360",
+                "show_hn"
+            ],
+            "author": "yassros16",
+            "children": [
+                48520362
+            ],
+            "created_at": "2026-06-13T19:04:09Z",
+            "created_at_i": 1781377449,
+            "num_comments": 0,
+            "objectID": "48520360",
+            "points": 2,
+            "story_id": 48520360,
+            "title": "Show HN: Galdor \u2013 a Go LLM agent framework with built-in tracing and replay",
+            "updated_at": "2026-06-13T19:17:54Z",
+            "url": "https://github.com/YasserCR/galdor"
+        },
+        {
+            "_highlightResult": {
+                "author": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "rairishabh2810"
+                },
+                "title": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "Show HN: Flashback Booth, A tactile retro photo booth in the browser"
+                },
+                "url": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "https://flashbackbooth.me"
+                }
+            },
+            "_tags": [
+                "story",
+                "author_rairishabh2810",
+                "story_48520330",
+                "show_hn"
+            ],
+            "author": "rairishabh2810",
+            "children": [
+                48520343
+            ],
+            "created_at": "2026-06-13T19:01:21Z",
+            "created_at_i": 1781377281,
+            "num_comments": 0,
+            "objectID": "48520330",
+            "points": 1,
+            "story_id": 48520330,
+            "title": "Show HN: Flashback Booth, A tactile retro photo booth in the browser",
+            "updated_at": "2026-06-13T19:03:39Z",
+            "url": "https://flashbackbooth.me"
+        },
+        {
+            "_highlightResult": {
+                "author": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "alexpate"
+                },
+                "title": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "Show HN: Domainbase \u2013 Instant domain search and management"
+                },
+                "url": {
+                    "matchLevel": "none",
+                    "matchedWords": [],
+                    "value": "https://domainbase.app/"
+                }
+            },
+            "_tags": [
+                "story",
+                "author_alexpate",
+                "story_48520199",
+                "show_hn"
+            ],
+            "author": "alexpate",
+            "created_at": "2026-06-13T18:44:28Z",
+            "created_at_i": 1781376268,
+            "num_comments": 0,
+            "objectID": "48520199",
+            "points": 1,
+            "story_id": 48520199,
+            "title": "Show HN: Domainbase \u2013 Instant domain search and management",
+            "updated_at": "2026-06-13T18:47:23Z",
+            "url": "https://domainbase.app/"
+        }
+    ],
+    "hitsPerPage": 3,
+    "nbHits": 538718,
+    "nbPages": 334,
+    "page": 0,
+    "params": "tags=show_hn&hitsPerPage=3&advancedSyntax=true&analyticsTags=backend",
+    "processingTimeMS": 1,
+    "processingTimingsMS": {
+        "_request": {
+            "roundTrip": 15
+        },
+        "fetch": {
+            "total": 1
+        },
+        "total": 2
+    },
+    "query": "",
+    "serverTimeMS": 2
+}
