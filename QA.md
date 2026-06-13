@@ -337,7 +337,7 @@ LangGraph
 - GitHub Trending
 - GitHub Search API
 - arXiv cs.AI / cs.CL / cs.LG
-- Papers with Code
+- Papers with Code（已作废：Meta 于 2025 关停并重定向至 Hugging Face，无可用 feed）
 - Hugging Face Papers
 
 ### 7.3 AI 产品发现源
