@@ -31,13 +31,13 @@
 
 ## 6. 远端 ts.mac-mini 同步生效
 
-- [ ] 6.1 `ssh ts.mac-mini` → `cd ~/ai-radar` → `cp -p .env .env.bak.$(date +%Y%m%d-%H%M%S)` 备份
-- [ ] 6.2 python3 精确追加 `SHOW_HN_MIN_POINTS`/`SHOW_HN_MAX_PER_RUN` 到远端 `.env`（带断言：键尚不存在；勿整文件覆盖）
-- [ ] 6.3 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d` 重建 worker/web
-- [ ] 6.4 `docker compose exec -T worker printenv SHOW_HN_MIN_POINTS` 确认；`docker compose logs --since 60s worker` 确认 env 校验通过、调度链已启动
+- [x] 6.1 `ssh ts.mac-mini` → `cd ~/ai-radar` → `cp -p .env .env.bak.$(date +%Y%m%d-%H%M%S)` 备份
+- [x] 6.2 python3 精确追加 `SHOW_HN_MIN_POINTS`/`SHOW_HN_MAX_PER_RUN` 到远端 `.env`（带断言：键尚不存在；勿整文件覆盖）
+- [x] 6.3 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d` 重建 worker/web
+- [x] 6.4 `docker compose exec -T worker printenv SHOW_HN_MIN_POINTS` 确认；`docker compose logs --since 60s worker` 确认 env 校验通过、调度链已启动
 
 ## 7. 提交与规范归档
 
-- [ ] 7.1 提交代码 + `.env.example`（`.env` 不入库）；含 src 实现 → **走 PR**（实现代码走 PR，归档/纯文档直推 main——按本仓库约定与 memory）
-- [ ] 7.2 `/opsx:sync` 将增量规范并入 `source-collectors` 与 `product-discovery` 主规范（含 F1 github.com 修复需求）
-- [ ] 7.3 `/opsx:archive` 归档本变更（纯文档归档步骤直推 main、不另开 PR）
+- [x] 7.1 提交代码 + `.env.example`（`.env` 不入库）；含 src 实现 → **走 PR**（实现代码走 PR，归档/纯文档直推 main——按本仓库约定与 memory）
+- [x] 7.2 `/opsx:sync` 将增量规范并入 `source-collectors` 与 `product-discovery` 主规范（含 F1 github.com 修复需求）
+- [x] 7.3 `/opsx:archive` 归档本变更（纯文档归档步骤直推 main、不另开 PR）
