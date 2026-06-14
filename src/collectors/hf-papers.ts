@@ -101,11 +101,21 @@ function extractEntries(body: unknown[]): HfDailyPaperEntry[] {
   return out;
 }
 
-/** 从 submittedBy（对象/字符串/缺失）安全取提交者名，无则 null。 */
+/**
+ * 安全取可空字段的 trim 串：**非字符串（数字/对象/布尔/null/undefined）→ ''**。
+ * HF API 若对 title/summary/organization 返非字符串，裸 `?.trim()` 会抛 TypeError 拖垮整个
+ * `hugging_face_papers` 源（而非按 M-B 逐行跳过坏行）；本守卫把非字符串归一为空串、交由各字段的
+ * 空值处理（title 空→跳过 / content 空→null / organization 空→不写）。
+ */
+function asTrimmedString(v: unknown): string {
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+/** 从 submittedBy（对象/字符串/缺失）安全取提交者名，无则 null（字段非字符串时不崩）。 */
 function extractSubmittedBy(submittedBy: HfDailyPaperEntry['submittedBy']): string | null {
   if (typeof submittedBy === 'string') return submittedBy.trim() || null;
   if (submittedBy && typeof submittedBy === 'object') {
-    const name = submittedBy.fullname?.trim() || submittedBy.name?.trim();
+    const name = asTrimmedString(submittedBy.fullname) || asTrimmedString(submittedBy.name);
     return name || null;
   }
   return null;
@@ -165,7 +175,8 @@ export async function collectHfPapers(
     }
 
     // 缺 title 跳过（M-B）：title NOT NULL，无合理回退源时不降级、不写空 title。
-    const title = stripUnsafeChars((paper.title ?? '').trim());
+    // asTrimmedString 防 paper.title 为非字符串时 .trim() 崩整个源（Bugbot #4）→ 非字符串归 '' → 跳过该行。
+    const title = stripUnsafeChars(asTrimmedString(paper.title));
     // strip 后再判空：含危险字节的 title 经 strip 致空 → 跳过该条（不写空/退化 title）。
     if (title.length === 0) {
       logError('hugging_face_papers 条目缺 paper.title，跳过不发射（title NOT NULL 不降级）', {
@@ -181,11 +192,13 @@ export async function collectHfPapers(
     if (typeof entry.numComments === 'number') metadata.num_comments = entry.numComments;
     // FIX-9：organization「可得才放」——元素级或 paper 子对象含非空 organization 则填 metadata.organization，
     // 否则不写该键（防御性可选读取，无则保持 metadata 不含 organization）。
-    const organization = (entry.organization ?? paper.organization)?.trim();
+    // asTrimmedString 防非字符串 .trim() 崩（Bugbot #4）；`||` 使元素级空/非字符串时回退 paper 级（顺带修元素级空串遮蔽 paper 级有效值）。
+    const organization = asTrimmedString(entry.organization) || asTrimmedString(paper.organization);
     if (organization) metadata.organization = stripUnsafeChars(organization);
 
     // content：trim 后净化危险字节；strip 致空（全控制符 summary）→ null（content 可空，不写空串）。
-    const summary = paper.summary?.trim();
+    // asTrimmedString 防 paper.summary 为非字符串时 .trim() 崩（Bugbot #4）→ 非字符串归 '' → content null。
+    const summary = asTrimmedString(paper.summary);
     const content = summary ? stripUnsafeChars(summary) || null : null;
 
     items.push({

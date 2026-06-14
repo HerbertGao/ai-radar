@@ -110,6 +110,28 @@ describe('collectHfPapers 映射统一结构（固化真实 daily_papers fixture
     expect(items[0]!.sourceItemId).toBe('12345');
     expect(items[0]!.url).toBe('https://huggingface.co/papers/12345');
   });
+
+  it('HF 返回非字符串字段（title/summary/organization 为数字/对象）→ 不崩、按行优雅处理（Bugbot #4）', async () => {
+    const logs: string[] = [];
+    const items = await mod.collectHfPapers({
+      // fetchJson 返回 unknown：模拟 HF API 返非字符串字段（裸 .trim() 会崩整源）。
+      fetchJson: async () => [
+        { paper: { id: 'bad-title', title: 999, summary: 'x' } }, // 非字符串 title → 视同缺 title 跳过该行
+        {
+          paper: { id: 'ok', title: 'Valid Title', summary: 42 }, // 非字符串 summary → content null
+          organization: { not: 'a string' }, // 非字符串 organization → 不写 metadata
+        },
+      ],
+      logError: (m) => logs.push(m),
+    });
+    // 不抛（整源未崩）；非字符串 title 行被跳过，合法行正常发射。
+    expect(items).toHaveLength(1);
+    expect(items[0]!.sourceItemId).toBe('ok');
+    expect(items[0]!.title).toBe('Valid Title');
+    expect(items[0]!.content).toBeNull(); // summary 非字符串 → content null
+    expect(items[0]!.metadata).not.toHaveProperty('organization');
+    expect(logs.some((l) => l.includes('title'))).toBe(true); // 跳过非字符串 title 行有日志
+  });
 });
 
 describe('collectHfPapers 缺字段跳过（M-B：绝不产假 id / 绝不空 title）', () => {
