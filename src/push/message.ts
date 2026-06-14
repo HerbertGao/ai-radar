@@ -14,6 +14,7 @@
  * 单条消息原子送达——N 条 push_record 状态同生共死（成功整批 success / 失败整批 failed），
  * 故必须拼成一条，不可拆多条。
  */
+import { HEADLINE_MAX } from '../agents/digest/schema.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import type { Channel } from './targets.js';
 
@@ -430,6 +431,323 @@ export function renderDigest(
       // 穷尽性检查：channelEnum 新增成员而本处未加分支时编译期报错（防遗漏渲染分支）。
       const exhaustive: never = channel;
       throw new Error(`renderDigest: 未知 channel=${String(exhaustive)}`);
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 日报双段渲染（merge-products-into-daily-digest，design D3）
+//
+// 一条「AI Radar 每日情报」=「要闻段（events）+ 新品段（products）」。与 weekly 的区别：
+// weekly 是「整份一条 push_record（target_id=iso_week）」整份 truncateByCodePoint 截断，
+// includedIds 恒为 [iso_week]；本处是**逐条** event/product 各自幂等——截断采
+// buildDigestMessage 的「按块累加遇超限即停」语义，两段**共享** MAX_MESSAGE_LENGTH 预算，
+// 要闻段在前、新品段顺延（顺延者不进 includedIds）。
+//
+// 与 weekly 共享的只有**视觉分段排版**（标题块 + 列表），不复用 WeeklySelectedEvent 单条结构。
+//
+// 返回分段 includedIds（eventIncludedIds / productIncludedIds），让 dispatcher 只对「真发出的」
+// 按各自 target_type 置 success（否则被截断未发的产品误标 success → 永久漏推，design D3）。
+//
+// **零 LLM**：产品段=序号 + 产品名 + 官网链接（canonicalUrl）；canonicalUrl 为 null → 仅产品名；
+// 产品无 headline/summary → 不渲染要点行（不去找 ai_products 简述列）。
+//
+// 表头计数取**实发数**（eventIncludedIds.length / productIncludedIds.length），非入参 pending 长度。
+// ──────────────────────────────────────────────────────────────────────────
+
+/** 日报渲染结果：MarkdownV2 文本（feishu 分支由 text 承载 card JSON）+ 分段 includedIds。 */
+export interface DailyDigestRendered {
+  text: string;
+  parseMode: 'MarkdownV2';
+  /** 实际拼进消息的 event 的 eventId（保持入参顺序）；被截断顺延的不在内、保持 pending。 */
+  eventIncludedIds: string[];
+  /** 实际拼进消息的 product 的 eventId（product 候选的 eventId = product_id）；同上。 */
+  productIncludedIds: string[];
+}
+
+/** 单个事件块的 MarkdownV2 文本（序号 + 标题 + 要点回退链 + 原文链接），复用 buildDigestMessage 同款渲染。 */
+function dailyTelegramBlock(e: SelectedEvent, idx: number): string {
+  const rawTitle = e.representativeTitle?.trim() || '(无标题)';
+  const title = escapeMarkdownV2(truncateByCodePoint(rawTitle, TITLE_MAX));
+
+  // headline_zh 列无长度上限（zod cap 仅约束 LLM 写入路径，手动 backfill 等非 zod 路径不受其约束），
+  // 故块内按 HEADLINE_MAX 本地再截断一次，使「单块恒可装」自证、不依赖上游 cap。
+  const headlineText = resolveHeadlineText(e);
+  const headlineLine = headlineText
+    ? `\n${escapeMarkdownV2(truncateByCodePoint(headlineText, HEADLINE_MAX))}`
+    : '';
+
+  // 链接：canonical_url 用专用 URL 转义器；缺失或超长则丢弃（仅渲染前面部分），保证单块恒可发。
+  const url = e.canonicalUrl?.trim();
+  let linkLine = '';
+  if (url) {
+    if (url.length <= MAX_URL_LENGTH) {
+      linkLine = `\n[原文](${escapeMarkdownV2Url(url)})`;
+    } else {
+      console.error(
+        `[push] daily canonical_url 超长（${url.length} 字符 > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
+      );
+    }
+  }
+
+  return `${escapeMarkdownV2(`${idx}.`)} *${title}*${headlineLine}${linkLine}`;
+}
+
+/** 单个产品块的 MarkdownV2 文本（序号 + 产品名 + 官网链接；无要点行；canonicalUrl null → 仅产品名）。 */
+function dailyTelegramProductBlock(p: SelectedEvent, idx: number): string {
+  // 产品名复用 representativeTitle（varchar(255) 有界），套 TITLE_MAX code-point 截断再转义。
+  const rawName = p.representativeTitle?.trim() || '(无产品名)';
+  const name = escapeMarkdownV2(truncateByCodePoint(rawName, TITLE_MAX));
+
+  // 官网链接：canonicalUrl 存在且不超长才渲染；超长丢链接（产品名 + canonical_domain 均有界 → 单块恒可装）。
+  const url = p.canonicalUrl?.trim();
+  let linkLine = '';
+  if (url) {
+    if (url.length <= MAX_URL_LENGTH) {
+      linkLine = `\n[官网](${escapeMarkdownV2Url(url)})`;
+    } else {
+      console.error(
+        `[push] daily product canonical_url 超长（${url.length} 字符 > ${MAX_URL_LENGTH}），丢弃链接仅渲染产品名。productId=${p.eventId}`,
+      );
+    }
+  }
+
+  return `${escapeMarkdownV2(`${idx}.`)} *${name}*${linkLine}`;
+}
+
+/**
+ * 日报 Telegram 渲染（MarkdownV2，design D3）：两段（要闻 + 新品）共享 MAX_MESSAGE_LENGTH 预算，
+ * 按块累加遇超限即停——要闻段优先、新品段顺延（顺延者不进 includedIds）。某段空只渲染非空段。
+ * 表头计数取实发数（eventIncludedIds.length / productIncludedIds.length）。
+ */
+function buildDailyDigestMessage(
+  events: readonly SelectedEvent[],
+  products: readonly SelectedEvent[],
+): DailyDigestRendered {
+  // 段标题（已转义）。
+  const eventsHeading = `*${escapeMarkdownV2('要闻')}*`;
+  const productsHeading = `*${escapeMarkdownV2('新品')}*`;
+
+  // 预渲染每段的块（块内已按 TITLE_MAX/HEADLINE_MAX/MAX_URL_LENGTH 有界，单块恒可装）。
+  const eventBlocks = events.map((e, i) => dailyTelegramBlock(e, i + 1));
+  const productBlocks = products.map((p, i) => dailyTelegramProductBlock(p, i + 1));
+
+  // 按块累加：先要闻段、后新品段，共享一个 text 缓冲与 MAX_MESSAGE_LENGTH 预算。
+  // 表头含实发数，但实发数依赖累加结果——故先以「全量计数」预留表头最坏长度（计数位数极短，
+  // 不同实发数下表头长度差异最多几个字符，落在 MAX_MESSAGE_LENGTH 的保守余量内），
+  // 末尾再以实发数重算表头。
+  const eventIncludedIds: string[] = [];
+  const productIncludedIds: string[] = [];
+
+  // 表头长度上界：计数取各段全量长度（位数最多、表头最长），保证预留充足。
+  const headerUpperBound = buildDailyHeaderTelegram(events.length, products.length);
+  let usedLen = headerUpperBound.length;
+
+  // 累加要闻段（段标题在首个入选块之前才追加，空段不渲染标题）。
+  let eventsHeadingCharged = false;
+  for (let i = 0; i < eventBlocks.length; i += 1) {
+    const headingCost = eventsHeadingCharged ? 0 : `\n\n${eventsHeading}`.length;
+    const blockCost = `\n\n${eventBlocks[i]!}`.length;
+    if (usedLen + headingCost + blockCost > MAX_MESSAGE_LENGTH) break;
+    usedLen += headingCost + blockCost;
+    eventsHeadingCharged = true;
+    eventIncludedIds.push(events[i]!.eventId);
+  }
+
+  // 累加新品段（顺延在要闻段之后；要闻段空时新品段成首段，其首块仍恒可装）。
+  let productsHeadingCharged = false;
+  for (let i = 0; i < productBlocks.length; i += 1) {
+    const headingCost = productsHeadingCharged ? 0 : `\n\n${productsHeading}`.length;
+    const blockCost = `\n\n${productBlocks[i]!}`.length;
+    if (usedLen + headingCost + blockCost > MAX_MESSAGE_LENGTH) break;
+    usedLen += headingCost + blockCost;
+    productsHeadingCharged = true;
+    productIncludedIds.push(products[i]!.eventId);
+  }
+
+  // 用实发数重建表头与正文（实发数 ≤ 全量数 → 重建后 text 长度 ≤ 上界估算，恒不超限）。
+  const header = buildDailyHeaderTelegram(
+    eventIncludedIds.length,
+    productIncludedIds.length,
+  );
+  const parts: string[] = [header];
+  if (eventIncludedIds.length > 0) {
+    parts.push(eventsHeading);
+    for (let i = 0; i < eventIncludedIds.length; i += 1) parts.push(eventBlocks[i]!);
+  }
+  if (productIncludedIds.length > 0) {
+    parts.push(productsHeading);
+    for (let i = 0; i < productIncludedIds.length; i += 1) parts.push(productBlocks[i]!);
+  }
+
+  return {
+    text: parts.join('\n\n'),
+    parseMode: 'MarkdownV2',
+    eventIncludedIds,
+    productIncludedIds,
+  };
+}
+
+/** 日报表头（Telegram，MarkdownV2）：`AI Radar 每日情报（要闻 X·新品 Y）`，计数取实发数。 */
+function buildDailyHeaderTelegram(eventCount: number, productCount: number): string {
+  return `*${escapeMarkdownV2(
+    `AI Radar 每日情报（要闻 ${eventCount}·新品 ${productCount}）`,
+  )}*`;
+}
+
+/**
+ * 日报飞书卡片渲染（design D3）：两段（要闻/新品）div 列表，文字链跳转、不依赖回调。
+ * 与 Telegram 同款「按块累加遇超限即停」共享预算（以序列化 text 长度近似度量），
+ * 要闻段优先、新品段顺延。表头计数取实发数。返回 text 承载 `{ card }` 的 JSON 序列化串。
+ */
+function buildDailyFeishuCard(
+  events: readonly SelectedEvent[],
+  products: readonly SelectedEvent[],
+): DailyDigestRendered {
+  // 单个事件块的 lark_md 内容（序号 + 标题 + 要点回退链 + 原文链接）。
+  const eventContent = (e: SelectedEvent, idx: number): string => {
+    const rawTitle = e.representativeTitle?.trim() || '(无标题)';
+    const title = escapeLarkMdText(truncateByCodePoint(rawTitle, FEISHU_TITLE_MAX));
+    const lines: string[] = [`**${idx}. ${title}**`];
+    // 同 Telegram：headline_zh 列无长度上限，块内按 HEADLINE_MAX 本地再截断一次使单块恒可装。
+    const headlineText = resolveHeadlineText(e);
+    if (headlineText) lines.push(escapeLarkMdText(truncateByCodePoint(headlineText, HEADLINE_MAX)));
+    const url = e.canonicalUrl?.trim();
+    if (url && url.length <= MAX_URL_LENGTH) {
+      lines.push(`[原文](${url})`);
+    } else if (url) {
+      console.error(
+        `[push] daily feishu canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
+      );
+    }
+    return lines.join('\n');
+  };
+
+  // 单个产品块的 lark_md 内容（序号 + 产品名 + 官网链接；无要点行；null → 仅产品名）。
+  const productContent = (p: SelectedEvent, idx: number): string => {
+    const rawName = p.representativeTitle?.trim() || '(无产品名)';
+    const name = escapeLarkMdText(truncateByCodePoint(rawName, FEISHU_TITLE_MAX));
+    const lines: string[] = [`**${idx}. ${name}**`];
+    const url = p.canonicalUrl?.trim();
+    if (url && url.length <= MAX_URL_LENGTH) {
+      lines.push(`[官网](${url})`);
+    } else if (url) {
+      console.error(
+        `[push] daily feishu product canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染产品名。productId=${p.eventId}`,
+      );
+    }
+    return lines.join('\n');
+  };
+
+  const eventContents = events.map((e, i) => eventContent(e, i + 1));
+  const productContents = products.map((p, i) => productContent(p, i + 1));
+
+  // 段标题 div 内容（与最终渲染逐字一致，使预算度量准确）。
+  const eventsHeadingContent = `**${escapeLarkMdText('要闻')}**`;
+  const productsHeadingContent = `**${escapeLarkMdText('新品')}**`;
+
+  // 按块累加：以「拼入该块后的实际 card JSON 序列化长度」度量预算（要闻段优先、新品段顺延）。
+  // 实际序列化口径天然计入「段标题 div + elements 数组间逗号」两项开销——故 elements 即最终数组、
+  // 不另估；飞书额外受 FEISHU_MAX_BLOCKS 元素数上限约束（含两个段标题 div 在内的总 elements 数）。
+  const eventIncludedIds: string[] = [];
+  const productIncludedIds: string[] = [];
+  const elements: unknown[] = [];
+
+  // 表头取全量计数作长度上界（位数最多、表头最长）；末尾再以实发数重建（实发 ≤ 全量 → 长度 ≤ 上界）。
+  const headerUpperBound = buildDailyHeaderFeishu(events.length, products.length);
+  // 拼入候选块后是否仍满足「elements 数 ≤ FEISHU_MAX_BLOCKS 且序列化长度 ≤ MAX_MESSAGE_LENGTH」。
+  const fits = (): boolean =>
+    elements.length <= FEISHU_MAX_BLOCKS &&
+    serializeFeishuCard(headerUpperBound, elements).length <= MAX_MESSAGE_LENGTH;
+
+  // 段标题 div 与该段首个入选块一同拼入：若拼入后超限则连标题一并回退（不留孤立段标题）。
+  let eventsHeadingPushed = false;
+  for (let i = 0; i < eventContents.length; i += 1) {
+    const before = elements.length;
+    if (!eventsHeadingPushed) elements.push(feishuDiv(eventsHeadingContent));
+    elements.push(feishuDiv(eventContents[i]!));
+    if (!fits()) {
+      elements.length = before; // 回退本次推入（含可能的段标题）。
+      break;
+    }
+    eventsHeadingPushed = true;
+    eventIncludedIds.push(events[i]!.eventId);
+  }
+
+  let productsHeadingPushed = false;
+  for (let i = 0; i < productContents.length; i += 1) {
+    const before = elements.length;
+    if (!productsHeadingPushed) elements.push(feishuDiv(productsHeadingContent));
+    elements.push(feishuDiv(productContents[i]!));
+    if (!fits()) {
+      elements.length = before;
+      break;
+    }
+    productsHeadingPushed = true;
+    productIncludedIds.push(products[i]!.eventId);
+  }
+
+  // 用实发数重建表头（计数 ≤ 全量 → 序列化长度 ≤ 上界，恒不超限）；elements 已是最终数组。
+  const card = buildDailyHeaderFeishu(eventIncludedIds.length, productIncludedIds.length);
+  card.elements = elements;
+
+  return {
+    text: JSON.stringify({ card }),
+    parseMode: 'MarkdownV2',
+    eventIncludedIds,
+    productIncludedIds,
+  };
+}
+
+/** 日报飞书卡片表头（计数取实发数）；elements 由调用方填充。 */
+function buildDailyHeaderFeishu(eventCount: number, productCount: number): FeishuCard {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `AI Radar 每日情报（要闻 ${eventCount}·新品 ${productCount}）`,
+      },
+      template: 'blue',
+    },
+    elements: [],
+  };
+}
+
+/** 构造一个 lark_md div 元素。 */
+function feishuDiv(content: string): unknown {
+  return { tag: 'div', text: { tag: 'lark_md', content } };
+}
+
+/** 把已构好 elements 的卡片序列化为 dispatcher 契约的 text（`{ card }` JSON 串）。 */
+function serializeFeishuCard(card: FeishuCard, elements: unknown[]): string {
+  return JSON.stringify({ card: { ...card, elements } });
+}
+
+/**
+ * 日报双段渲染入口（design D3）。channel 决定走哪个分支（同 renderDigest）：
+ * telegram → MarkdownV2 文本；feishu → text 承载 `{ card }` JSON 串（沿用既有 FeishuSender 契约）。
+ * 返回 `{ text, parseMode, eventIncludedIds, productIncludedIds }`——分段 includedIds 是核心，
+ * 让 dispatcher 只对真发出的按各自 target_type 置 success。
+ *
+ * @param events 要闻段候选（入参顺序即渲染顺序）。
+ * @param products 新品段候选（product 候选的 eventId = product_id）。
+ * @param channel 目标通道。
+ */
+export function renderDailyDigest(
+  events: readonly SelectedEvent[],
+  products: readonly SelectedEvent[],
+  channel: Channel,
+): DailyDigestRendered {
+  switch (channel) {
+    case 'telegram':
+      return buildDailyDigestMessage(events, products);
+    case 'feishu':
+      return buildDailyFeishuCard(events, products);
+    default: {
+      // 穷尽性检查：channelEnum 新增成员而本处未加分支时编译期报错。
+      const exhaustive: never = channel;
+      throw new Error(`renderDailyDigest: 未知 channel=${String(exhaustive)}`);
     }
   }
 }
