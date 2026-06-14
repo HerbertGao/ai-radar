@@ -42,11 +42,11 @@
 
 ## 9. 远端 ts.mac-mini 部署
 
-- [ ] 9.1 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d --force-recreate`（**无 .env 清理步**——无独立产品调度 env；`DAILY_DIGEST_CRON` 保留）
-- [ ] 9.2 验证：`docker compose logs --since 90s worker` 确认**调度链数减一**（不再有 product-digest）；下次日报 cron 后确认推**一条**「AI Radar 每日情报（要闻 X·新品 Y）」含两段、不再有独立产品消息；push_records **有候选日**仍有 `target_type='product'` 行（**无候选日则断言「无新增 product 行 + 日报正常推要闻段」**，验收脚本容忍空）
+- [x] 9.1 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d --force-recreate`（**无 .env 清理步**——无独立产品调度 env；`DAILY_DIGEST_CRON` 保留）
+- [x] 9.2 验证：`docker compose logs --since 90s worker` 确认**调度链数减一**（不再有 product-digest）；下次日报 cron 后确认推**一条**「AI Radar 每日情报（要闻 X·新品 Y）」含两段、不再有独立产品消息；push_records **有候选日**仍有 `target_type='product'` 行（**无候选日则断言「无新增 product 行 + 日报正常推要闻段」**，验收脚本容忍空）
 
 ## 10. 提交与规范归档
 
 - [x] 10.1 提交代码（`.env` 不入库；本次无 `.env.example` 改动——无产品调度 env）；含 src 实现 → **走 PR**
-- [ ] 10.2 PR 合并后：`/opsx:sync` 将增量规范并入 `daily-intel-pipeline` + `product-discovery` 主规范（确认覆盖原 product-discovery「独立 BullMQ 调度任务」表述）
-- [ ] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
+- [x] 10.2 PR 合并后：`/opsx:sync` 将增量规范并入 `daily-intel-pipeline` + `product-discovery` 主规范（确认覆盖原 product-discovery「独立 BullMQ 调度任务」表述）
+- [x] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
