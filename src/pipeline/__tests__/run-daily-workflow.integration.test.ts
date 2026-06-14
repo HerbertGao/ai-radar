@@ -28,6 +28,8 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 const { runDailyWorkflow, WorkflowAbortError } = await import(
   '../run-daily-workflow.js'
 );
+// 产品段零件模块（供 vi.spyOn 注入塌缩/候选桩，验证日报产品段编排：塌缩只调一次、候选失败降级等）。
+const productDigestModule = await import('../product-digest.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
@@ -976,5 +978,235 @@ describe.skipIf(!canRun)('runDailyWorkflow 发布时间回填阶段（4.4）', (
     expect(result.outcome).toBe('skipped-no-candidates');
     expect(result.topNCount).toBe(0);
     expect(sender.calls).toBe(0);
+  });
+});
+
+/**
+ * runDailyWorkflow 产品段编排集成测试（merge-products-into-daily-digest，design D1/D5/D6，tasks 7.3）。
+ *
+ * 注入产品段两步零件桩（vi.spyOn product-digest 模块的 collapseProductsOnce / selectProductsForChannelSafe）：
+ * - 日报含产品段：候选非空 → 推一条含新品段的日报、push_records 出 target_type='product' 行。
+ * - 塌缩只调一次（多 channel 下断言 collapse 调用次数 = 1，channel-blind 不随 per-channel 重复）。
+ * - 产品段降级空（候选 safe 包装失败返回空）→ 新闻段照推、不进熔断分母（judge/digest 统计不变）。
+ * - 早退两段皆空才 skip：新闻空 + 产品非空 / 新闻非空 + 产品空 各正常推单段、两段皆空才 skip。
+ * - 汇总按 dispatchDailyDigest 的 outcome（sent → pushed）。
+ *
+ * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 产品段编排（7.3）', () => {
+  /** 造一个产品候选视图（SelectedEvent，eventId=product_id；无 headline/summary）。 */
+  function prodCandidate(productId: string): import('../../selection/top-n.js').SelectedEvent {
+    return {
+      eventId: productId,
+      representativeTitle: `产品候选 ${productId}`,
+      summaryZh: null,
+      headlineZh: null,
+      canonicalUrl: null,
+      publishedAt: null,
+      rankScore: 0,
+    };
+  }
+
+  it('日报含产品段：候选非空 → 推含新品段的日报，push_records 出 target_type=product 行', async () => {
+    const pid = `prod-seg-${process.pid}-a1`;
+    // 塌缩桩：无操作（不连真实产品塌缩）；候选桩：telegram 返回一个产品候选。
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    const candSpy = vi
+      .spyOn(productDigestModule, 'selectProductsForChannelSafe')
+      .mockResolvedValue([prodCandidate(pid)]);
+    try {
+      const items = [item({ id: 'pseg1', url: 'https://ex.com/pseg1', title: 'News with product' })];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1); // 一条含要闻 + 新品的日报。
+      expect(collapseSpy).toHaveBeenCalledTimes(1);
+
+      // push_records 出 product 行 success（产品段并入日报、各按 target_type 写）。
+      const { rows } = await pool!.query<{ target_id: string; status: string }>(
+        `SELECT target_id, status FROM push_records WHERE target_type='product'`,
+      );
+      expect(rows.find((r) => r.target_id === pid)?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('塌缩只调一次（多 channel 下 collapse 调用次数 = 1，channel-blind 不随 per-channel 重复）', async () => {
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    // 候选桩：两通道各返回各自候选（断言塌缩在 channel 展开之前只跑一次、候选 per-channel）。
+    const candSpy = vi
+      .spyOn(productDigestModule, 'selectProductsForChannelSafe')
+      .mockImplementation(async (channel) => [prodCandidate(`prod-mc-${process.pid}-${channel}`)]);
+    try {
+      const items = [item({ id: 'mcollapse', url: 'https://ex.com/mc', title: 'Multi channel collapse' })];
+      const tg = okSender();
+      const fs = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        channels: ['telegram', 'feishu'],
+        senders: { telegram: tg, feishu: fs },
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed');
+      // 塌缩 channel-blind 只跑一次（不随 2 个 channel 重复）。
+      expect(collapseSpy).toHaveBeenCalledTimes(1);
+      // 候选 per-channel：每个 channel 各调一次（共 2 次）。
+      expect(candSpy).toHaveBeenCalledTimes(2);
+      expect(tg.calls).toBe(1);
+      expect(fs.calls).toBe(1);
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('产品段降级空（候选 safe 返回空）→ 新闻段照推、不进熔断分母（judge/digest 统计不变）', async () => {
+    const collapseSpy = vi
+      .spyOn(productDigestModule, 'collapseProductsOnce')
+      .mockResolvedValue(undefined);
+    // 候选 safe 包装失败时返回空段（设计契约：永不抛、降级空）——此处直接返回空模拟降级结果。
+    const candSpy = vi
+      .spyOn(productDigestModule, 'selectProductsForChannelSafe')
+      .mockResolvedValue([]);
+    try {
+      const items = [
+        item({ id: 'pdeg1', url: 'https://ex.com/pdeg1', title: 'Healthy news A' }),
+        item({ id: 'pdeg2', url: 'https://ex.com/pdeg2', title: 'Healthy news B' }),
+      ];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      // 新闻段照常推送（产品段空不拖垮）。
+      expect(result.outcome).toBe('pushed');
+      expect(sender.calls).toBe(1);
+      // 熔断分母仅含 judge/digest，与产品段无关：judge 全过、digest 全过。
+      expect(result.judge).toEqual({ processed: 2, degraded: 0 });
+      expect(result.digest.degraded).toBe(0);
+      expect(collapseSpy).toHaveBeenCalledTimes(1);
+      void candSpy;
+      // 无 product 行写入（产品段空）。
+      const { rows } = await pool!.query<{ n: string }>(
+        `SELECT count(*) AS n FROM push_records WHERE target_type='product'`,
+      );
+      expect(Number(rows[0]!.n)).toBe(0);
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('早退：新闻非空 + 产品空 → 正常推单段（要闻段）', async () => {
+    const collapseSpy = vi.spyOn(productDigestModule, 'collapseProductsOnce').mockResolvedValue(undefined);
+    const candSpy = vi.spyOn(productDigestModule, 'selectProductsForChannelSafe').mockResolvedValue([]);
+    try {
+      const items = [item({ id: 'newsonly', url: 'https://ex.com/no', title: 'News only segment' })];
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning(items) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('pushed'); // 仅要闻段，正常推。
+      expect(sender.calls).toBe(1);
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('早退：新闻空 + 产品非空 → 正常推单段（新品段，不被新闻空吞掉）', async () => {
+    const pid = `prod-only-${process.pid}-x1`;
+    const collapseSpy = vi.spyOn(productDigestModule, 'collapseProductsOnce').mockResolvedValue(undefined);
+    const candSpy = vi
+      .spyOn(productDigestModule, 'selectProductsForChannelSafe')
+      .mockResolvedValue([prodCandidate(pid)]);
+    try {
+      // 新闻三源全空 → 新闻 Top N 为空；产品候选非空 → 仍须推新品段（design D6 修复「新闻空吞掉产品段」）。
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      // 新闻空但产品非空 → 不早退、推新品段。
+      expect(result.outcome).toBe('pushed');
+      expect(result.topNCount).toBe(0); // 新闻 Top N 空。
+      expect(sender.calls).toBe(1); // 仍发一条（仅新品段）。
+      // product 行写入 success。
+      const { rows } = await pool!.query<{ status: string }>(
+        `SELECT status FROM push_records WHERE target_type='product' AND target_id=$1`,
+        [pid],
+      );
+      expect(rows[0]?.status).toBe('success');
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
+  });
+
+  it('早退：新闻空 + 产品空 → skip-no-candidates（两段皆空才不推）', async () => {
+    const collapseSpy = vi.spyOn(productDigestModule, 'collapseProductsOnce').mockResolvedValue(undefined);
+    const candSpy = vi.spyOn(productDigestModule, 'selectProductsForChannelSafe').mockResolvedValue([]);
+    try {
+      const sender = okSender();
+      const result = await runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender,
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+      });
+      expect(result.outcome).toBe('skipped-no-candidates');
+      expect(sender.calls).toBe(0); // 两段皆空 → 不发空消息。
+    } finally {
+      collapseSpy.mockRestore();
+      candSpy.mockRestore();
+    }
   });
 });

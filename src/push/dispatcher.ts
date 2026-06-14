@@ -30,7 +30,7 @@ import { db as defaultDb } from '../db/index.js';
 import { pushRecords } from '../db/schema.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate } from './push-date.js';
-import { renderDigest } from './message.js';
+import { renderDigest, renderDailyDigest } from './message.js';
 import { CHANNEL, TARGET_TYPE, type Channel, type TargetType } from './targets.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
@@ -247,4 +247,283 @@ export async function dispatchDigest(
   });
 
   return { pushDate, pending: pending.length, outcome: 'sent', eventIds: includedIds };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 单消息双 target_type 分发（merge-products-into-daily-digest，design D2）
+//
+// 一条「AI Radar 每日情报」= 要闻段（events，target_type='event'）+ 新品段（products，
+// target_type='product'）。首次让一次 sender 发送横跨两个 target_type 命名空间——是对
+// dispatcher 既有「待发→pending→原子送达→success/failed + includedIds 截断顺延」机制的能力
+// 扩展（**复用** computePendingSet 与 pending INSERT / 终态 UPDATE 的 SQL 模式，绝不另写漂移状态机）。
+//
+// **单 channel 对称签名**：channel 维度由 run-daily 在 per-channel 层引入（products 由其从
+// productsByChannel.get(channel) 取并传入），dispatch 内**不循环 channel**，消除「productsForChannelA
+// 误发进 channelB」错配。两段的 pending INSERT 与终态写均限定四元组 (target_type,target_id,channel,
+// push_date)，与既有 per-channel 并发面隔离边界一致，无新增并发面。
+// ──────────────────────────────────────────────────────────────────────────
+
+/** 日报双段分发结果（**不复用 DispatchResult**——其 pending/eventIds 不适用双段）。 */
+export interface DailyDispatchResult {
+  pushDate: string;
+  /** 'sent' 至少一段发出 / 'failed' sender 抛异常 / 'skipped' 两段待发皆空。 */
+  outcome: 'sent' | 'failed' | 'skipped';
+  /** 本次实发（拼进消息、未被截断）的 event 的 event_id；被截断者不在内、保持 pending。 */
+  eventIncludedIds: string[];
+  /** 本次实发（拼进消息、未被截断）的 product 的 product_id；同上。 */
+  productIncludedIds: string[];
+}
+
+/**
+ * 执行一次日报双段推送（design D2，方案 A 终态）：
+ * ① 两段各算待发集合（computePendingSet 按各自 target_type）→ ② 两段皆空则 skip、仅一段空只处理
+ * 非空段 → ③ 两集合各 INSERT pending（各自 target_type，ON CONFLICT DO NOTHING）→ ④ renderDailyDigest
+ * 渲染一条双段消息 → ⑤ 非空抛错不变量 → ⑥ 一次 sender 发送 → ⑦ 方案 A 两段各自独立事务终态。
+ *
+ * **段级失败隔离（全程）**：product 侧任一 DB 操作异常绝不令「已发送成功」的 event 段被误判/回滚 failed；
+ * 发送前 product 侧异常 → productsPending 降级空、只推 event 段 + 告警。
+ *
+ * **方案 A 终态（关键、非对称）**：发送成功后**先**一个事务把 eventIncludedIds 置 success（优先固化要闻段）、
+ * **再**另一事务把 productIncludedIds 置 success；event 终态事务抛错**不 swallow、向上传播**（→ run-daily
+ * 置 failedChannels 触发整 job 重试），product 终态事务抛错**只记错误/告警、不回滚 event、不抛**（残留
+ * product pending 下次日报补发，outcome 仍 'sent'）。
+ *
+ * @param events 要闻段候选（入参顺序即渲染顺序）。
+ * @param products 新品段候选（product 候选的 eventId = product_id）。
+ * @param options 含 now 与 sender（必填）及可选 channel（默认 telegram）；**不读 options.targetType**
+ *   （双段各自固定 'event'/'product'）。
+ * @param dbh db 或事务句柄。
+ */
+export async function dispatchDailyDigest(
+  events: readonly SelectedEvent[],
+  products: readonly SelectedEvent[],
+  options: DispatchOptions,
+  dbh: DbLike = defaultDb,
+): Promise<DailyDispatchResult> {
+  const pushDate = getPushDate(options.now);
+  const channel = options.channel ?? DEFAULT_CHANNEL;
+
+  // ① 两段各算待发集合（按各自 target_type；产品「跨天一产品一生一次」由 computePendingSet「任一
+  //    push_date success 排除」+ 候选查询 merge_conflict 排除共同保证）。
+  const eventsPending = await computePendingSet(
+    events,
+    pushDate,
+    dbh,
+    TARGET_TYPE.event,
+    channel,
+  );
+
+  // 段级失败隔离（发送前）：product 侧 computePendingSet 抛错 → 降级空新品段 + 告警，只走 event 段；
+  // event 侧不降级（event 是优先段，其发送前 DB 异常按既有处理向上传播）。
+  let productsPending: SelectedEvent[] = [];
+  try {
+    productsPending = await computePendingSet(
+      products,
+      pushDate,
+      dbh,
+      TARGET_TYPE.product,
+      channel,
+    );
+  } catch (error) {
+    console.error(
+      `[daily-dispatch] 新品段 computePendingSet 失败，降级为空新品段、只推要闻段。` +
+        `pushDate=${pushDate} channel=${channel}`,
+      error,
+    );
+    productsPending = [];
+  }
+
+  // ② 两段待发皆空 → skip（不发空消息）。
+  if (eventsPending.length === 0 && productsPending.length === 0) {
+    return {
+      pushDate,
+      outcome: 'skipped',
+      eventIncludedIds: [],
+      productIncludedIds: [],
+    };
+  }
+
+  // ③ 两集合各 INSERT pending（各自 target_type，ON CONFLICT DO NOTHING 不覆盖既有行）。
+  //    event 段在前（优先段）；event INSERT 抛错按既有处理向上传播。
+  if (eventsPending.length > 0) {
+    await dbh.transaction(async (tx) => {
+      await tx
+        .insert(pushRecords)
+        .values(
+          eventsPending.map((e) => ({
+            targetType: TARGET_TYPE.event,
+            targetId: e.eventId,
+            channel,
+            pushDate,
+            status: 'pending',
+          })),
+        )
+        .onConflictDoNothing();
+    });
+  }
+
+  // 段级失败隔离（发送前）：product 段 INSERT pending 抛错 → 降级空新品段 + 告警，只走 event 段。
+  if (productsPending.length > 0) {
+    try {
+      await dbh.transaction(async (tx) => {
+        await tx
+          .insert(pushRecords)
+          .values(
+            productsPending.map((p) => ({
+              targetType: TARGET_TYPE.product,
+              targetId: p.eventId,
+              channel,
+              pushDate,
+              status: 'pending',
+            })),
+          )
+          .onConflictDoNothing();
+      });
+    } catch (error) {
+      console.error(
+        `[daily-dispatch] 新品段 INSERT pending 失败，降级为空新品段、只推要闻段。` +
+          `pushDate=${pushDate} channel=${channel}`,
+        error,
+      );
+      productsPending = [];
+    }
+  }
+
+  // product INSERT pending 降级（上方 catch）可能清空 productsPending；若此后两段皆空 →
+  // skip（不发空消息、不触发 ⑤ 非空抛错）。computePendingSet 失败已在前面接住，此处接 INSERT 失败。
+  if (eventsPending.length === 0 && productsPending.length === 0) {
+    return { pushDate, outcome: 'skipped', eventIncludedIds: [], productIncludedIds: [] };
+  }
+
+  // ④ 渲染一条双段消息（截断采按块累加语义，要闻段优先、新品段顺延；某段空只渲染非空段）。
+  const rendered = renderDailyDigest(eventsPending, productsPending, channel);
+  const { text, parseMode, eventIncludedIds, productIncludedIds } = rendered;
+
+  // ⑤ 非空抛错不变量（跨段保持，沿用 dispatchDigest:175-185 防静默漏推）：两段 pending 并集非空、
+  //    但两段 includedIds 并集空 → 抛错使整 job 可见失败（记录保持 pending 安全）。
+  if (eventIncludedIds.length === 0 && productIncludedIds.length === 0) {
+    throw new Error(
+      `dispatchDailyDigest: 待发 event=${eventsPending.length} product=${productsPending.length} ` +
+        `但渲染出 0 条可发（单块超限不变量被破坏），不静默跳过，抛错使整 job 失败可见。` +
+        `pushDate=${pushDate} channel=${channel}`,
+    );
+  }
+
+  // ⑥ 一次 sender 发送（feishu 由 text 承载 card JSON，FeishuSender 解析后 POST）。
+  try {
+    await options.sender.send(text, parseMode);
+  } catch (error) {
+    // 发送失败 → 两段都未发成功，各自独立事务把对应 included 子集置 failed（product 侧置 failed 也
+    // try/catch、不拖 event）；被截断未发的（不在 included）保持 pending。下次重试纳入待发集合。
+    const message = error instanceof Error ? error.message : String(error);
+    await setDailySegmentStatus(
+      dbh,
+      TARGET_TYPE.event,
+      channel,
+      pushDate,
+      eventIncludedIds,
+      'failed',
+      message,
+    );
+    try {
+      await setDailySegmentStatus(
+        dbh,
+        TARGET_TYPE.product,
+        channel,
+        pushDate,
+        productIncludedIds,
+        'failed',
+        message,
+      );
+    } catch (productErr) {
+      console.error(
+        `[daily-dispatch] 发送失败后新品段置 failed 写库异常（不拖累要闻段）。` +
+          `pushDate=${pushDate} channel=${channel} productIncludedIds=${JSON.stringify(productIncludedIds)}`,
+        productErr,
+      );
+    }
+    return { pushDate, outcome: 'failed', eventIncludedIds, productIncludedIds };
+  }
+
+  // ⑦ 方案 A 终态（两段各自独立事务）：消息已送达是既成事实。
+  //    先固化要闻段（event 终态事务抛错**不 swallow、向上传播** → run-daily 置 failedChannels 触发整
+  //    job 重试，重试时 computePendingSet 排除已 success 段、只重发残 pending 段）。
+  await setDailySegmentStatus(
+    dbh,
+    TARGET_TYPE.event,
+    channel,
+    pushDate,
+    eventIncludedIds,
+    'success',
+  );
+
+  // 再固化新品段（product 终态事务抛错**只记错误/告警、不回滚 event、不抛**——event 已 success，残留
+  //    product pending 由下次日报运行的 computePendingSet 补发；outcome 仍 'sent'，不令该 channel 进
+  //    failedChannels 触发整 job 重试，与 event 段失败非对称是有意的，design D2-8）。
+  try {
+    await setDailySegmentStatus(
+      dbh,
+      TARGET_TYPE.product,
+      channel,
+      pushDate,
+      productIncludedIds,
+      'success',
+    );
+  } catch (error) {
+    console.error(
+      `[daily-dispatch] 新品段终态写 success 失败，要闻段已 success（不回滚）、新品残 pending 下次补。` +
+        `这些 product_id 残 pending、次日日报运行会补发（重复推送一次，符合方案 A 已知权衡）。` +
+        `pushDate=${pushDate} channel=${channel} productIncludedIds=${JSON.stringify(productIncludedIds)}`,
+      error,
+    );
+  }
+
+  return { pushDate, outcome: 'sent', eventIncludedIds, productIncludedIds };
+}
+
+/**
+ * 把某段（单一 target_type）实发的 includedIds 行置终态（success/failed），独立事务。
+ * 沿用 dispatchDigest 终态 UPDATE 的 SQL 模式：`inArray(targetId, includedIds)` + 限定单一
+ * (targetType, channel, pushDate)。**禁止另写漂移状态机**。
+ *
+ * - includedIds 空 → 无操作（该段未实发任何条目，无行可改）。
+ * - success：写 pushed_at、清空残留 error_message。
+ * - failed：写 error_message（截 1000 字）。
+ */
+async function setDailySegmentStatus(
+  dbh: DbLike,
+  targetType: TargetType,
+  channel: Channel,
+  pushDate: string,
+  includedIds: string[],
+  status: 'success' | 'failed',
+  errorMessage?: string,
+): Promise<void> {
+  if (includedIds.length === 0) return;
+  await dbh.transaction(async (tx) => {
+    await tx
+      .update(pushRecords)
+      .set(
+        status === 'success'
+          ? {
+              status: 'success',
+              pushedAt: new Date(),
+              errorMessage: null,
+              updatedAt: sql`now()`,
+            }
+          : {
+              status: 'failed',
+              errorMessage: (errorMessage ?? '').slice(0, 1000),
+              updatedAt: sql`now()`,
+            },
+      )
+      .where(
+        and(
+          eq(pushRecords.targetType, targetType),
+          eq(pushRecords.channel, channel),
+          eq(pushRecords.pushDate, pushDate),
+          inArray(pushRecords.targetId, includedIds),
+        ),
+      );
+  });
 }

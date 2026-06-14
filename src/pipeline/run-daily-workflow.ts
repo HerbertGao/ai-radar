@@ -48,10 +48,14 @@ import {
 } from '../agents/digest/persistence.js';
 import type { SummarizeOptions } from '../agents/digest/index.js';
 import {
-  dispatchDigest,
-  type DispatchResult,
+  dispatchDailyDigest,
+  type DailyDispatchResult,
   type MessageSender,
 } from '../push/dispatcher.js';
+import {
+  collapseProductsOnce,
+  selectProductsForChannelSafe,
+} from './product-digest.js';
 import { createTelegramSender } from '../push/telegram.js';
 import { createFeishuSender } from '../push/feishu.js';
 import { CHANNEL, type Channel } from '../push/targets.js';
@@ -459,10 +463,42 @@ export async function runDailyWorkflow(
       throw new WorkflowAbortError('digest', rate);
     }
 
+    // ── 阶段 5.5：产品段（design D1/D5/D6）——新闻链之后、早退判断之前，在日报锁内执行。
+    //    **位置约束**：必在 judge(:326)/digest 熔断 throw **之后**——熔断日整条日报（含新品段）当日
+    //    不推、次日 cron 补（design 风险节），故产品段拿不到熔断累加变量、天然不进熔断分母。
+    //    P1（塌缩）/P2（候选）均**永不向上抛**（异常转空段+告警），「产品失败不拖垮新闻」由这两个
+    //    薄包装保证。productsByChannel **算一次、贯穿早退判断与 dispatch**（dispatch 不重算）。
+    //
+    //    步骤 P1：产品塌缩一次（channel-blind）。**必在 channel 展开之前只跑一次**——产品塌缩单实例
+    //    承载（顺序处理避免同批竞态），若随 per-channel 并发跑 N 次会违反单实例假设。
+    await collapseProductsOnce(dbh);
+    //    步骤 P2：per-channel 产品候选。候选是纯 SELECT 无写竞态、塌缩已在上面单次完成，故可并发。
+    //    每 channel 候选包 try/catch（selectProductsForChannelSafe 内），失败 → 该 channel 空新品段。
+    const productEntries = await Promise.all(
+      channelSenders.map(
+        async ({ channel }): Promise<[Channel, SelectedEvent[]]> => [
+          channel,
+          await selectProductsForChannelSafe(channel, dbh),
+        ],
+      ),
+    );
+    const productsByChannel = new Map<Channel, SelectedEvent[]>(productEntries);
+    console.error(
+      `[pipeline] 产品段: ${channelSenders
+        .map((c) => `${c.channel}=${(productsByChannel.get(c.channel) ?? []).length}`)
+        .join(', ')}`,
+    );
+
     // ── 阶段 6：多通道推送（向所有已配置通道并发分发，单消息原子 + push_records 幂等，G6）。
-    if (pushable.length === 0) {
-      // Top N 为空（摘要分母 = 0，正常不推）或全被剔除 → 无可推，正常结束（不告警、不中止）。
-      console.error(`[pipeline] 推送: 待发 0 条 → skipped-no-candidates`);
+    //    早退：新闻 Top N（pushable）为空**且**所有 channel 的产品候选皆空才不推（design D6）；
+    //    仅一段空时仍推非空段（dispatchDailyDigest 内逐 channel 再判）。
+    if (
+      pushable.length === 0 &&
+      [...productsByChannel.values()].every((p) => p.length === 0)
+    ) {
+      // 新闻 Top N 空（摘要分母 = 0 或全被剔除）且所有 channel 产品候选亦空 → 无可推，正常结束
+      // （不告警、不中止）。仅一段空不在此早退（落到下方逐 channel dispatch 推非空段）。
+      console.error(`[pipeline] 推送: 新闻与产品候选皆空 → skipped-no-candidates`);
       return {
         outcome: 'skipped-no-candidates',
         pushDate,
@@ -495,22 +531,26 @@ export async function runDailyWorkflow(
     }
 
     // 向**所有已配置通道并发分发**（daily-intel-pipeline / feishu-push）。channelSenders 已在阶段 4
-    // 解析（与 selectTopN 候选共用同一通道集）。各通道走 dispatcher 同一套「待发集合→pending→原子
-    // 送达→success/failed」状态机（仅 channel 参数不同）；待发集合按 per-channel 跨天「从未 success」
-    // 判定——失败通道跨天可靠补发、成功通道不重发（统一名单 + 各通道可靠投递）。
+    // 解析（与 selectTopN 候选共用同一通道集）。各通道走 dispatcher 的**双段**状态机
+    // dispatchDailyDigest（要闻段 = pushable，新品段 = productsByChannel.get(channel)；待发集合各按
+    // per-channel 跨天「从未 success」判定）——一条「AI Radar 每日情报」含要闻 + 新品两段、各自幂等。
     console.error(
-      `[pipeline] 推送: 待发 ${pushable.length} 条，向 ${channelSenders.length} 个通道并发分发：` +
+      `[pipeline] 推送: 待发要闻 ${pushable.length} 条，向 ${channelSenders.length} 个通道并发分发：` +
         channelSenders.map((c) => c.channel).join(', '),
     );
 
     // **并发分发 + 单通道失败隔离**（Promise.allSettled）：某通道发送失败（dispatch.outcome
     // ='failed' 或 dispatch 自身抛错）只记录该 channel 的 failed、绝不拖垮另一通道——另一通道
     // 照常完成推送。全部 settle 后再统一汇总（成功通道已写 success，失败通道已写 failed）。
+    // 产品段 productsByChannel 在阶段 5.5 **算一次**，此处直接复用 .get(channel)、不重算。
     const settled = await Promise.allSettled(
       channelSenders.map(({ channel, sender }) =>
-        dispatchDigest(pushable, { now, sender, channel }, dbh).then(
-          (dispatch): ChannelDispatch => ({ channel, dispatch }),
-        ),
+        dispatchDailyDigest(
+          pushable,
+          productsByChannel.get(channel) ?? [],
+          { now, sender, channel },
+          dbh,
+        ).then((dispatch): ChannelDispatch => ({ channel, dispatch })),
       ),
     );
 
@@ -580,10 +620,10 @@ function withDefaultArxivCursor(
   return { ...base, arxiv: { cursor: createLookbackArxivCursorStore() } };
 }
 
-/** 单通道分发结果（供 Promise.allSettled 汇总）。 */
+/** 单通道分发结果（供 Promise.allSettled 汇总）。汇总仅读 dispatch.outcome。 */
 interface ChannelDispatch {
   channel: Channel;
-  dispatch: DispatchResult;
+  dispatch: DailyDispatchResult;
 }
 
 /**
