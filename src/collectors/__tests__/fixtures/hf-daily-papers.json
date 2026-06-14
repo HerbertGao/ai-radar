@@ -1,0 +1,59 @@
+[
+  {
+    "paper": {
+      "id": "2406.12345",
+      "title": "Scaling Laws for Reward Model Overoptimization",
+      "summary": "We study the effect of optimizing against a reward model and characterize the overoptimization regime across model scales.",
+      "publishedAt": "2026-06-13T00:00:00.000Z",
+      "upvotes": 42,
+      "organization": "OpenAI"
+    },
+    "submittedBy": {
+      "name": "akhaliq",
+      "fullname": "AK"
+    },
+    "numComments": 7,
+    "publishedAt": "2026-06-13T08:30:00.000Z"
+  },
+  {
+    "paper": {
+      "id": "2406.67890",
+      "title": "Mixture-of-Depths: Dynamically Allocating Compute in Transformers",
+      "summary": "A method to dynamically allocate FLOPs across tokens and layers in transformer language models.",
+      "publishedAt": null,
+      "upvotes": 31
+    },
+    "submittedBy": "guest-submitter",
+    "numComments": 3,
+    "publishedAt": null
+  },
+  {
+    "paper": {
+      "title": "A Paper Missing Its Identifier",
+      "summary": "This entry intentionally has no paper.id and must be skipped (绝不产假 id).",
+      "publishedAt": "2026-06-12T00:00:00.000Z"
+    },
+    "submittedBy": { "name": "nobody" },
+    "numComments": 0
+  },
+  {
+    "paper": {
+      "id": "2406.00000",
+      "title": "   ",
+      "summary": "This entry has a blank/whitespace title and must be skipped (title NOT NULL).",
+      "publishedAt": "2026-06-11T00:00:00.000Z"
+    },
+    "submittedBy": { "name": "blank-title" },
+    "numComments": 1
+  },
+  {
+    "paper": {
+      "id": "2406.11111",
+      "title": "Retrieval-Augmented Diffusion for Long-Context Generation",
+      "summary": "We augment diffusion language models with retrieval to extend usable context windows.",
+      "publishedAt": "not-a-real-date"
+    },
+    "submittedBy": { "fullname": "Jane Researcher", "name": "jresearcher" },
+    "numComments": 12
+  }
+]
