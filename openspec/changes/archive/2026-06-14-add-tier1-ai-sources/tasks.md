@@ -47,13 +47,13 @@
 
 ## 9. 远端 ts.mac-mini 部署
 
-- [ ] 9.1 `ssh ts.mac-mini` → `cd ~/ai-radar` → `cp -p .env .env.bak.$(date +%Y%m%d-%H%M%S)` 备份
-- [ ] 9.2 python3 精确改远端 `.env`：`RSS_FEEDS` 追加 9 条（断言旧 9 条不存在、防重复）+ 加 `HF_PAPERS_MAX_PER_RUN`/`SITEMAP_SOURCES`（键不存在才加）；勿整文件覆盖
-- [ ] 9.3 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d` 重建 worker/web
-- [ ] 9.4 `docker compose exec -T worker printenv RSS_FEEDS HF_PAPERS_MAX_PER_RUN SITEMAP_SOURCES` 确认；`docker compose logs --since 90s worker` 确认 env 校验通过 + 启动日志 `已启动 N 条调度链`
+- [x] 9.1 `ssh ts.mac-mini` → `cd ~/ai-radar` → `cp -p .env .env.bak.$(date +%Y%m%d-%H%M%S)` 备份
+- [x] 9.2 python3 精确改远端 `.env`：`RSS_FEEDS` 追加 9 条（断言旧 9 条不存在、防重复）+ 加 `HF_PAPERS_MAX_PER_RUN`/`SITEMAP_SOURCES`（键不存在才加）；勿整文件覆盖
+- [x] 9.3 本地 `docker build` → `docker save | ssh ts.mac-mini docker load`（GHCR 受阻，部署 memory）→ 远端 `docker compose --profile app up -d` 重建 worker/web
+- [x] 9.4 `docker compose exec -T worker printenv RSS_FEEDS HF_PAPERS_MAX_PER_RUN SITEMAP_SOURCES` 确认；`docker compose logs --since 90s worker` 确认 env 校验通过 + 启动日志 `已启动 N 条调度链`
 
 ## 10. 提交与规范归档
 
-- [ ] 10.1 提交代码 + `.env.example`（`.env` 不入库）；含 src 实现 → **走 PR**
-- [ ] 10.2 PR 合并后：`/opsx:sync` 将增量规范并入 `source-collectors` 主规范
-- [ ] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
+- [x] 10.1 提交代码 + `.env.example`（`.env` 不入库）；含 src 实现 → **走 PR**
+- [x] 10.2 PR 合并后：`/opsx:sync` 将增量规范并入 `source-collectors` 主规范
+- [x] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
