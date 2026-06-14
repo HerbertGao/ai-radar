@@ -295,6 +295,11 @@ describe('PH 注册进 registry（单源失败隔离）', () => {
         },
         // show_hn 注入空桩，隔离真实 HN Algolia（漏桩会拉真数据使 items 断言失败）。
         showHn: async () => [],
+        // 扩源第一梯队新增两源同样注入空桩：collectAllSources 走全集 registry，
+        // 漏桩会回退真实 collectHfPapers（打真实 HF daily_papers API）/ collectSitemaps，
+        // 污染 items 断言且违反「测试不触网」（test-no-prod-sends）。
+        hfPapers: async () => [],
+        sitemap: async () => [],
       },
     });
     // PH 失败被隔离。

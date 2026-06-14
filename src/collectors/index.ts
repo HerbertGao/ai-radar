@@ -36,6 +36,14 @@ import {
   type ShowHnCollectorOptions,
 } from './show-hn.js';
 import {
+  collectHfPapers,
+  type HfPapersCollectorOptions,
+} from './hf-papers.js';
+import {
+  collectSitemaps,
+  type SitemapCollectorOptions,
+} from './sitemap.js';
+import {
   storeCollectedItems,
   type StoreOptions,
   type StoreResult,
@@ -54,6 +62,8 @@ export { collectGitHub } from './github.js';
 export { collectArxiv, harvestArxiv } from './arxiv.js';
 export { collectProductHunt } from './product-hunt.js';
 export { collectShowHn } from './show-hn.js';
+export { collectHfPapers } from './hf-papers.js';
+export { collectSitemaps } from './sitemap.js';
 export { storeCollectedItems } from './store.js';
 
 /** 单个源在本轮采集中可用的注入选项（按 source 路由）。 */
@@ -64,6 +74,8 @@ export interface PerSourceOptions {
   arxiv?: ArxivCollectorOptions;
   productHunt?: ProductHuntCollectorOptions;
   showHn?: ShowHnCollectorOptions;
+  hfPapers?: HfPapersCollectorOptions;
+  sitemap?: SitemapCollectorOptions;
 }
 
 /** registry 单项契约（design D1）：标记 source + 无参可调的 collect 闭包。 */
@@ -90,6 +102,8 @@ export interface CollectAllOptions extends PerSourceOptions {
       opts?: ProductHuntCollectorOptions,
     ) => Promise<CollectedItem[]>;
     showHn?: (opts?: ShowHnCollectorOptions) => Promise<CollectedItem[]>;
+    hfPapers?: (opts?: HfPapersCollectorOptions) => Promise<CollectedItem[]>;
+    sitemap?: (opts?: SitemapCollectorOptions) => Promise<CollectedItem[]>;
   };
 }
 
@@ -126,6 +140,14 @@ export function buildRegistry(
     {
       source: 'show_hn',
       collect: () => (c.showHn ?? collectShowHn)(options.showHn),
+    },
+    {
+      source: 'hugging_face_papers',
+      collect: () => (c.hfPapers ?? collectHfPapers)(options.hfPapers),
+    },
+    {
+      source: 'sitemap',
+      collect: () => (c.sitemap ?? collectSitemaps)(options.sitemap),
     },
   ];
 }

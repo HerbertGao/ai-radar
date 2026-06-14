@@ -91,6 +91,77 @@ const rssFeedList = z
     return feeds;
   });
 
+/** 单个 sitemap 增量源配置（add-tier1-ai-sources，design D3）：sitemap URL + 路径前缀 + vendor。 */
+export interface SitemapSourceConfig {
+  sitemapUrl: string;
+  pathPrefix: string;
+  vendor: string;
+}
+
+/**
+ * 把 `SITEMAP_SOURCES` 解析为「sitemap 增量源配置」列表（add-tier1-ai-sources，design D3 / spec）。
+ *
+ * 格式：逗号分隔多个条目，每个条目形如 `url|pathPrefix|vendor`（**恰好 2 个 `|`、3 段**）。
+ * 比照上方 `rssFeedList` 的「钉死错误分支、绝不静默退化」范式，启动期快速失败：
+ *   ① 按 `|` split；段数 ≠ 3（`|` 不恰好 2 个）→ `addIssue`；
+ *   ② 任一段 trim 后为空 → `addIssue`；
+ *   ③ pathPrefix 不以 `/` 开头 → `addIssue`（用于 `new URL(c).pathname.startsWith(pathPrefix)` 过滤，
+ *      非 `/` 开头的前缀必不匹配规范化后的 pathname，属配置错误）。
+ * 空字符串 `SITEMAP_SOURCES=` → 解析为空数组（该源不采，与 RSS_FEEDS 空值处理一致）。
+ * 未设置 env 时默认含 Anthropic News 一条（design D3 默认配置）。
+ */
+const sitemapSourceList = z
+  .string()
+  .default('https://www.anthropic.com/sitemap.xml|/news/|anthropic')
+  .transform((raw, ctx) => {
+    const entries = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    const sources: SitemapSourceConfig[] = [];
+    for (const entry of entries) {
+      const parts = entry.split('|');
+      if (parts.length !== 3) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'SITEMAP_SOURCES 条目「' +
+            entry +
+            '」格式错误：须恰好形如 url|pathPrefix|vendor（恰好 2 个 | 分隔符、3 段）。',
+        });
+        continue;
+      }
+      const sitemapUrl = parts[0]!.trim();
+      const pathPrefix = parts[1]!.trim();
+      const vendor = parts[2]!.trim();
+      if (sitemapUrl.length === 0 || pathPrefix.length === 0 || vendor.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'SITEMAP_SOURCES 条目「' +
+            entry +
+            '」含空段：sitemapUrl / pathPrefix / vendor 三段均不得为空。',
+        });
+        continue;
+      }
+      if (!pathPrefix.startsWith('/')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'SITEMAP_SOURCES 条目「' +
+            entry +
+            '」的 pathPrefix「' +
+            pathPrefix +
+            '」必须以 / 开头（用于在规范化绝对 URL 上 new URL(c).pathname.startsWith 过滤）。',
+        });
+        continue;
+      }
+      sources.push({ sitemapUrl, pathPrefix, vendor });
+    }
+    return sources;
+  });
+
 const envSchema = z.object({
   DATABASE_URL: z
     .string()
@@ -203,6 +274,15 @@ const envSchema = z.object({
   // **仅采集期控量**——产品选品按 ai_products.last_seen_at、不经 published_at 时效窗（见 product-digest）。
   // 默认 30（10 points 阈值下近 3 天有裕量）；非法值启动即报错。
   SHOW_HN_MAX_PER_RUN: z.coerce.number().int().positive().default(30),
+
+  // --- 扩源第一梯队（add-tier1-ai-sources，design D2/D3）---
+  // HF Papers 单轮采集上限（daily_papers 单轮取前 N 条；比照 SHOW_HN_MAX_PER_RUN 控量）。
+  // 默认 50（实测 ~50 条/日）；非法值（NaN/负/0）启动即报错。
+  HF_PAPERS_MAX_PER_RUN: z.coerce.number().int().positive().default(50),
+  // sitemap 增量源配置：逗号分隔多个 `url|pathPrefix|vendor` 条目（恰好 3 段），
+  // 解析为 {sitemapUrl, pathPrefix, vendor}[]；段数≠3 / 任一段空 / pathPrefix 不以 / 开头 → 启动即报错。
+  // 默认含 Anthropic News；可为空（空则该源不采）。sitemap 窗口复用 FIRST_SEEN_WINDOW_DAYS。
+  SITEMAP_SOURCES: sitemapSourceList,
 
   // --- 实时重大发布告警（realtime-alerts，design D6）---
   // 实时告警总开关。默认 'false'（功能打磨期关闭）；设为 'true' 才注册 alert-scan 队列与 worker。

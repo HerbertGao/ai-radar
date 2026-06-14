@@ -258,6 +258,9 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         // product_hunt / show_hn 注入空桩，隔离真实 PH GraphQL / HN Algolia（漏桩会拉真数据污染断言）。
         productHunt: async () => [],
         showHn: async () => [],
+        // add-tier1-ai-sources：两新源同理注入空桩，避免漏桩落真实 HF JSON API / sitemap 污染断言。
+        hfPapers: async () => [],
+        sitemap: async () => [],
       },
     });
     expect(result.items.map((i) => i.sourceItemId).sort()).toEqual(['h1', 'r1']);
@@ -285,6 +288,9 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         arxiv: fail,
         productHunt: fail,
         showHn: fail,
+        // add-tier1-ai-sources：两新源也注入桩，避免漏桩落真实 HF JSON API / sitemap 网络。
+        hfPapers: fail,
+        sitemap: fail,
       },
     });
     expect(result.items).toHaveLength(0);
@@ -294,6 +300,8 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
     expect(result.perSource.arxiv?.ok).toBe(false);
     expect(result.perSource.product_hunt?.ok).toBe(false);
     expect(result.perSource.show_hn?.ok).toBe(false);
+    expect(result.perSource.hugging_face_papers?.ok).toBe(false);
+    expect(result.perSource.sitemap?.ok).toBe(false);
   });
 
   it('registry 注册即接入：新增一源后被并发调用（buildRegistry 含全部 source）', () => {
@@ -303,9 +311,11 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
       'arxiv',
       'github',
       'hacker_news',
+      'hugging_face_papers',
       'product_hunt',
       'rss',
       'show_hn',
+      'sitemap',
     ]);
   });
 
@@ -328,6 +338,8 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         arxiv: slow('d'),
         productHunt: slow('e'),
         showHn: slow('f'),
+        hfPapers: slow('g'),
+        sitemap: slow('h'),
       },
     });
     // 并发执行 → 同时在跑的源数 > 1（若串行则恒为 1）。
@@ -355,6 +367,17 @@ describe('collectSources：按 source 筛选子集（实时新闻源）', () => 
       'rss',
     ]);
     expect(result.perSource.arxiv).toBeUndefined();
+  });
+});
+
+describe('子集意图负向断言（MINOR-2）：两新源不进实时/产品子集', () => {
+  it('REALTIME_NEWS_SOURCES 不含 hugging_face_papers / sitemap（非实时）', () => {
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('hugging_face_papers');
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('sitemap');
+  });
+  it('PRODUCT_SOURCES 不含 hugging_face_papers / sitemap（非产品）', () => {
+    expect(mod.PRODUCT_SOURCES).not.toContain('hugging_face_papers');
+    expect(mod.PRODUCT_SOURCES).not.toContain('sitemap');
   });
 });
 

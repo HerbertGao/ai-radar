@@ -25,6 +25,8 @@ beforeAll(async () => {
   process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
   process.env.TELEGRAM_BOT_TOKEN ||= 'test-bot-token';
   process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
+  // 纯净 CI 无 .env 时 import env.js 的单例校验会因缺 PRODUCT_HUNT_TOKEN throw、整套件 import 期崩溃假绿（FIX-C，比照 product-hunt.test.ts）。
+  process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
   ({ parseEnv, isFeishuEnabled } = await import('../env.js'));
 });
 
@@ -276,5 +278,109 @@ describe('parseEnv —— RSS_FEEDS 带 vendor 的 feed 配置解析（design D2
     } as NodeJS.ProcessEnv;
     expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
     expect(() => parseEnv(source)).toThrow(/多于一个/);
+  });
+});
+
+describe('parseEnv —— SITEMAP_SOURCES 解析（add-tier1-ai-sources / design D3，FIX-6）', () => {
+  it('合法 3 段（url|pathPrefix|vendor）解析为 {sitemapUrl, pathPrefix, vendor}', () => {
+    const source = {
+      ...validEnv(),
+      SITEMAP_SOURCES:
+        ' https://www.anthropic.com/sitemap.xml|/news/|anthropic , https://lab-b.example.com/sitemap.xml|/blog/|lab_b ',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.SITEMAP_SOURCES).toEqual([
+      {
+        sitemapUrl: 'https://www.anthropic.com/sitemap.xml',
+        pathPrefix: '/news/',
+        vendor: 'anthropic',
+      },
+      {
+        sitemapUrl: 'https://lab-b.example.com/sitemap.xml',
+        pathPrefix: '/blog/',
+        vendor: 'lab_b',
+      },
+    ]);
+  });
+
+  it('空字符串 → 空数组（该源不采）', () => {
+    const env = parseEnv({ ...validEnv(), SITEMAP_SOURCES: '' } as NodeJS.ProcessEnv);
+    expect(env.SITEMAP_SOURCES).toEqual([]);
+  });
+
+  it('缺省（未设置）→ 默认含 Anthropic News 一条', () => {
+    const env = parseEnv(validEnv()); // validEnv 不含 SITEMAP_SOURCES。
+    expect(env.SITEMAP_SOURCES).toEqual([
+      {
+        sitemapUrl: 'https://www.anthropic.com/sitemap.xml',
+        pathPrefix: '/news/',
+        vendor: 'anthropic',
+      },
+    ]);
+  });
+
+  it('2 段（缺 vendor、| 不足 2 个）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      SITEMAP_SOURCES: 'https://www.anthropic.com/sitemap.xml|/news/',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('含空段（中间段为空）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      SITEMAP_SOURCES: 'https://www.anthropic.com/sitemap.xml||anthropic',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('pathPrefix 不以 / 开头 → 报错', () => {
+    const source = {
+      ...validEnv(),
+      SITEMAP_SOURCES: 'https://www.anthropic.com/sitemap.xml|news/|anthropic',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
+describe('parseEnv —— HF_PAPERS_MAX_PER_RUN 校验（add-tier1-ai-sources，FIX-6）', () => {
+  it('合法值（"30"）coerce 为 number 30', () => {
+    const source = {
+      ...validEnv(),
+      HF_PAPERS_MAX_PER_RUN: '30',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.HF_PAPERS_MAX_PER_RUN).toBe(30);
+    expect(typeof env.HF_PAPERS_MAX_PER_RUN).toBe('number');
+  });
+
+  it('缺省 → 默认 50', () => {
+    const env = parseEnv(validEnv());
+    expect(env.HF_PAPERS_MAX_PER_RUN).toBe(50);
+  });
+
+  it('非正（"0"）→ 报错（positive 校验）', () => {
+    const source = {
+      ...validEnv(),
+      HF_PAPERS_MAX_PER_RUN: '0',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('负数（"-1"）→ 报错', () => {
+    const source = {
+      ...validEnv(),
+      HF_PAPERS_MAX_PER_RUN: '-1',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('非整（"3.5"）→ 报错（int 校验）', () => {
+    const source = {
+      ...validEnv(),
+      HF_PAPERS_MAX_PER_RUN: '3.5',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
   });
 });

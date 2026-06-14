@@ -170,7 +170,11 @@ function pickAbsUrl(recordXml: string): string | null {
   return null;
 }
 
-function toDate(raw: string | null): Date | null {
+/**
+ * 日期解析的 NaN 守卫纯函数（有效日期则 Date，否则 null）。
+ * 导出供其他采集器（hf-papers）复用同一口径解析 publishedAt，避免多套时间解析（NIT-4）。
+ */
+export function toDate(raw: string | null): Date | null {
   if (!raw) return null;
   const d = new Date(raw);
   return Number.isNaN(d.getTime()) ? null : d;

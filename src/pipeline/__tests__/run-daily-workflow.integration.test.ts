@@ -125,6 +125,9 @@ function collectorsReturning(items: CollectedItem[]) {
     arxiv: async () => [],
     productHunt: async () => [],
     showHn: async () => [],
+    // add-tier1-ai-sources 两新源（HF Papers / sitemap）：空桩，避免落真实 HF JSON API / sitemap 网络。
+    hfPapers: async () => [],
+    sitemap: async () => [],
   };
 }
 
@@ -148,6 +151,12 @@ function collectorsAllFail() {
     },
     showHn: async () => {
       throw new Error('show_hn down');
+    },
+    hfPapers: async () => {
+      throw new Error('hf_papers down');
+    },
+    sitemap: async () => {
+      throw new Error('sitemap down');
     },
   };
 }
@@ -220,6 +229,8 @@ function collectorsArxivPaperOnly(papers: CollectedItem[]) {
     arxiv: async () => papers,
     productHunt: async () => [],
     showHn: async () => [],
+    hfPapers: async () => [],
+    sitemap: async () => [],
   };
 }
 
