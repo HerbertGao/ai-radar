@@ -33,9 +33,13 @@
 
 塌缩的 `INSERT` 分支必须**省略 `event_id`**，由数据库默认值 `gen_random_uuid()::text` 生成不透明身份；首次创建时必须写入 `representative_raw_item_id`、`representative_title`（取代表 `raw_item` 的**原始 title**——非归一化标题，保证 `NOT NULL`，供摘要降级时回退展示；原始 title 通常可读，极个别为空串 `''` 的情形由摘要降级兜底到 canonical_url）、`first_seen_at`、`published_at`（取代表 `raw_item` 的发布时间），并初始化 `source_count=1`。`ON CONFLICT DO UPDATE` 分支必须累加 `source_count`、更新 `last_seen_at`，并且**仅在事件当前 `published_at IS NULL` 时**用后到 `raw_item` 的非 NULL `published_at` 经 `COALESCE` 补值（identity-preserving NULL-fill：`published_at = COALESCE(ai_news_events.published_at, excluded.published_at)`）——这是**确定性事实优先于 AI 推断**的体现（DB 已有的确定发布时间绝不交给 LLM，见 published-at-inference）。`ON CONFLICT DO UPDATE` 分支**禁止**覆盖 `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at`，也**禁止**把已非 NULL 的 `published_at` 覆盖为其它值（`COALESCE` 保证已设值不变、只允许 `NULL → 已知` 单向补值）——否则事件身份与「首建代表原文」语义被后到的 `raw_item` 破坏。多条同 `dedup_key` 但日期不同的 `raw_item` 并发塌缩时，NULL-fill 取**先抢到行锁那条**的确定日期：取哪条依到达序、非全序确定，但**始终是某条真实 `raw_item` 的确定发布时间**（不丢、不臆造），与「首建代表 = 第一条命中」的到达序语义一致；契约只承诺「填入某个确定发布时间」（任一确定值都满足时效闸语义），不承诺选最早/最晚，故无需 per-dedup 序列化锁或聚合子查询。
 
+**tombstone 改投（P3 新增）**：当塌缩的 `ON CONFLICT (dedup_key)` 命中的既有事件已被语义合并置 `merged_into` 非空（tombstone，见 semantic-dedup「确定性事件合并」），系统必须把该 `raw_item` 改塌缩进 `merged_into` 指向的存活事件，禁止新建重复事件、也禁止把 `source_count` 累加到 tombstone 行。**改投必须沿 `merged_into` 链递归/迭代到终态存活者**（`merged_into IS NULL`）——存活者本身可能在后续轮次再被合并而成 tombstone，单跳改投可能仍落在 tombstone 上；解析须带环路保护（已访问集合，命中环即报错告警，绝不无限循环）。`source_count` 仅对真正新到的 `raw_item` `+1`，绝不重加被吞事件已冻结的 `source_count`（见 semantic-dedup「source_count 不重复计数」）。
+
+**改投的并发原子性（关键：塌缩与语义合并跨链并发）**：塌缩入口 `collapseUncollapsedRawItems` **日报链与实时告警高频链共用**，而告警链**不持日报单例锁**（`alert-scan.ts` 每 20min 跑塌缩、`acquireAlertLock` 只裹分发不裹塌缩），故告警链塌缩会与日报链语义合并**并发**。因此 tombstone 改投**不可**用裸 `ON CONFLICT (dedup_key) DO UPDATE SET source_count = source_count + 1`——该写会落在被命中行上，若该行刚被合并置 tombstone，就把已冻结的 tombstone `source_count` 误加（违反冻结不变量）、且不改投。改投必须：①增量目标是**链解析后的终态存活者**而非被命中行——对命中行的 `DO UPDATE` 加 `WHERE ai_news_events.merged_into IS NULL` 守卫（命中 tombstone 时该 `DO UPDATE` 不动 tombstone），命中行为 tombstone 时改在**同一事务内**对命中行取行锁（`ON CONFLICT` 对冲突行本就持行锁，或显式 `SELECT ... FOR UPDATE`）读 `merged_into`、链解析到存活者后 `UPDATE 存活者 SET source_count = source_count + 1, last_seen_at = ...`；②靠**冲突 `dedup_key` 那一行的行锁**与并发的语义合并（合并对被吞行 `FOR UPDATE`）串行化——两侧争同一行锁，故无论谁先提交都自洽：合并先提交→塌缩读到 `merged_into` 非空→改投存活者（+1 落存活者）；塌缩先提交（+1 落尚未 tombstone 的命中行）→合并随后 `源count += 被吞`（把这 +1 一并吸收进存活者）。两序皆不丢不重。
+
 流水线下游对同一事件行的后续写入（Value Judge 写 `*_score`/`should_push`、中文摘要写 `summary_zh`、published-at-inference 在所有关联 raw_item 均无发布时间时回填 `published_at`）必须以 `UPDATE ... WHERE event_id = ?` 定位、`set` 中**只含本阶段目标列**（published-at-inference 的回填须附 `AND published_at IS NULL` 的 CAS 守卫），禁止用 `INSERT ... ON CONFLICT` 模板（P0 `persistEventScores` 的全列覆盖式 `set` 是反面模板），以免把 `published_at`/`representative_*`/`first_seen_at` 覆盖回 NULL 而使 Top N 排序静默退化。
 
-去重判定必须全程由程序与 DB 唯一约束保障，禁止交给 LLM。本期仅做此硬去重层，禁止引入 embedding 相似度或 LLM 二次判断。
+去重判定的**最终事实**必须全程由程序与 DB 唯一约束保障，禁止交给 LLM。本需求只规定**硬去重层**（第一层硬去重 + 第二层 `title_hash`）行为；embedding 相似度（第三层）与 LLM 二次判断（第四层）在硬去重塌缩**之后**由 semantic-dedup capability 承接——其 LLM 仅产语义判断（结构见 semantic-dedup「LLM 二次判断」，`{same_event, same_product, reason}`），是否合并的最终落库仍由程序 + DB 单事务执行（见 semantic-dedup）。本需求不再禁止后续期次引入 embedding/LLM 语义层（原 P1/P2「本期仅做硬去重层、禁止引入 embedding 相似度或 LLM 二次判断」的期次限制随 P3 解除）。
 
 #### 场景:同 canonical_url 的多条塌缩为一条事件
 - **当** 两条新闻类 `raw_item` 经规范化得到相同 `canonical_url`（因而相同 `dedup_key`）
@@ -56,6 +60,10 @@
 #### 场景:后到 raw_item 的确定发布时间补空（确定性优先于 AI）
 - **当** 某事件首建时 `published_at` 为 NULL（首条 raw_item 无发布时间），后到的同 `dedup_key` raw_item 带确定 `published_at`
 - **那么** `ON CONFLICT DO UPDATE` 经 `COALESCE(ai_news_events.published_at, excluded.published_at)` 把确定值补入（`NULL → 已知` 单向），该事件不再进入 AI 推断阶段（确定性事实优先、不交 LLM）
+
+#### 场景:塌缩命中 tombstone 改投存活事件
+- **当** 一条新闻类 `raw_item` 的 `dedup_key` 命中的既有事件已被语义合并置 `merged_into` 非空
+- **那么** 该 `raw_item` 改塌缩进 `merged_into` 指向的存活事件，不新建重复事件、不向 tombstone 行累加 `source_count`
 
 ### 需求:不可处理条目兜底
 
