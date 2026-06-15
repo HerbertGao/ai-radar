@@ -29,6 +29,8 @@
 
 **移除独立产品调度**：worker 不再注册独立 `product-digest` 调度链/队列/cron/单例锁；产品推送只经日报链承载（产品段在日报单例锁内，天然防同 push_date 并发双发）。新闻熔断 abort（judge/digest 降级率超阈）时整条日报含产品段当日不推、次日 cron 补——产品搭日报 job 便车、不免疫 job abort（「不进熔断分母」指产品不影响熔断触发）。新闻事件的评分/摘要/熔断/时效闸/幂等口径不变。
 
+**产品中文化前置 + 新品段中文渲染（capability product-chinese-digest）**：日报产品段编排须在**产品塌缩之后、per-channel 候选之前**插入一次 channel-blind 产品中文化步骤（中文化候选 = 各 channel 推送候选精确并集，见 product-discovery / product-chinese-digest）；该步骤**永不向上抛**、产品中文化失败**不进熔断分母、不中止流水线**（延续「失败不拖垮新闻」），但整步失败规模异常须单独告警（系统故障可观测、「不进熔断」≠「无监管」）。**失败语义与 events 编排不同规格**：Agent 内核（summarizeProduct）与 events 同规格，编排零件对称 collapseProductsOnce（永不抛）、非 events digest 的「非业务异常 rethrow + 熔断」。新品段渲染由「仅英文产品名 + 链接」改为「中文译名（回退英文名）+ 中文简介要点行（套**产品专属上限 `PRODUCT_TAGLINE_MAX`** 截断、**非 events HEADLINE_MAX**、与 schema cap 同一常量；无则省略要点行、退纯标题）」，Telegram 与飞书两渲染口径一致。
+
 #### 场景:定时触发跑通整条流水线并多通道分发
 - **当** 每日定时触发 `daily-digest` 任务
 - **那么** `runDailyWorkflow()` 按采集（含 arXiv）→去重→判断→发布时间回填→选择→摘要→分发顺序执行，并向 Telegram 与飞书两通道各自分发日报
@@ -84,6 +86,18 @@
 #### 场景:新闻链熔断 abort 时整条日报含产品段当日不推
 - **当** 新闻链 judge 或 digest 降级率超阈触发 `WorkflowAbortError`（LLM 大面积故障）
 - **那么** 整条日报 job 终止（产品段位于熔断 throw 之后、不执行），当日要闻段与新品段都不推、次日 cron 补（产品幂等不退化）；「产品不进熔断分母」指产品不影响熔断触发，非产品免疫 job abort
+
+#### 场景:产品中文化阶段编排在塌缩后候选前
+- **当** 日报流水线执行到产品段（judge/digest 熔断之后、早退之前）
+- **那么** 先 collapseProductsOnce（channel-blind 一次），再 channel-blind 产品中文化一次，再 per-channel 产品候选；中文化失败不中止流水线、不进熔断分母
+
+#### 场景:新品段渲染中文译名与简介
+- **当** 渲染日报新品段、产品已中文化
+- **那么** 渲染中文译名 + 中文简介要点行（套 `PRODUCT_TAGLINE_MAX` 截断 / 转义、Telegram 与飞书一致）；未中文化的产品回退英文名、省略要点行
+
+#### 场景:产品中文化失败不拖垮日报但可观测
+- **当** 某产品中文化业务失败（ProductDigestFailureError）或整步遇系统异常（DB 断连）
+- **那么** 该产品回退英文名照常推送，流水线不中止、不进 events 熔断分母、要闻段不受影响；但整步失败数异常须单独告警（不进熔断 ≠ 无监管、防系统故障静默）
 
 ### 需求:Top N 组合分选择
 

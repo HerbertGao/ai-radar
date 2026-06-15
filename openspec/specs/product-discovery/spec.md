@@ -66,7 +66,9 @@ PH 产品名必须写入 `raw_items.title`（满足 QA.md §8.1 `title TEXT NOT 
 
 **产品推送并入新闻日报消息（合并变更）**：产品发现**不再是独立 BullMQ 调度任务/独立消息**（原「每日产品发现独立调度链/队列/cron/独立单例锁」一并废止）。产品作为「新品段」并入新闻日报的**同一条**「AI Radar 每日情报」消息（与「要闻段」events 并列）。其内部仍是确定性顺序子流程「产品采集（由日报 `collectAllSources` 覆盖）→ **产品塌缩一次（channel-blind）** → **per-channel 选产品候选** → 并入日报消息」：产品塌缩调 `collapseUncollapsedProductRawItems`（import 自 `src/collectors/product-collapse.ts`，在 channel 展开之前**只跑一次**——产品塌缩单实例承载，绝不随 per-channel 并发重复），随后对每个 channel 调 `selectProductCandidates(channel, dbh, limit)`；塌缩与候选各自包 try/catch 永不向上抛（失败降级空段）。产品段在日报 `runDailyWorkflow()` 的单例锁（`acquireDigestLock(push_date)`）内执行，由该锁保 push_date 全局单例（不再需要独立 `product-digest:{channel}:{push_date}` 锁）。
 
-**产品候选查询复用既有导出纯函数**：`selectProductCandidates(channel, dbh, limit=TOP_N)` 是导出纯函数（无 `now` 参数——跨天去重与时刻无关），日报直接 `import` 复用。**链接来源**：候选查询的 SELECT 含 `canonical_domain`，映射 `canonicalUrl = canonical_domain ? 'https://' + canonical_domain : null`（`ai_products` 无 `url` 列，仅 canonical_domain/github_repo/product_hunt_slug；domain 含 scheme/path/空白等畸形则降级 null）。产品行渲染：产品名 + 官网链接（`canonicalUrl`，为 null 时降级纯产品名，绝不渲染坏链接），**产品段零 LLM**（无 headline/summary 不渲染要点行、不调 LLM 生成定位）。
+**产品候选查询复用既有导出纯函数**：`selectProductCandidates(channel, dbh, limit=TOP_N)` 是导出纯函数（无 `now` 参数——跨天去重与时刻无关），日报直接 `import` 复用。**链接来源**：候选查询的 SELECT 含 `canonical_domain`，映射 `canonicalUrl = canonical_domain ? 'https://' + canonical_domain : null`（`ai_products` 无 `url` 列，仅 canonical_domain/github_repo/product_hunt_slug；domain 含 scheme/path/空白等畸形则降级 null）。产品行渲染：中文译名（`name_zh ?? name`、回退英文）+ 中文简介要点行（`tagline_zh`，无则省略要点行）+ 官网链接（`canonicalUrl`，为 null 时降级纯标题，绝不渲染坏链接）。
+
+**产品中文化前置步骤（capability product-chinese-digest）**：`ai_products` 提供中文展示列 `name_zh`（varchar，可空）+ `tagline_zh`（text，可空），既有产品 NULL = 未中文化、渲染回退英文 `name`。产品进入候选前必须经一次 **channel-blind 中文化前置步骤**（产品塌缩之后、per-channel 候选之前、搭日报单例锁、不独立调度）：中文化候选 = **各 channel 正式推送候选的精确并集**——直接复用 `selectProductCandidates`（每 channel 调用取 product_id）+ 应用层 `Set` 去重并集（消除覆盖边缘、非手写 SQL UNION 防谓词漂移），对并集中 `name_zh IS NULL` 且 `name !== '(unnamed product)'` 占位名（与 product-collapse 单一来源共享、防零信息诱发幻觉译名）的产品 LLM 产 `name_zh`/`tagline_zh` 落库；该步骤**永不向上抛**（对称塌缩零件、失败回退英文、不拖垮新闻、不进 events 熔断分母、整步失败规模异常单独告警可观测）；幂等（已中文化跳过 LLM）。中文化**只产展示文本、绝不改**塌缩/硬规则合并/merge_conflict/`selectProductCandidates` 选品口径（选品条件/order/limit 一字不变，仅映射 `representativeTitle = name_zh ?? name`、产品要点 = `tagline_zh`、`summary_zh` 仍 null）。
 
 **跨天不重推候选窗口（与 event 同口径，绝不可省、绝不退化）**：选择进入推送的产品候选必须满足「该 `product_id` **从未被任何 `push_date` 以该 channel `success` 推送过**」（**按 channel 分判**：同一产品可分别进 telegram/feishu 候选）；「同日不重复」由唯一约束兜底，「跨天一产品一生只推一次」由本候选窗口 + dispatcher 的 `computePendingSet`（任一 push_date 该 channel success 排除）双层兜底，**并入日报后此口径不变**（绝不因并入变成天天重推）。
 
@@ -105,6 +107,22 @@ PH 产品名必须写入 `raw_items.title`（满足 QA.md §8.1 `title TEXT NOT 
 #### 场景:产品塌缩只跑一次不随 channel 重复
 - **当** 日报对多个 channel 各取产品候选
 - **那么** 产品塌缩 `collapseUncollapsedProductRawItems` 在 channel 展开之前只调一次（channel-blind），各 channel 仅各调 `selectProductCandidates(channel)`；绝不每 channel 重复塌缩（避免违反产品塌缩单实例假设）
+
+#### 场景:产品候选携带中文译名与简介
+- **当** 已中文化（name_zh/tagline_zh 非 NULL）的产品进入某 channel 候选
+- **那么** 候选映射标题为中文译名、要点为中文简介；未中文化（NULL）则回退英文 `name`、无要点
+
+#### 场景:中文化前置不改选品口径
+- **当** 执行产品中文化前置步骤
+- **那么** 不改变 merge_conflict 排除 / 跨天从未 success 窗口 / order / limit 选品规则，仅补中文展示字段；中文化失败的产品仍按原规则入选（回退英文名）
+
+#### 场景:中文化候选精确覆盖各 channel 推送候选
+- **当** 某产品在 channel A 已 success 推过、在 channel B 从未 success（仍将进 B 推送候选）
+- **那么** 该产品在中文化候选的各 channel 并集内、被中文化（不因 channel-blind 单窗 LIMIT 漏覆盖某 channel 第 N 名）
+
+#### 场景:塌缩占位名产品不中文化
+- **当** 某产品 `name` 为塌缩兜底占位 `(unnamed product)`
+- **那么** 不进中文化候选（零信息输入会诱发 LLM 幻觉译名）、保持占位英文、渲染回退
 
 
 ### 需求:产品塌缩为多源输入并支持跨源产品合并

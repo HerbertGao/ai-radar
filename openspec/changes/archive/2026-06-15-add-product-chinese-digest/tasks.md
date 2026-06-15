@@ -52,6 +52,6 @@
 
 ## 10. 提交与规范归档
 
-- [ ] 10.1 提交代码（schema + 迁移 + src/agents/product-digest + pipeline + message + mcp + 测试）；含 src 实现 → **走 PR**
-- [ ] 10.2 PR 合并后：`/opsx:sync` 将 4 个增量规范并入主规范（新增 product-chinese-digest；修改 product-discovery/daily-intel-pipeline/mcp-query）
-- [ ] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
+- [x] 10.1 提交代码（schema + 迁移 + src/agents/product-digest + pipeline + message + mcp + 测试）；含 src 实现 → **走 PR**（PR #16，已合并 1570b32）
+- [x] 10.2 PR 合并后：`/opsx:sync` 将 4 个增量规范并入主规范（新增 product-chinese-digest；修改 product-discovery/daily-intel-pipeline/mcp-query）
+- [x] 10.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
