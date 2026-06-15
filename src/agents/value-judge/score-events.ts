@@ -214,7 +214,7 @@ export async function scoreUnscoredEvents(
       // P3 tombstone 排除（合并核心闭环）：评分写 CAS 自身 WHERE 加 `merged_into IS NULL`——claim 成功
       // 后、评分写前仍存在链内二次 TOCTOU（日报合并可在此间隙把已 claim 的事件置 tombstone）。谓词落
       // 评分写 CAS 才使「tombstone 绝不被写 *_score/should_push 复活」成立（命中 0 行=无害空写、跳过）。
-      await dbh
+      const updated = await dbh
         .update(aiNewsEvents)
         .set({
           importanceScore: scoreColumns.importanceScore,
@@ -223,7 +223,29 @@ export async function scoreUnscoredEvents(
           hypeRiskScore: scoreColumns.hypeRiskScore,
           shouldPush: scoreColumns.shouldPush,
         })
-        .where(and(eq(aiNewsEvents.eventId, event.eventId), isNull(aiNewsEvents.mergedInto)));
+        .where(and(eq(aiNewsEvents.eventId, event.eventId), isNull(aiNewsEvents.mergedInto)))
+        .returning({ eventId: aiNewsEvents.eventId });
+
+      if (updated.length === 0) {
+        // 评分写命中 0 行：claim 成功后、写入前该事件被并发日报合并置 tombstone（链内二次 TOCTOU，
+        // 仅「告警链评分」与「日报链语义合并」并发时可能发生；日报链自身合并在 value-judge 之前、
+        // 候选 SELECT 已排除 tombstone，故不触发）。这既非评分成功、也非 LLM 降级，而是 tombstone 被
+        // 正确排除——故**不计 scored、并从熔断分母剔除**（judged--，避免用一条非降级的 tombstone 稀释
+        // 降级率），同时释放该（已 tombstone）事件的 claim（防残留 judge_claimed_at；该事件已被候选
+        // SELECT 的 `merged_into IS NULL` 永久排除，释放仅作纵深清理）。
+        judged -= 1;
+        await releaseJudgeClaim(event.eventId, dbh).catch((releaseErr: unknown) =>
+          logError(
+            `事件 ${event.eventId} 评分写命中 0 行（已 tombstone）释放 claim 失败（候选已排除，无副作用）`,
+            releaseErr,
+          ),
+        );
+        logError(
+          `事件 ${event.eventId} 评分写命中 0 行（claim 后被并发合并置 tombstone）：跳过，不计入 scored/熔断分母`,
+          null,
+        );
+        continue;
+      }
 
       scored += 1;
     } catch (error) {

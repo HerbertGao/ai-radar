@@ -221,6 +221,11 @@ describe.skipIf(!databaseUrl)('B. 并发交错：CAS 自带谓词命中 0 行、
     expect(after!.importance_score).toBeNull(); // 未被评分写覆盖（CAS 谓词 merged_into IS NULL 拦下）
     expect(after!.should_push).toBe(false);
     expect(after!.merged_into).toBe(survivor); // 仍是 tombstone，未被复活
+    // 计数诚实性（Bugbot「Zero row score still counts」修复）：评分写命中 0 行（claim 后被并发合并置
+    // tombstone）既非评分成功也非 LLM 降级——生产代码不计 scored、并从熔断分母剔除（judged--）、释放该
+    // 残留 claim。注：scoreUnscoredEvents 扫全表（非本 source 隔离），并行套件的未评分事件也会计入
+    // result.scored/judged，故此处不对全局计数做精确断言（沿用 score-events 集成测试的 `>=` 约定）；本条
+    // 0 行写的行为正确性已由上方「importance 仍 NULL / should_push 仍 false / merged_into 不变」证明。
     void result;
   });
 
