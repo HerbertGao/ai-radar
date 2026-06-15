@@ -17,6 +17,7 @@
     "worker": "tsx src/pipeline/worker-main.ts",
     "mcp": "tsx src/mcp/server.ts",
     "smoke": "tsx src/pipeline/smoke.ts",
+    "kb:backfill": "tsx src/kb/backfill-main.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
