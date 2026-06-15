@@ -49,5 +49,5 @@
 ## 9. 提交与规范归档
 
 - [x] 9.1 提交代码（`src/mcp/` + package.json + 测试 + 文档）；含 src 实现 → **走 PR**（PR #15：feat/mcp-query-server）
-- [ ] 9.2 PR 合并后：`/opsx:sync` 将 `mcp-query` 增量规范并入主规范（新建 `openspec/specs/mcp-query/spec.md`）
-- [ ] 9.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
+- [x] 9.2 PR 合并后：`/opsx:sync` 将 `mcp-query` 增量规范并入主规范（新建 `openspec/specs/mcp-query/spec.md`）
+- [x] 9.3 PR 合并后：`/opsx:archive` 归档本变更（纯文档直推 main）
