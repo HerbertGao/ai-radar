@@ -30,5 +30,5 @@
 
 ## 5. 规格同步与历史行处置
 
-- [ ] 5.1 `openspec-cn validate` 通过；`/opsx:apply` 完成后 `/opsx:archive` 同步增量 spec 进主规范。**归档核查**：MODIFIED 块（mcp-query「查询当日已推日报」、source-collectors「Show HN 产品采集」、product-discovery「每日产品发现推送」）须**整块替换**主规范对应需求（含被改名/拆分的场景，如 mcp-query「畸形域降级一致」→「三键回退一致」+「畸形降级与已推一致」），确认不残留旧场景
+- [x] 5.1 `openspec-cn validate` 通过；`/opsx:apply` 完成后 `/opsx:archive` 同步增量 spec 进主规范。**归档核查**：MODIFIED 块（mcp-query「查询当日已推日报」、source-collectors「Show HN 产品采集」、product-discovery「每日产品发现推送」）须**整块替换**主规范对应需求（含被改名/拆分的场景，如 mcp-query「畸形域降级一致」→「三键回退一致」+「畸形降级与已推一致」），确认不残留旧场景
 - [ ] 5.2 历史泄漏行决策：默认不主动清理（靠时效窗自然老化）；部署后观察一两天，若仍见要闻段残留 Show HN 才由用户人工执行 design.md 的一次性 `should_push=false` SQL（只读核对命中行数后执行，**不用** `merged_into`）。**已知局限**：该 SQL 按 `representative_title` 匹配前缀，而塌缩可能选了同簇非 Show-HN 标题作 representative，故对这类行会 under-match——属可接受（opt-in、bounded、非破坏）

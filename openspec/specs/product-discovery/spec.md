@@ -66,7 +66,9 @@ PH 产品名必须写入 `raw_items.title`（满足 QA.md §8.1 `title TEXT NOT 
 
 **产品推送并入新闻日报消息（合并变更）**：产品发现**不再是独立 BullMQ 调度任务/独立消息**（原「每日产品发现独立调度链/队列/cron/独立单例锁」一并废止）。产品作为「新品段」并入新闻日报的**同一条**「AI Radar 每日情报」消息（与「要闻段」events 并列）。其内部仍是确定性顺序子流程「产品采集（由日报 `collectAllSources` 覆盖）→ **产品塌缩一次（channel-blind）** → **per-channel 选产品候选** → 并入日报消息」：产品塌缩调 `collapseUncollapsedProductRawItems`（import 自 `src/collectors/product-collapse.ts`，在 channel 展开之前**只跑一次**——产品塌缩单实例承载，绝不随 per-channel 并发重复），随后对每个 channel 调 `selectProductCandidates(channel, dbh, limit)`；塌缩与候选各自包 try/catch 永不向上抛（失败降级空段）。产品段在日报 `runDailyWorkflow()` 的单例锁（`acquireDigestLock(push_date)`）内执行，由该锁保 push_date 全局单例（不再需要独立 `product-digest:{channel}:{push_date}` 锁）。
 
-**产品候选查询复用既有导出纯函数**：`selectProductCandidates(channel, dbh, limit=TOP_N)` 是导出纯函数（无 `now` 参数——跨天去重与时刻无关），日报直接 `import` 复用。**链接来源**：候选查询的 SELECT 含 `canonical_domain`，映射 `canonicalUrl = canonical_domain ? 'https://' + canonical_domain : null`（`ai_products` 无 `url` 列，仅 canonical_domain/github_repo/product_hunt_slug；domain 含 scheme/path/空白等畸形则降级 null）。产品行渲染：中文译名（`name_zh ?? name`、回退英文）+ 中文简介要点行（`tagline_zh`，无则省略要点行）+ 官网链接（`canonicalUrl`，为 null 时降级纯标题，绝不渲染坏链接）。
+**产品候选查询复用既有导出纯函数**：`selectProductCandidates(channel, dbh, limit=TOP_N)` 是导出纯函数（无 `now` 参数——跨天去重与时刻无关），日报直接 `import` 复用。**链接来源（回退链）**：候选查询的 SELECT MUST 含 `canonical_domain`、`github_repo`、`product_hunt_slug` 三键（`ai_products` 无 `url` 列），映射经导出纯函数 `resolveProductUrl` 按优先级回退产出 `canonicalUrl`：① `canonical_domain` → `https://<canonical_domain>`（沿用既有畸形校验：含 scheme/path/空白等畸形则落下一级）；② `github_repo`（归一 `owner/name`，恰两段非空）→ `https://github.com/<owner>/<name>`；③ `product_hunt_slug`（**含 `/` 或空白即判畸形、落 null**，否则直接拼）→ `https://www.producthunt.com/posts/<slug>`；三者皆空/畸形 → `canonicalUrl=null`。`resolveProductUrl` 产出的 `canonicalUrl` 仅供**渲染**，**不**参与 `daily-intel-pipeline` 的跨段去重对齐（后者用 `ai_products` 存储三键字段，见该 capability）。
+
+**候选载体（供跨段去重对齐复用）**：`selectProductCandidates` 的 SELECT 已含 `canonical_domain`/`github_repo`/`product_hunt_slug` 三键（同时供 `resolveProductUrl` 与跨段对齐）；返回的每个产品候选 MUST **额外携带这三个存储键字段**（如在候选对象上附 `productMergeKeys: { canonicalDomain, githubRepo, productHuntSlug }` 可选字段；事件侧候选不填、保持共享候选类型可空）。`daily-intel-pipeline` 的跨段去重据此**从内存 `productsByChannel` 候选对象直接读三键**构建产品键集合，**无需回查 `ai_products`**（满足该 capability「复用 productsByChannel、不引入额外 DB 查询」约束）。三键仅作**确定性对齐键**，不改选品口径（条件/order/limit 一字不变）。回退链解决「纯 GitHub 仓库类产品（`canonical_domain` 空、仅 `github_repo`）在新品段丢官网链接」（生产实锤：`themartiano/luz`）。产品行渲染：中文译名（`name_zh ?? name`、回退英文）+ 中文简介要点行（`tagline_zh`，无则省略要点行）+ 官网链接（`canonicalUrl`，为 null 时降级纯标题，绝不渲染坏链接）。渲染层（`message.ts`）MUST NOT 改动——回退在选品层透明完成、渲染层只认 `canonicalUrl`。
 
 **产品中文化前置步骤（capability product-chinese-digest）**：`ai_products` 提供中文展示列 `name_zh`（varchar，可空）+ `tagline_zh`（text，可空），既有产品 NULL = 未中文化、渲染回退英文 `name`。产品进入候选前必须经一次 **channel-blind 中文化前置步骤**（产品塌缩之后、per-channel 候选之前、搭日报单例锁、不独立调度）：中文化候选 = **各 channel 正式推送候选的精确并集**——直接复用 `selectProductCandidates`（每 channel 调用取 product_id）+ 应用层 `Set` 去重并集（消除覆盖边缘、非手写 SQL UNION 防谓词漂移），对并集中 `name_zh IS NULL` 且 `name !== '(unnamed product)'` 占位名（与 product-collapse 单一来源共享、防零信息诱发幻觉译名）的产品 LLM 产 `name_zh`/`tagline_zh` 落库；该步骤**永不向上抛**（对称塌缩零件、失败回退英文、不拖垮新闻、不进 events 熔断分母、整步失败规模异常单独告警可观测）；幂等（已中文化跳过 LLM）。中文化**只产展示文本、绝不改**塌缩/硬规则合并/merge_conflict/`selectProductCandidates` 选品口径（选品条件/order/limit 一字不变，仅映射 `representativeTitle = name_zh ?? name`、产品要点 = `tagline_zh`、`summary_zh` 仍 null）。
 
@@ -92,9 +94,13 @@ PH 产品名必须写入 `raw_items.title`（满足 QA.md §8.1 `title TEXT NOT 
 - **当** 日报触发并存在当日新产品候选
 - **那么** 产品以「新品段」并入同一条「AI Radar 每日情报」消息（与要闻段并列），不再产生独立的产品推送消息；产品行各按 `target_type='product'` 写 `push_records`
 
-#### 场景:产品行链接来源与降级
+#### 场景:产品行链接来源回退链与降级
 - **当** 渲染产品行
-- **那么** 用候选查询映射的 `canonicalUrl`（`https://canonical_domain`）；`canonical_domain` 为空或畸形则 `canonicalUrl=null`、降级为纯产品名，绝不渲染坏链接；产品段不调任何 LLM
+- **那么** 用候选查询经 `resolveProductUrl` 映射的 `canonicalUrl`，按优先级回退：`canonical_domain`（`https://<domain>`）→ `github_repo`（`https://github.com/<owner>/<name>`）→ `product_hunt_slug`（`https://www.producthunt.com/posts/<slug>`）；三者皆空/畸形则 `canonicalUrl=null`、降级为纯产品名，绝不渲染坏链接；产品段不调任何 LLM
+
+#### 场景:纯 GitHub 仓库产品回退到 github 链接
+- **当** 某产品 `canonical_domain` 为空但 `github_repo='owner/repo'`（如 Show HN 直链 github 的产品）
+- **那么** `resolveProductUrl` 回退产出 `canonicalUrl='https://github.com/owner/repo'`，新品段渲染出官网链接（不再因 `canonical_domain` 空而丢链接）
 
 #### 场景:独立 product-digest 调度链已移除
 - **当** worker 启动注册调度链
