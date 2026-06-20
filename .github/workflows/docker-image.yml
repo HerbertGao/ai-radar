@@ -31,7 +31,7 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # 仅非 PR 事件登录并推送（PR 来自 fork 时无 packages 写权限，且本就只验证构建）。
       - name: Log in to GHCR
