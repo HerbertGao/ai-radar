@@ -25,8 +25,8 @@ x-app: &app
   build: .
   # 本地 build 与 CI 推送（GHCR）共用此 tag：`up --build` 本地构建、`pull` 拉 CI 多架构镜像。
   # owner 必须与 CI 推送口径一致——docker-image.yml 用 ${{ github.repository_owner }}，
-  # 本仓 owner = herbert-software，故默认 ghcr.io/herbert-software/ai-radar；可用 AI_RADAR_IMAGE 覆盖。
-  image: ${AI_RADAR_IMAGE:-ghcr.io/herbert-software/ai-radar:latest}
+  # 本仓 owner = HerbertGao，故默认 ghcr.io/herbertgao/ai-radar（metadata-action 小写化 owner）；可用 AI_RADAR_IMAGE 覆盖。
+  image: ${AI_RADAR_IMAGE:-ghcr.io/herbertgao/ai-radar:latest}
   env_file:
     - .env
   environment:

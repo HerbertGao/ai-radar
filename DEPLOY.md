@@ -61,9 +61,9 @@ arm64 / amd64 主机都能本地构建（基础镜像均为多架构）。
 
 ### 方式 B：拉 CI 构建的镜像（GHCR）
 
-CI（`.github/workflows/docker-image.yml`）构建 **amd64+arm64** 多架构镜像推 `ghcr.io/herbert-software/ai-radar`（owner 取 `github.repository_owner`，与 compose 的 `image:` 默认值一致）。tag 策略：
+CI（`.github/workflows/docker-image.yml`）构建 **amd64+arm64** 多架构镜像推 `ghcr.io/herbertgao/ai-radar`（owner 取 `github.repository_owner`，与 compose 的 `image:` 默认值一致）。tag 策略：
 - **push `main`** → 更新 `:latest`（compose 默认拉的就是它，即「跟随 main 的滚动部署镜像」）。
-- **打 `v*` tag**（如 `v1.2.3`）→ 发布版本 tag `:1.2.3`（`{{version}}` 去掉 `v` 前缀），**不动 `:latest`**。要部署某个固定版本，设 `AI_RADAR_IMAGE=ghcr.io/herbert-software/ai-radar:1.2.3` 再 pull；也可用 `:sha-<短哈希>` 钉到具体 commit。
+- **打 `v*` tag**（如 `v1.2.3`）→ 发布版本 tag `:1.2.3`（`{{version}}` 去掉 `v` 前缀），**不动 `:latest`**。要部署某个固定版本，设 `AI_RADAR_IMAGE=ghcr.io/herbertgao/ai-radar:1.2.3` 再 pull；也可用 `:sha-<短哈希>` 钉到具体 commit。
 
 目标主机直接拉（默认 `:latest`，即最新 main）：
 
