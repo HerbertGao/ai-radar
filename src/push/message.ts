@@ -206,10 +206,38 @@ const FEISHU_MAX_BLOCKS = 50;
 /**
  * 转义 lark_md 文本中会破坏内联链接 `[文本](url)` 结构的字符。
  * lark_md 解析 markdown 语法，故标题/要点里的 `[` `]` `(` `)` 需转义，避免误当链接语法；
- * URL 段不走此函数（URL 直接置于 `(...)` 内，飞书按原样跳转）。
+ * URL 段不走此函数，改走 `escapeLarkMdUrl`（percent-encode、href 安全），二者机制不可互换。
  */
 function escapeLarkMdText(text: string): string {
   return text.replace(/[[\]()\\]/g, (ch) => `\\${ch}`);
+}
+
+/**
+ * **链接 URL 专用** lark_md 转义器：内联链接 `[文本](url)` 的 URL 段对
+ * `(`/`)`/`[`/`]`/`\` 做 **percent-encode**（`%28`/`%29`/`%5B`/`%5D`/`%5C`），与 `escapeLarkMdText`
+ * （链接文本/标题/正文）分工不同、不可互换；与 Telegram 的
+ * `escapeMarkdownV2`（文本）/`escapeMarkdownV2Url`（URL）对称。
+ *
+ * **为何 percent-encode 而非反斜杠**：lark_md 是否把 `\)` 解析为字面 `)` 未知（解析器相关）。
+ * percent-encode 后 URL 段**不含括号/方括号**，对「首个 `)` 即闭合链接」与「CommonMark 配对括号」
+ * 两种解析模型都不破链——correct-by-construction、与解析器无关；`%28`/`%29`/`%5B`/`%5D`/`%5C` 是合法
+ * URL 编码，点击时解码回原字符、href 不变。
+ *
+ * **字符集 = `( ) [ ] \`**：这是经 `normalizeUrl`（dedup/normalize.ts）后仍可能字面残留进
+ * `canonical_url` **且** 在 markdown 链接目标段可能有语法意义的全集——空格/`<`/`>`/换行/中文等已被
+ * URL 解析（path）或 `encodeURIComponent`（query）编码、不残留，故无需处理。`( )` 是链接定界符、
+ * `\` 是转义引导符、`[ ]` 在闭源 lark_md 解析器下可能被当链接文本起始（`escapeLarkMdText` 亦转义之）；
+ * 同时 encode `(`/`[`（不只 `)`/`]`）以免配对模型下留下不配对开括号反而破链。
+ */
+export function escapeLarkMdUrl(url: string): string {
+  const enc: Record<string, string> = {
+    '(': '%28',
+    ')': '%29',
+    '[': '%5B',
+    ']': '%5D',
+    '\\': '%5C',
+  };
+  return url.replace(/[()[\]\\]/g, (ch) => enc[ch]!);
 }
 
 /** 飞书互动卡片 payload（最小结构：header + elements，不含任何回调字段）。 */
@@ -302,8 +330,8 @@ export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendere
       // 文字链跳转（不依赖回调）：canonical_url 缺失则不渲染链接行。
       const url = e.canonicalUrl?.trim();
       if (url && url.length <= MAX_URL_LENGTH) {
-        // 链接文本「原文」无特殊字符；URL 直接置于括号内（飞书按原样跳转）。
-        lines.push(`[原文](${url})`);
+        // 链接文本「原文」无特殊字符；URL 段经 escapeLarkMdUrl percent-encode `()[]\` 防破链。
+        lines.push(`[原文](${escapeLarkMdUrl(url)})`);
       } else if (url) {
         console.error(
           `[push] feishu: canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
@@ -407,7 +435,7 @@ export function buildWeeklyFeishuCard(item: WeeklySelectedEvent): FeishuRendered
       const { title, headline, url } = weeklyLineText(e, i + 1);
       const blockLines = [`**${escapeLarkMdText(title)}**`];
       if (headline) blockLines.push(escapeLarkMdText(headline));
-      if (url) blockLines.push(`[原文](${url})`);
+      if (url) blockLines.push(`[原文](${escapeLarkMdUrl(url)})`);
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: blockLines.join('\n') } });
     });
   };
@@ -518,7 +546,7 @@ function buildExperienceFeishuCard(
 
       const url = e.canonicalUrl?.trim();
       if (url && url.length <= MAX_URL_LENGTH) {
-        lines.push(`[来源](${url})`);
+        lines.push(`[来源](${escapeLarkMdUrl(url)})`);
       } else if (url) {
         console.error(
           `[push] feishu experience canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染要点+摘要。id=${e.eventId}`,
@@ -768,7 +796,7 @@ function buildDailyFeishuCard(
     if (headlineText) lines.push(escapeLarkMdText(truncateByCodePoint(headlineText, HEADLINE_MAX)));
     const url = e.canonicalUrl?.trim();
     if (url && url.length <= MAX_URL_LENGTH) {
-      lines.push(`[原文](${url})`);
+      lines.push(`[原文](${escapeLarkMdUrl(url)})`);
     } else if (url) {
       console.error(
         `[push] daily feishu canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染标题+要点。eventId=${e.eventId}`,
@@ -788,7 +816,7 @@ function buildDailyFeishuCard(
     if (tagline) lines.push(escapeLarkMdText(truncateByCodePoint(tagline, PRODUCT_TAGLINE_MAX)));
     const url = p.canonicalUrl?.trim();
     if (url && url.length <= MAX_URL_LENGTH) {
-      lines.push(`[官网](${url})`);
+      lines.push(`[官网](${escapeLarkMdUrl(url)})`);
     } else if (url) {
       console.error(
         `[push] daily feishu product canonical_url 超长（${url.length} > ${MAX_URL_LENGTH}），丢弃链接仅渲染产品名。productId=${p.eventId}`,

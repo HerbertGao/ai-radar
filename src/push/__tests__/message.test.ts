@@ -12,9 +12,13 @@ import type { SelectedEvent } from '../../selection/top-n.js';
 import {
   buildDigestMessage,
   buildFeishuCard,
+  buildWeeklyFeishuCard,
+  escapeLarkMdUrl,
   escapeMarkdownV2Url,
+  renderDailyDigest,
   renderDigest,
   type FeishuCard,
+  type WeeklySelectedEvent,
 } from '../message.js';
 
 function ev(id: string, overrides: Partial<SelectedEvent> = {}): SelectedEvent {
@@ -365,5 +369,144 @@ describe('buildFeishuCard 飞书 JSON 卡片渲染（5.2 / 5.6）', () => {
     expect(includedIds).toEqual(['e1']);
     const el = card.elements[0] as { text: { content: string } };
     expect(el.text.content).not.toContain('[原文]');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// 飞书 URL 段 percent-encode 转义（harden-feishu-link-url-escape）
+//
+// lark_md 内联链接 `[文本](url)` 的 URL 段对 `(`/`)`/`[`/`]`/`\` 做 percent-encode（%28/%29/%5B/%5D/%5C），
+// 使链接结构对「首个 `)` 即闭合」与「CommonMark 配对括号」两种解析模型都不破坏；点击解码回原 URL。
+// 含括号 URL 的典型样本：维基百科消歧义 URL `Go_(programming_language)`。
+// ──────────────────────────────────────────────────────────────────────────
+
+/** 含 `(` 与 `)` 的真实样本 URL（维基百科消歧义条目）。 */
+const PARENS_URL = 'https://en.wikipedia.org/wiki/Go_(programming_language)';
+/** 含字面 `\` 的 URL。 */
+const BACKSLASH_URL = 'https://ex.com/a\\b\\c';
+/** 含 `[` 与 `]` 的 URL（经 normalizeUrl 后方括号仍可字面残留进 canonical_url）。 */
+const BRACKET_URL = 'https://ex.com/q?x=[a]&y=(b)';
+/** percent-encode 后再 decode 回原 URL（证 href 不变）。 */
+function decodeLark(encoded: string): string {
+  return encoded
+    .replaceAll('%28', '(')
+    .replaceAll('%29', ')')
+    .replaceAll('%5B', '[')
+    .replaceAll('%5D', ']')
+    .replaceAll('%5C', '\\');
+}
+/** 从一段 lark_md 文本里抽出首个 `[label](url)` 的 URL 段。 */
+function linkTarget(content: string): string {
+  const m = /\[[^\]]*\]\(([^)]*)\)/.exec(content);
+  if (!m) throw new Error(`no link in: ${content}`);
+  return m[1]!;
+}
+
+describe('escapeLarkMdUrl（飞书 URL 专用 percent-encode）', () => {
+  it('percent-encode ( ) [ ] \\ 五字符', () => {
+    expect(escapeLarkMdUrl(PARENS_URL)).toBe(
+      'https://en.wikipedia.org/wiki/Go_%28programming_language%29',
+    );
+    expect(escapeLarkMdUrl(BACKSLASH_URL)).toBe('https://ex.com/a%5Cb%5Cc');
+    expect(escapeLarkMdUrl(BRACKET_URL)).toBe(
+      'https://ex.com/q?x=%5Ba%5D&y=%28b%29',
+    );
+  });
+
+  it('防过度转义：干净 URL 原样不变（. - _ = ? / : 不被编码）', () => {
+    const clean = 'https://ex.com/path-to_thing.html?a=1&b=2#sec';
+    expect(escapeLarkMdUrl(clean)).toBe(clean);
+  });
+
+  it('编码后 decode 回原 URL（href 不变）', () => {
+    expect(decodeLark(escapeLarkMdUrl(PARENS_URL))).toBe(PARENS_URL);
+    expect(decodeLark(escapeLarkMdUrl(BACKSLASH_URL))).toBe(BACKSLASH_URL);
+    expect(decodeLark(escapeLarkMdUrl(BRACKET_URL))).toBe(BRACKET_URL);
+  });
+});
+
+describe('飞书渲染器 URL 段 percent-encode（4 渲染器）', () => {
+  /** 断言一段 lark_md：URL 目标无裸 ( ) \、结构完整、decode 后等于原 URL。 */
+  function assertEscapedLink(content: string, originalUrl: string): void {
+    const target = linkTarget(content);
+    // URL 段内无裸 ( ) [ ] \。
+    expect(target).not.toMatch(/[()[\]\\]/);
+    // 已成 %28/%29/%5B/%5D/%5C（按原 URL 含哪些字符断言）。
+    if (originalUrl.includes('(')) expect(target).toContain('%28');
+    if (originalUrl.includes(')')) expect(target).toContain('%29');
+    if (originalUrl.includes('[')) expect(target).toContain('%5B');
+    if (originalUrl.includes(']')) expect(target).toContain('%5D');
+    if (originalUrl.includes('\\')) expect(target).toContain('%5C');
+    // decode 后等于原 URL（href 不变）。
+    expect(decodeLark(target)).toBe(originalUrl);
+  }
+
+  it('事件 buildFeishuCard：[原文] URL 段被 percent-encode', () => {
+    const parens = buildFeishuCard([ev('e1', { canonicalUrl: PARENS_URL })]);
+    const el = parens.card.elements[0] as { text: { content: string } };
+    assertEscapedLink(el.text.content, PARENS_URL);
+
+    const back = buildFeishuCard([ev('e2', { canonicalUrl: BACKSLASH_URL })]);
+    const elBack = back.card.elements[0] as { text: { content: string } };
+    assertEscapedLink(elBack.text.content, BACKSLASH_URL);
+
+    const bracket = buildFeishuCard([ev('e3', { canonicalUrl: BRACKET_URL })]);
+    const elBracket = bracket.card.elements[0] as { text: { content: string } };
+    assertEscapedLink(elBracket.text.content, BRACKET_URL);
+  });
+
+  it('经验 buildExperienceFeishuCard：[来源] URL 段被 percent-encode', () => {
+    const rendered = renderDigest(
+      [ev('x1', { canonicalUrl: PARENS_URL })],
+      'feishu',
+      'experience',
+    );
+    if (rendered.channel !== 'feishu') throw new Error('unreachable');
+    const el = rendered.card.elements[0] as { text: { content: string } };
+    assertEscapedLink(el.text.content, PARENS_URL);
+
+    const back = renderDigest(
+      [ev('x2', { canonicalUrl: BACKSLASH_URL })],
+      'feishu',
+      'experience',
+    );
+    if (back.channel !== 'feishu') throw new Error('unreachable');
+    const elBack = back.card.elements[0] as { text: { content: string } };
+    assertEscapedLink(elBack.text.content, BACKSLASH_URL);
+  });
+
+  it('日报 buildDailyFeishuCard：事件块 [原文] + 产品块 [官网] URL 段被 percent-encode', () => {
+    const event = ev('e1', { canonicalUrl: PARENS_URL });
+    const product = ev('p1', { canonicalUrl: BACKSLASH_URL, headlineZh: null });
+    const r = renderDailyDigest([event], [product], 'feishu');
+    const card = (JSON.parse(r.text) as { card: FeishuCard }).card;
+    // elements: [要闻段标题, 事件块, 新品段标题, 产品块]。
+    const eventEl = card.elements[1] as { text: { content: string } };
+    const productEl = card.elements[3] as { text: { content: string } };
+    assertEscapedLink(eventEl.text.content, PARENS_URL);
+    assertEscapedLink(productEl.text.content, BACKSLASH_URL);
+  });
+
+  it('周报 buildWeeklyFeishuCard：[原文] URL 段被 percent-encode', () => {
+    const item: WeeklySelectedEvent = {
+      ...ev('2026-W25'),
+      representativeTitle: 'AI Radar 周报',
+      canonicalUrl: null,
+      weeklyItems: {
+        events: [ev('we1', { canonicalUrl: PARENS_URL })],
+        products: [],
+      },
+    };
+    const rendered = buildWeeklyFeishuCard(item);
+    // elements: [本周要闻段标题, 要闻块]。
+    const el = rendered.card.elements[1] as { text: { content: string } };
+    assertEscapedLink(el.text.content, PARENS_URL);
+  });
+
+  it('防过度转义：干净 URL 渲染后原样（含 ? = / : 不被编码）', () => {
+    const clean = 'https://example.com/article/1?id=1&x=2';
+    const rendered = buildFeishuCard([ev('e1', { canonicalUrl: clean })]);
+    const el = rendered.card.elements[0] as { text: { content: string } };
+    expect(el.text.content).toContain(`[原文](${clean})`);
   });
 });
