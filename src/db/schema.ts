@@ -466,6 +466,8 @@ export const mrPlans = pgTable(
       .default(sql`gen_random_uuid()::text`),
     vendorId: varchar('vendor_id', { length: 128 }).notNull(),
     // UNIQUE(vendor_id, name) 组件 → NOT NULL（真实列，非派生）。
+    // 录入约定：name = 套餐全名（含产品上下文，如 'Coding Plan Pro'/'Qoder Pro'，非裸档位 'Pro'）；
+    // 故 key 不含 category 仍正确（同厂跨桶全名天然不同 + 挡同名误录）。裸档位跨桶误撞属 5b 录入契约须避免。
     name: text('name').notNull(),
     category: text('category').notNull(),
     // 与 currency 同生同灭（Zod refine 兜）；needs_login_recheck 时两者皆 NULL 占位。
