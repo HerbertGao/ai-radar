@@ -33,10 +33,12 @@ type DbLike = typeof defaultDb;
 
 /** runStaleness 结果（供编排/可观测）。 */
 export interface RunStalenessResult {
-  /** 打 source flag 的 source id 数。 */
+  /** 成功打 source flag 的 source id 数。 */
   sourceFlagged: number;
-  /** 打 plan flag 的 plan id 数（去重后；source/limit/junction 陈旧均经所属 plan）。 */
+  /** 成功打 plan flag 的 plan id 数（去重后；source/limit/junction 陈旧均经所属 plan）。 */
   planFlagged: number;
+  /** 单 target 打标失败数（失败隔离，扫描继续）。 */
+  errors: number;
 }
 
 export interface RunStalenessOptions {
@@ -44,6 +46,8 @@ export interface RunStalenessOptions {
   thresholdDays?: number;
   /** 参考时刻（默认当前；阈值边界 = now - thresholdDays）。 */
   now?: Date;
+  /** 运行期日志 sink（默认 console.error）。 */
+  log?: (message: string, detail?: unknown) => void;
 }
 
 /** 各事实表对应的 plan 级 reason 前缀（注明哪类行陈旧，落地 design D9 reason 注明）。 */
@@ -52,6 +56,9 @@ const REASON_LIMIT = '限额行陈旧';
 const REASON_CLIENT = '工具/协议兼容行陈旧';
 const REASON_MODEL = '模型兼容行陈旧';
 const REASON_SOURCE = '来源页面长期未核对';
+
+const defaultLog = (message: string, detail?: unknown): void =>
+  console.error(`[mr-staleness] ${message}`, detail ?? '');
 
 /**
  * 陈旧度纯函数（design D9）。扫五表 last_checked 超阈值/NULL → 打 flag。
@@ -66,6 +73,7 @@ export async function runStaleness(
 ): Promise<RunStalenessResult> {
   const thresholdDays = options.thresholdDays ?? envThresholdDays ?? 30;
   const now = options.now ?? new Date();
+  const log = options.log ?? defaultLog;
   const threshold = new Date(now.getTime() - thresholdDays * 86_400_000);
 
   // 陈旧判定：last_checked IS NULL（最该复核）OR < threshold（design D9 NULL 语义）。
@@ -113,12 +121,28 @@ export async function runStaleness(
   for (const m of staleModels) flagPlan(m.planId, REASON_MODEL);
 
   // per-target 独立打标（每 CAS 自治，失败隔离，不裹批事务）。
+  let sourceFlagged = 0;
+  let planFlagged = 0;
+  let errors = 0;
+
   for (const s of staleSources) {
-    await setReviewFlag(dbh, { targetType: 'source', targetId: s.id }, REASON_SOURCE);
+    try {
+      await setReviewFlag(dbh, { targetType: 'source', targetId: s.id }, REASON_SOURCE);
+      sourceFlagged += 1;
+    } catch (error) {
+      errors += 1;
+      log(`打标失败[source=${s.id}]`, error);
+    }
   }
   for (const [planId, reason] of flaggedPlans) {
-    await setReviewFlag(dbh, { targetType: 'plan', targetId: planId }, reason);
+    try {
+      await setReviewFlag(dbh, { targetType: 'plan', targetId: planId }, reason);
+      planFlagged += 1;
+    } catch (error) {
+      errors += 1;
+      log(`打标失败[plan=${planId}]`, error);
+    }
   }
 
-  return { sourceFlagged: staleSources.length, planFlagged: flaggedPlans.size };
+  return { sourceFlagged, planFlagged, errors };
 }

@@ -25,26 +25,29 @@ process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 const { markChecked, listPendingFlags } = await import('../dispose.js');
 const schema = await import('../../../db/schema.js');
 
-/** 记录一次写操作命中的表（update / insert）。 */
+/** 记录一次 update 命中的表。 */
 interface TableHit {
-  op: 'update' | 'insert';
+  op: 'update';
   table: unknown;
 }
 
 /** tx 桩：记录 update/insert 命中的表，并执行 set/where/values/onConflict 链不报错。 */
-function makeTxStub(hits: TableHit[]) {
+function makeTxStub(hits: TableHit[], resolveAffectedRows: number) {
   return {
     update(table: unknown) {
       return {
         set(_v: unknown) {
-          return { where: async () => hits.push({ op: 'update', table }) };
-        },
-      };
-    },
-    insert(table: unknown) {
-      return {
-        values(_v: unknown) {
-          return { onConflictDoUpdate: async () => hits.push({ op: 'insert', table }) };
+          return {
+            where(_cond: unknown) {
+              hits.push({ op: 'update', table });
+              return {
+                returning: async () =>
+                  table === schema.mrReviewFlag && resolveAffectedRows > 0
+                    ? [{ id: 'flag-1' }]
+                    : [],
+              };
+            },
+          };
         },
       };
     },
@@ -52,10 +55,14 @@ function makeTxStub(hits: TableHit[]) {
 }
 
 /** db 桩：transaction 把 tx 桩传给回调；裸 select 给 listPendingFlags。 */
-function makeDbStub(hits: TableHit[], pendingRows: unknown[] = []) {
+function makeDbStub(
+  hits: TableHit[],
+  pendingRows: unknown[] = [],
+  opts: { resolveAffectedRows?: number } = {},
+) {
   return {
-    async transaction(cb: (tx: unknown) => Promise<void>) {
-      await cb(makeTxStub(hits));
+    async transaction<T>(cb: (tx: unknown) => Promise<T>): Promise<T> {
+      return cb(makeTxStub(hits, opts.resolveAffectedRows ?? 1));
     },
     select(_cols?: unknown) {
       return {
@@ -78,8 +85,12 @@ function tableNames(hits: TableHit[]): Set<unknown> {
 describe('markChecked 粒度刷新（注入桩）', () => {
   it('markChecked(plan)：刷 mr_plans + 全部 child 事实行（4 张表均 UPDATE）', async () => {
     const hits: TableHit[] = [];
-    await markChecked(makeDbStub(hits) as never, { targetType: 'plan', targetId: 'plan-1' });
+    const result = await markChecked(makeDbStub(hits) as never, {
+      targetType: 'plan',
+      targetId: 'plan-1',
+    });
 
+    expect(result).toEqual({ outcome: 'checked' });
     const tables = tableNames(hits);
     // resolveFlag UPDATE mr_review_flag + 刷 mr_plans/limits/clients/models 各 UPDATE。
     expect(tables.has(schema.mrReviewFlag)).toBe(true);
@@ -91,8 +102,12 @@ describe('markChecked 粒度刷新（注入桩）', () => {
 
   it('markChecked(source)：只刷 mr_source，不碰 plan child', async () => {
     const hits: TableHit[] = [];
-    await markChecked(makeDbStub(hits) as never, { targetType: 'source', targetId: 'src-1' });
+    const result = await markChecked(makeDbStub(hits) as never, {
+      targetType: 'source',
+      targetId: 'src-1',
+    });
 
+    expect(result).toEqual({ outcome: 'checked' });
     const tables = tableNames(hits);
     expect(tables.has(schema.mrReviewFlag)).toBe(true);
     expect(tables.has(schema.mrSource)).toBe(true);
@@ -102,8 +117,12 @@ describe('markChecked 粒度刷新（注入桩）', () => {
 
   it('markChecked(vendor)：仅 resolve（vendor 无 last_checked 列）', async () => {
     const hits: TableHit[] = [];
-    await markChecked(makeDbStub(hits) as never, { targetType: 'vendor', targetId: 'v-1' });
+    const result = await markChecked(makeDbStub(hits) as never, {
+      targetType: 'vendor',
+      targetId: 'v-1',
+    });
 
+    expect(result).toEqual({ outcome: 'checked' });
     const tables = tableNames(hits);
     expect(tables.has(schema.mrReviewFlag)).toBe(true);
     // vendor 身份表无 freshness 列 → 仅 mr_review_flag 被 UPDATE。
@@ -117,11 +136,25 @@ describe('markChecked 粒度刷新（注入桩）', () => {
     ).rejects.toThrow();
     expect(hits).toHaveLength(0);
   });
+
+  it('resolveFlag 0 行（无 pending 或已被重开/resolve）：返回 not-resolved 且不刷 last_checked', async () => {
+    const hits: TableHit[] = [];
+    const result = await markChecked(
+      makeDbStub(hits, [], { resolveAffectedRows: 0 }) as never,
+      { targetType: 'plan', targetId: 'plan-not-resolved' },
+    );
+
+    expect(result).toEqual({ outcome: 'not-resolved' });
+    // resolveFlag 的 UPDATE 命中 mr_review_flag（0 行），但不刷任何 last_checked 表。
+    expect(tableNames(hits)).toEqual(new Set([schema.mrReviewFlag]));
+  });
 });
 
 describe('listPendingFlags 链路成形（注入桩）', () => {
   it('返回桩给的 pending 行（select→from→where→orderBy）', async () => {
-    const rows = [{ targetType: 'plan', targetId: 'p-1', reason: 'r', openedAt: new Date() }];
+    const rows = [
+      { targetType: 'plan', targetId: 'p-1', reason: 'r', openedAtText: '2026-06-25 00:00:00+00' },
+    ];
     const out = await listPendingFlags(makeDbStub([], rows) as never, { targetType: 'plan' });
     expect(out).toEqual(rows);
   });

@@ -39,9 +39,12 @@ export const mrPlanWriteValidator = mrPlanWriteSchema;
  * version 不归一（保留版本号原貌；未标版本由 Group B 填哨兵 `''`）。本表无 enum 列，归一是唯一有限值约束。
  */
 export const mrModelWriteSchema = z.object({
+  // 先 trim 再校验非空（纯空白 family 会归一成 '' 入 (vendor_id,family,version) 唯一键 → 畸形身份，fail-fast）。
   family: z
     .string()
-    .transform((s) => s.toLowerCase().trim()),
+    .transform((s) => s.trim())
+    .pipe(z.string().min(1, 'family 不可为空'))
+    .transform((s) => s.toLowerCase()),
   version: z.string(),
 });
 

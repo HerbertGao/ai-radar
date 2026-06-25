@@ -259,18 +259,23 @@ export function robotsAllows(robotsTxt: string, path: string, userAgent: string)
     }
   }
 
-  // 选适用组：精确匹配本 UA token 优先，否则 `*`。
-  const applicable =
-    groups.find((g) => g.agents.some((a) => a !== '*' && uaToken.includes(a))) ??
-    groups.find((g) => g.agents.includes('*'));
-  if (!applicable) return true; // 无适用规则 = 允许。
+  // 选适用组：精确匹配本 UA token 的组优先，否则全部 `*` 组。合并所有匹配本 bot 的组规则
+  // （一个 bot 可声明多个 User-agent 行/多组；RFC 惯例合并而非只取首组）。
+  const specific = groups.filter((g) => g.agents.some((a) => a !== '*' && uaToken.includes(a)));
+  const applicable = specific.length > 0 ? specific : groups.filter((g) => g.agents.includes('*'));
+  if (applicable.length === 0) return true; // 无适用规则 = 允许。
 
-  // 取最长前缀匹配的规则决定 allow/disallow（空 Disallow path = 允许全部，不算匹配）。
+  // 最长前缀匹配决定 allow/disallow；等长 tie 优先 Allow（RFC 惯例）。空 path = 不约束。
   let best: { allow: boolean; len: number } | null = null;
-  for (const rule of applicable.rules) {
-    if (rule.path === '' ) continue; // 空 Disallow/Allow = 不约束。
-    if (path.startsWith(rule.path)) {
-      if (!best || rule.path.length > best.len) {
+  for (const group of applicable) {
+    for (const rule of group.rules) {
+      if (rule.path === '') continue; // 空 Disallow/Allow = 不约束。
+      if (!path.startsWith(rule.path)) continue;
+      if (
+        !best ||
+        rule.path.length > best.len ||
+        (rule.path.length === best.len && rule.allow && !best.allow)
+      ) {
         best = { allow: rule.allow, len: rule.path.length };
       }
     }

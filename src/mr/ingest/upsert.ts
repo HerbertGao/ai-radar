@@ -57,7 +57,9 @@ export type IdentityUpsertOutcome =
   /** 新建身份行。 */
   | { outcome: 'inserted'; id: string }
   /** 唯一键命中既有行（幂等）。 */
-  | { outcome: 'exists'; id: string };
+  | { outcome: 'exists'; id: string }
+  /** 既有行的定位元数据（非断言事实）按 ingest 权威更正（如 source.fetch_strategy 漂移）。 */
+  | { outcome: 'updated'; id: string; field: string };
 
 /** fact guarded-write 结果（design D2）。 */
 export type FactWriteOutcome =
@@ -161,13 +163,23 @@ export async function upsertSource(
   if (inserted.length > 0) return { outcome: 'inserted', id: inserted[0]!.id };
 
   const existing = await dbh
-    .select({ id: mrSource.id })
+    .select({ id: mrSource.id, fetchStrategy: mrSource.fetchStrategy })
     .from(mrSource)
     .where(
       and(eq(mrSource.vendorId, s.vendorId), eq(mrSource.sourceUrl, s.sourceUrl)),
     )
     .limit(1);
-  return { outcome: 'exists', id: existing[0]!.id };
+  const row = existing[0]!;
+  // fetch_strategy 是定位元数据（非断言事实）：源从 http 改 browser/manual 后旧 lane 不应长存。
+  // 人工策展更正按 ingest 权威更新（区别于 fact guarded-write 的「不盲覆盖」），返回 updated。
+  if (row.fetchStrategy !== fetchStrategy) {
+    await dbh
+      .update(mrSource)
+      .set({ fetchStrategy })
+      .where(eq(mrSource.id, row.id));
+    return { outcome: 'updated', id: row.id, field: 'fetch_strategy' };
+  }
+  return { outcome: 'exists', id: row.id };
 }
 
 // ───────────────────────── fact guarded-write（ON CONFLICT DO NOTHING + 比对 + 打标）─────────────────────────

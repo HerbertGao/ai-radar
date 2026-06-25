@@ -97,6 +97,21 @@ describe('detectSourceChange 编排', () => {
     expect(compareFn).not.toHaveBeenCalled();
   });
 
+  it('未知 fetchStrategy → fail-closed skipped，不发请求（纵深防御，非落 http）', async () => {
+    const fetchHttp = vi.fn();
+    const fetchBrowser = vi.fn();
+    const compareFn = vi.fn();
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's-unknown', sourceUrl: 'https://openai.com/p', fetchStrategy: 'graphql' },
+      { fetchHttp, fetchBrowser, compareFn, writeSnapshotFile: false },
+    );
+    expect(out).toEqual({ outcome: 'skipped' });
+    expect(fetchHttp).not.toHaveBeenCalled();
+    expect(fetchBrowser).not.toHaveBeenCalled();
+    expect(compareFn).not.toHaveBeenCalled();
+  });
+
   it('browser 档无注入 fetchBrowser → skipped（隔离 playwright）', async () => {
     const out = await detectSourceChange(
       fakeDb,

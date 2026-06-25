@@ -10,7 +10,8 @@
  * - 禁下载（`acceptDownloads:false`）/file chooser/对话框（自动 dismiss）/新窗口/service worker/默认权限；
  * - **私网/元数据 IP 的权威封锁靠网络层 egress**（渲染器 socket 不经 Node lookup，必需部署控制）——
  *   `context.route`（URL-string 过滤）+ CDP `Network.setBlockedURLs(['ws://*','wss://*'])` 封 WebSocket = **纵深防御**；
- * - **硬超时杀进程树**（`SIGKILL` + 外层 watchdog，非 `browser.close()`——后者被挂死渲染器拖住）；
+ * - **硬超时 SIGKILL browser 主进程**（+ 外层 watchdog，非 `browser.close()`——后者被挂死渲染器拖住）；
+ *   Chromium 子进程由容器 cgroup / 独立 service 回收（D11/D15 容器隔离兜底，非本层逐 PID 杀）；
  * - 内存/响应体上限（容器 cgroup + 本层最大体）。
  */
 import { env } from '../../config/env.js';
@@ -87,8 +88,9 @@ export interface BrowserFetchOptions {
 /**
  * browser 档取页（沙箱锁定，design D11）。每次调用 = 一个 job = 全新 context 用后即关。
  *
- * **硬超时杀进程树**：外层 `Promise.race([job, watchdog])`，超时 `process.kill(pid,'SIGKILL')`（进程树）+
- * 不依赖 `browser.close()`（挂死渲染器会拖住它）。
+ * **硬超时 SIGKILL browser 主进程**：外层 `Promise.race([job, watchdog])`，超时 `process.kill(pid,'SIGKILL')`
+ * 只杀 browser 主进程（Chromium 子进程由容器 cgroup / 独立 service 回收，D11/D15）+ 不依赖
+ * `browser.close()`（挂死渲染器会拖住它）。
  *
  * @returns 页面 HTML 文本；超时/失败抛错（由 BullMQ 整 job 重试）。
  */
@@ -115,7 +117,8 @@ export async function fetchWithBrowser(
   let watchdog: NodeJS.Timeout | undefined;
   const hardTimeout = new Promise<never>((_, reject) => {
     watchdog = setTimeout(() => {
-      if (pid) killProcess(pid, 'SIGKILL'); // 进程树 kill（cgroup/容器内 pid 同树）。
+      // SIGKILL browser 主进程；Chromium 子进程由容器 cgroup / 独立 service 回收（D11/D15）。
+      if (pid) killProcess(pid, 'SIGKILL');
       reject(new Error('mr-browser-hard-timeout'));
     }, timeoutMs);
   });

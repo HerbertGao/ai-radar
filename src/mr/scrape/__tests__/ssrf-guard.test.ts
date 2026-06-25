@@ -97,6 +97,25 @@ describe('assertUrlAllowed（scheme + 白名单 + 字面 IP 私网）', () => {
     }
   });
 
+  it('URL 含 userinfo（user:pass@白名单host）→ url-has-userinfo（防变 Basic Auth 头，违 D12）', () => {
+    try {
+      assertUrlAllowed('https://u:p@openai.com/', ALLOW);
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(SsrfBlockedError);
+      expect((e as InstanceType<typeof SsrfBlockedError>).reason).toBe('url-has-userinfo');
+    }
+  });
+
+  it('URL 仅含 username（user@白名单host）→ url-has-userinfo', () => {
+    try {
+      assertUrlAllowed('https://user@openai.com/', ALLOW);
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as InstanceType<typeof SsrfBlockedError>).reason).toBe('url-has-userinfo');
+    }
+  });
+
   it('重定向目标私网 → 重跑守卫拦截（每跳重验）', () => {
     // 模拟「白名单源 302 到私网」：守卫对 location 重跑即拒。
     const redirectTarget = 'http://169.254.169.254/';

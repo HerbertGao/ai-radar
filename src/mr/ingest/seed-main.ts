@@ -25,8 +25,9 @@ async function main(): Promise<void> {
 }
 
 main()
-  .then(() => process.exit(0))
+  // 成功路径不调 process.exit(0)（自然退出，避免截断 stdout 的 JSON artifact 缓冲）。
   .catch((err: unknown) => {
     console.error('[mr-seed] 失败：', err);
-    process.exit(1);
+    // 设 exitCode 而非 process.exit(1)，让缓冲的输出自然刷出。
+    process.exitCode = 1;
   });

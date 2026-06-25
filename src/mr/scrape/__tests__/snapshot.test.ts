@@ -49,6 +49,25 @@ describe('writeSnapshot / readSnapshot', () => {
     const files = await fs.readdir(baseDir);
     expect(files.some((f) => f.endsWith('.tmp'))).toBe(false);
   });
+
+  it('并发同源写用唯一 tmp，互不破坏 + 最终文件完整可读', async () => {
+    const a = 'a'.repeat(2000);
+    const b = 'b'.repeat(2000);
+    // 并发两次写同一 source_id：唯一 tmp 使二者不互相覆盖/破坏对方 rename。
+    const [ok1, ok2] = await Promise.all([
+      writeSnapshot('same-id', a, { baseDir }),
+      writeSnapshot('same-id', b, { baseDir }),
+    ]);
+    expect(ok1).toBe(true);
+    expect(ok2).toBe(true);
+
+    // 最终态：恰一个 final 文件（纯 hex），无 .tmp 残留，内容是某一次的完整写（非半截/混合）。
+    const files = await fs.readdir(baseDir);
+    expect(files.some((f) => f.endsWith('.tmp'))).toBe(false);
+    expect(files).toEqual([snapshotId('same-id')]);
+    const final = await readSnapshot('same-id', { baseDir });
+    expect([a, b]).toContain(final);
+  });
 });
 
 describe('janitor', () => {

@@ -84,10 +84,24 @@ export default tseslint.config(
             '抓取链禁 globalThis.fetch——必走 safeFetch 经 SSRF chokepoint。design D10/D12。',
         },
         {
+          // computed member 绕过：globalThis['fetch'] / global['fetch']。
+          selector:
+            "MemberExpression[computed=true][object.name=/^(globalThis|global)$/][property.value='fetch']",
+          message:
+            "抓取链禁 globalThis['fetch']/global['fetch'] computed 取 fetch——必走 safeFetch 经 SSRF chokepoint。design D10/D12。",
+        },
+        {
           selector:
             "CallExpression[callee.name='require'][arguments.0.value=/^node:(http|https|net|dgram|dns)$/]",
           message:
             '抓取链禁 require 形式调出站/解析原语绕过 SSRF wrapper——走 safeFetch。design D10/D12。',
+        },
+        {
+          // 动态 import 出站/解析原语绕过 import 静态分析：await import('node:http') 等。
+          selector:
+            "ImportExpression[source.value=/^node:(http|https|net|dgram|dns)$/]",
+          message:
+            "抓取链禁 import() 动态导入 node:http(s)/net/dgram/dns 绕过 SSRF wrapper——走 safeFetch。design D10/D12。",
         },
       ],
     },

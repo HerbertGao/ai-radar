@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { eq, like } from 'drizzle-orm';
+import { eq, inArray, like, or } from 'drizzle-orm';
 import * as schema from '../../../db/schema.js';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -26,7 +26,7 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
-const { setReviewFlag } = await import('../../write/flag.js');
+const { resolveFlag, setReviewFlag } = await import('../../write/flag.js');
 const { listPendingFlags, markChecked } = await import('../dispose.js');
 const { runStaleness } = await import('../staleness.js');
 
@@ -40,7 +40,21 @@ const OLD = new Date('2000-01-01T00:00:00Z');
 
 async function cleanup() {
   if (!db) return;
-  await db.delete(schema.mrReviewFlag).where(like(schema.mrReviewFlag.targetId, `${PREFIX}%`));
+  const plans = await db
+    .select({ id: schema.mrPlans.id })
+    .from(schema.mrPlans)
+    .where(like(schema.mrPlans.sourceUrl, `${PREFIX}%`));
+  const sources = await db
+    .select({ id: schema.mrSource.id })
+    .from(schema.mrSource)
+    .where(like(schema.mrSource.sourceUrl, `${PREFIX}%`));
+  const generatedTargetIds = [...plans.map((p) => p.id), ...sources.map((s) => s.id)];
+  const directPrefixMatch = like(schema.mrReviewFlag.targetId, `${PREFIX}%`);
+  await db.delete(schema.mrReviewFlag).where(
+    generatedTargetIds.length > 0
+      ? or(directPrefixMatch, inArray(schema.mrReviewFlag.targetId, generatedTargetIds))
+      : directPrefixMatch,
+  );
   await db.delete(schema.mrPlanModels).where(like(schema.mrPlanModels.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
   await db.delete(schema.mrPlanClients).where(like(schema.mrPlanClients.sourceUrl, `${PREFIX}%`));
@@ -128,6 +142,84 @@ describeIfDb('7.3 flag 翻转 + dispose', () => {
     expect(r[0]!.openedAt!.getFullYear()).toBeGreaterThan(2000);
   });
 
+  it('resolveFlag expectedOpenedAt mismatch 返回 0 且不清 newer pending flag', async () => {
+    const targetId = `${PREFIX}generation-mismatch`;
+    await setReviewFlag(db!, { targetType: 'plan', targetId }, '旧触发');
+    // 经 listPendingFlags 拿 full-precision text（精度安全，配 resolveFlag 的 text↔text 比）。
+    const oldOpenedAtText = (await listPendingFlags(db!, { targetType: 'plan' })).find(
+      (f) => f.targetId === targetId,
+    )!.openedAtText;
+    const first = (await flagRows(targetId))[0]!;
+    const newerOpenedAt = new Date(first.openedAt!.getTime() + 60_000);
+    await db!
+      .update(schema.mrReviewFlag)
+      .set({ openedAt: newerOpenedAt, reason: '新触发', status: 'pending', resolvedAt: null })
+      .where(eq(schema.mrReviewFlag.targetId, targetId));
+
+    const affected = await resolveFlag(
+      db!,
+      { targetType: 'plan', targetId },
+      { expectedOpenedAt: oldOpenedAtText },
+    );
+
+    const r = await flagRows(targetId);
+    expect(affected).toBe(0);
+    expect(r[0]!.status).toBe('pending');
+    expect(r[0]!.reason).toBe('新触发');
+    expect(r[0]!.openedAt!.getTime()).toBe(newerOpenedAt.getTime());
+  });
+
+  it('markChecked 传旧 expectedOpenedAt（人在 list 后 flag 被重开）→ not-resolved 且不清新标', async () => {
+    const targetId = `${PREFIX}gen-gate-markchecked`;
+    await setReviewFlag(db!, { targetType: 'plan', targetId }, '旧触发');
+    // 人在 listPendingFlags 时见到的 opened_at（full-precision text）。
+    const staleOpenedAtText = (await listPendingFlags(db!, { targetType: 'plan' })).find(
+      (f) => f.targetId === targetId,
+    )!.openedAtText;
+
+    // list 之后、markChecked 之前：该 flag 被重开（setReviewFlag 使 opened_at 前进到 now）。
+    await setReviewFlag(db!, { targetType: 'plan', targetId }, '新触发');
+
+    const result = await markChecked(
+      db!,
+      { targetType: 'plan', targetId },
+      { expectedOpenedAt: staleOpenedAtText },
+    );
+
+    expect(result).toEqual({ outcome: 'not-resolved' });
+    const r = await flagRows(targetId);
+    // 新 pending 标未被旧复核误清。
+    expect(r[0]!.status).toBe('pending');
+    expect(r[0]!.reason).toBe('新触发');
+  });
+
+  it('markChecked 无 pending flag：返回 not-resolved 且不更新 last_checked', async () => {
+    const suffix = 'no-pending';
+    const [v] = await db!
+      .insert(schema.mrVendors)
+      .values({ normalizedName: `${PREFIX}v-${suffix}`, name: `V ${suffix}` })
+      .returning();
+    const [src] = await db!
+      .insert(schema.mrSource)
+      .values({
+        sourceUrl: `${PREFIX}src-${suffix}`,
+        vendorId: v!.id,
+        fetchStrategy: 'http',
+        lastChecked: OLD,
+      })
+      .returning();
+
+    const result = await markChecked(db!, { targetType: 'source', targetId: src!.id });
+    const [after] = await db!
+      .select()
+      .from(schema.mrSource)
+      .where(eq(schema.mrSource.id, src!.id));
+
+    expect(result).toEqual({ outcome: 'not-resolved' });
+    expect(after!.lastChecked!.getTime()).toBe(OLD.getTime());
+    expect(await flagRows(src!.id)).toHaveLength(0);
+  });
+
   it('markChecked(source) 后陈旧度不立即重标', async () => {
     const suffix = 'src-fresh';
     const [v] = await db!
@@ -151,7 +243,8 @@ describeIfDb('7.3 flag 翻转 + dispose', () => {
     expect(r[0]!.status).toBe('pending');
 
     // 人工 markChecked：resolve + 刷 last_checked=now（同事务）。
-    await markChecked(db!, { targetType: 'source', targetId: src!.id });
+    const result = await markChecked(db!, { targetType: 'source', targetId: src!.id });
+    expect(result).toEqual({ outcome: 'checked' });
     r = await flagRows(src!.id);
     expect(r[0]!.status).toBe('resolved');
 
@@ -171,7 +264,8 @@ describeIfDb('7.3 flag 翻转 + dispose', () => {
     expect(r[0]!.status).toBe('pending');
 
     // markChecked(plan)：刷 mr_plans + 全部 child（含 plan_model）last_checked=now。
-    await markChecked(db!, { targetType: 'plan', targetId: planId });
+    const result = await markChecked(db!, { targetType: 'plan', targetId: planId });
+    expect(result).toEqual({ outcome: 'checked' });
     r = await flagRows(planId);
     expect(r[0]!.status).toBe('resolved');
 
@@ -210,7 +304,8 @@ describeIfDb('7.3 flag 翻转 + dispose', () => {
   it('markChecked(plan) 与陈旧度刷新在同事务原子（resolve 行存在即 last_checked 已刷）', async () => {
     const planId = await makeStalePlanWithJunction('atomic');
     await setReviewFlag(db!, { targetType: 'plan', targetId: planId }, '触发');
-    await markChecked(db!, { targetType: 'plan', targetId: planId });
+    const result = await markChecked(db!, { targetType: 'plan', targetId: planId });
+    expect(result).toEqual({ outcome: 'checked' });
 
     const r = await flagRows(planId);
     expect(r[0]!.status).toBe('resolved');

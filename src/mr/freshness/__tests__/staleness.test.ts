@@ -38,6 +38,7 @@ function makeStub(opts: {
   staleClients: Array<{ planId: string }>;
   staleModels: Array<{ planId: string }>;
   flagCalls: FlagCall[];
+  failTargetIds?: ReadonlySet<string>;
 }) {
   return {
     select(_cols?: unknown) {
@@ -59,6 +60,9 @@ function makeStub(opts: {
         values(v: { targetType: string; targetId: string; reason: string | null }) {
           return {
             onConflictDoUpdate: async () => {
+              if (opts.failTargetIds?.has(v.targetId)) {
+                throw new Error('simulated flag write failure');
+              }
               opts.flagCalls.push({
                 targetType: v.targetType,
                 targetId: v.targetId,
@@ -145,5 +149,22 @@ describe('runStaleness 路由 + 去重（注入桩）', () => {
     expect(result.sourceFlagged).toBe(0);
     expect(result.planFlagged).toBe(0);
     expect(flagCalls).toHaveLength(0);
+  });
+
+  it('单 target 打标失败不 abort 全量扫描，返回 errors 反映隔离失败', async () => {
+    const flagCalls: FlagCall[] = [];
+    const result = await runStaleness(
+      makeStub({
+        ...empty,
+        staleSources: [{ id: 'src-fail' }, { id: 'src-ok' }],
+        stalePlans: [{ id: 'plan-ok' }],
+        flagCalls,
+        failTargetIds: new Set(['src-fail']),
+      }) as never,
+      { thresholdDays: 30, log: () => {} },
+    );
+
+    expect(result).toEqual({ sourceFlagged: 1, planFlagged: 1, errors: 1 });
+    expect(flagCalls.map((c) => c.targetId).sort()).toEqual(['plan-ok', 'src-ok']);
   });
 });

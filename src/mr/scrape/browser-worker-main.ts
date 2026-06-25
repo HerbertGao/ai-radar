@@ -42,14 +42,26 @@ export async function startBrowserWorker(opts: {
 
   // ② 自检过 → 注册队列/cron/worker。
   const connection = opts.connection ?? buildScrapeConnection();
-  const queue = createMrScrapeBrowserQueue(connection);
-  await scheduleMrScrapeBrowser(queue);
-  const worker = createMrScrapeBrowserWorker({ connection });
+  const closeConnection = () =>
+    (connection as unknown as { quit?: () => Promise<unknown> }).quit?.();
+  let queue: ReturnType<typeof createMrScrapeBrowserQueue> | undefined;
+  let worker: ReturnType<typeof createMrScrapeBrowserWorker> | undefined;
+  try {
+    queue = createMrScrapeBrowserQueue(connection);
+    await scheduleMrScrapeBrowser(queue);
+    worker = createMrScrapeBrowserWorker({ connection });
+  } catch (err) {
+    // 构造期失败：关已建句柄再抛，否则 Redis/BullMQ 句柄泄漏会让进程挂住、破坏 fail-closed 退出。
+    await worker?.close().catch(() => {});
+    await queue?.close().catch(() => {});
+    await closeConnection()?.catch(() => {});
+    throw err;
+  }
 
   return async () => {
-    await worker.close();
-    await queue.close();
-    await (connection as unknown as { quit?: () => Promise<unknown> }).quit?.();
+    await worker!.close();
+    await queue!.close();
+    await closeConnection();
   };
 }
 

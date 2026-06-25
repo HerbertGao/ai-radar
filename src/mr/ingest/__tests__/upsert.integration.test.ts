@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { and, eq, like } from 'drizzle-orm';
+import { and, eq, inArray, like } from 'drizzle-orm';
 import * as schema from '../../../db/schema.js';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -42,15 +42,45 @@ const describeIfDb = databaseUrl ? describe : describe.skip;
 
 async function cleanup() {
   if (!db) return;
-  // 子表先删（无 FK 但保持有序）。按前缀隔离自己造的行。
-  await db.delete(schema.mrReviewFlag).where(like(schema.mrReviewFlag.targetId, `${PREFIX}%`));
-  await db.delete(schema.mrPriceHistory).where(like(schema.mrPriceHistory.sourceUrl, `${PREFIX}%`));
-  await db.delete(schema.mrPlanModels).where(like(schema.mrPlanModels.sourceUrl, `${PREFIX}%`));
-  await db.delete(schema.mrPlanLimits).where(like(schema.mrPlanLimits.sourceUrl, `${PREFIX}%`));
-  await db.delete(schema.mrPlans).where(like(schema.mrPlans.sourceUrl, `${PREFIX}%`));
-  await db.delete(schema.mrSource).where(like(schema.mrSource.sourceUrl, `${PREFIX}%`));
-  await db.delete(schema.mrModels).where(like(schema.mrModels.family, `${PREFIX}%`));
-  await db.delete(schema.mrVendors).where(like(schema.mrVendors.normalizedName, `${PREFIX}%`));
+  // relation-based 清理：flag/限额/兼容等的 targetId/planId 是 generated UUID（非 PREFIX），
+  // 按 sourceUrl/targetId 的 PREFIX like 漏删。改为先查 PREFIX 的 vendors → 其 plans/sources，
+  // 再按这些 id 删 dependent 行，最后删主行（无 FK 但保持有序）。
+  const vendors = await db
+    .select({ id: schema.mrVendors.id })
+    .from(schema.mrVendors)
+    .where(like(schema.mrVendors.normalizedName, `${PREFIX}%`));
+  const vendorIds = vendors.map((v) => v.id);
+  if (vendorIds.length > 0) {
+    const plans = await db
+      .select({ id: schema.mrPlans.id })
+      .from(schema.mrPlans)
+      .where(inArray(schema.mrPlans.vendorId, vendorIds));
+    const planIds = plans.map((p) => p.id);
+    const sources = await db
+      .select({ id: schema.mrSource.id })
+      .from(schema.mrSource)
+      .where(inArray(schema.mrSource.vendorId, vendorIds));
+    const sourceIds = sources.map((s) => s.id);
+
+    // flag 多态引 plan/source/vendor 三身份 id（targetId = generated id，非 PREFIX）。
+    const flagIds = [...planIds, ...sourceIds, ...vendorIds];
+    if (flagIds.length > 0) {
+      await db
+        .delete(schema.mrReviewFlag)
+        .where(inArray(schema.mrReviewFlag.targetId, flagIds));
+    }
+    if (planIds.length > 0) {
+      await db.delete(schema.mrPriceHistory).where(inArray(schema.mrPriceHistory.planId, planIds));
+      await db.delete(schema.mrPlanModels).where(inArray(schema.mrPlanModels.planId, planIds));
+      await db.delete(schema.mrPlanLimits).where(inArray(schema.mrPlanLimits.planId, planIds));
+      await db.delete(schema.mrPlanClients).where(inArray(schema.mrPlanClients.planId, planIds));
+      await db.delete(schema.mrPlanSources).where(inArray(schema.mrPlanSources.planId, planIds));
+    }
+    await db.delete(schema.mrPlans).where(inArray(schema.mrPlans.vendorId, vendorIds));
+    await db.delete(schema.mrSource).where(inArray(schema.mrSource.vendorId, vendorIds));
+    await db.delete(schema.mrModels).where(inArray(schema.mrModels.vendorId, vendorIds));
+    await db.delete(schema.mrVendors).where(inArray(schema.mrVendors.id, vendorIds));
+  }
 }
 
 beforeAll(cleanup);
@@ -318,10 +348,10 @@ describeIfDb('7.1 录入 Zod 闸 + identity/fact 写契约', () => {
       normalizedName: `${PREFIX}vendor-manual-exempt`,
       name: 'Manual Exempt Vendor',
     });
-    // manual 源不发请求、豁免白名单闸：非白名单 URL（带前缀确保 cleanup 命中）也应成功录入。
+    // manual 源不发请求、豁免白名单闸：非白名单 URL 也应成功录入（cleanup 已改 relation-based，不再需 PREFIX 字面）。
     const r = await upsertSource(db!, {
       vendorId: v.id,
-      sourceUrl: `${PREFIX}https://not-allowed.example`,
+      sourceUrl: 'https://not-allowed.example',
       fetchStrategy: 'manual',
     });
     expect(r.outcome).toBe('inserted');
@@ -330,6 +360,61 @@ describeIfDb('7.1 录入 Zod 闸 + identity/fact 写契约', () => {
       .from(schema.mrSource)
       .where(eq(schema.mrSource.vendorId, v.id));
     expect(rows).toHaveLength(1);
+  });
+
+  it('upsertSource：同 (vendor,source_url) 改 fetch_strategy → 更新生效（定位元数据非事实）', async () => {
+    const v = await upsertVendor(db!, {
+      normalizedName: `${PREFIX}vendor-fetch-drift`,
+      name: 'Fetch Drift Vendor',
+    });
+    // 用白名单域名 URL，使 http/browser 也过 SSRF 闸（ingest 侧仅查 scheme/allowlist/字面 IP）。
+    const url = 'https://openai.com/pricing';
+    const a = await upsertSource(db!, {
+      vendorId: v.id,
+      sourceUrl: url,
+      fetchStrategy: 'http',
+    });
+    expect(a.outcome).toBe('inserted');
+
+    // 同 (vendor,source_url) 改 http→browser → 更新（旧 lane 不长存）。
+    const b = await upsertSource(db!, {
+      vendorId: v.id,
+      sourceUrl: url,
+      fetchStrategy: 'browser',
+    });
+    expect(b.outcome).toBe('updated');
+    expect((b as { field: string }).field).toBe('fetch_strategy');
+    expect((b as { id: string }).id).toBe((a as { id: string }).id);
+
+    // 库里 fetch_strategy 已更正为 browser。
+    const rows = await db!
+      .select()
+      .from(schema.mrSource)
+      .where(eq(schema.mrSource.id, (a as { id: string }).id));
+    expect(rows[0]!.fetchStrategy).toBe('browser');
+
+    // 相同 fetch_strategy 重录 → exists（幂等，不更新）。
+    const c = await upsertSource(db!, {
+      vendorId: v.id,
+      sourceUrl: url,
+      fetchStrategy: 'browser',
+    });
+    expect(c.outcome).toBe('exists');
+  });
+
+  it('upsertModel：纯空白 family → Zod 校验拒（不落库畸形身份键）', async () => {
+    const v = await upsertVendor(db!, {
+      normalizedName: `${PREFIX}vendor-blank-family`,
+      name: 'Blank Family Vendor',
+    });
+    await expect(
+      upsertModel(db!, { vendorId: v.id, family: '   ', version: '1.0' }),
+    ).rejects.toThrow();
+    const rows = await db!
+      .select()
+      .from(schema.mrModels)
+      .where(eq(schema.mrModels.vendorId, v.id));
+    expect(rows).toHaveLength(0);
   });
 
   it('非法 category 发 SQL 前被 Zod 拒（不落库）', async () => {

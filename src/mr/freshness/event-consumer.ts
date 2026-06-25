@@ -96,23 +96,23 @@ function normalizeForMatch(text: string): string {
  * 判断事件是否命中：归一后的事件文本须同时含**某被跟踪厂商名** + **某价格/模型关键词**。
  *
  * 三列 nullable：**任一为 NULL 跳过该列、不对 NULL 归一**；全 NULL → 无可匹配文本 → 不命中。
- * 返回命中的 vendor（用于反查其 plan）；无命中返回 null。
+ * 返回命中的 vendors（用于逐个反查其 plan）；无命中返回空数组。
  */
-function matchVendor(event: CandidateEvent, vendors: VendorRow[]): VendorRow | null {
+function matchVendor(event: CandidateEvent, vendors: VendorRow[]): VendorRow[] {
   // 仅取非 NULL 文本列，逐列归一后拼成一段可匹配文本（NULL 列绝不参与，避免 'null' 字面误匹配）。
   const parts = [event.representativeTitle, event.summaryZh, event.headlineZh]
     .filter((t): t is string => t !== null && t !== '')
     .map(normalizeForMatch);
-  if (parts.length === 0) return null;
+  if (parts.length === 0) return [];
   const haystack = parts.join(' ');
 
   const hasKeyword = REVIEW_TRIGGER_KEYWORDS.some((kw) =>
     haystack.includes(normalizeForMatch(kw)),
   );
-  if (!hasKeyword) return null;
+  if (!hasKeyword) return [];
 
   // 厂商名已小写归一（录入契约）；子串命中（normalized_name 短，子串足够，不引词边界库）。
-  return vendors.find((v) => v.normalizedName !== '' && haystack.includes(v.normalizedName)) ?? null;
+  return vendors.filter((v) => v.normalizedName !== '' && haystack.includes(v.normalizedName));
 }
 
 /**
@@ -159,26 +159,32 @@ export async function runEventReview(
   let flaggedPlans = 0;
 
   for (const event of events) {
-    const vendor = matchVendor(event, vendors);
-    if (!vendor) continue;
+    const matchedVendors = matchVendor(event, vendors);
+    if (matchedVendors.length === 0) continue;
     matchedEvents += 1;
 
-    // 反查该厂商全部 plan（只读）。
-    const plans = await dbh
-      .select({ id: mrPlans.id })
-      .from(mrPlans)
-      .where(sql`${mrPlans.vendorId} = ${vendor.id}`);
+    for (const vendor of matchedVendors) {
+      // 反查该厂商全部 plan（只读）。
+      const plans = await dbh
+        .select({ id: mrPlans.id })
+        .from(mrPlans)
+        .where(sql`${mrPlans.vendorId} = ${vendor.id}`);
 
-    const reason = `event-review: ai-radar 事件 ${event.eventId} 命中厂商 ${vendor.normalizedName}（价格/模型关键词）`;
+      const reason = `event-review: ai-radar 事件 ${event.eventId} 命中厂商 ${vendor.normalizedName}（价格/模型关键词）`;
 
-    // per-target 独立打标：每 CAS 自治 autocommit，失败隔离、不裹批事务（D8）。
-    for (const plan of plans) {
-      try {
-        await setReviewFlag(dbh, { targetType: 'plan', targetId: plan.id }, reason);
-        flaggedPlans += 1;
-      } catch (error) {
-        // 单 plan 打标失败隔离，不拖垮同事件其余 plan / 其余事件。
-        log(`打标失败[plan=${plan.id}]`, error);
+      // per-target 独立打标：每 CAS 自治 autocommit，失败隔离、不裹批事务（D8）。
+      for (const plan of plans) {
+        try {
+          // ponytail: window-overlap re-trigger — events within windowDays (default 1d) re-call setReviewFlag
+          // each replay may re-open an already-resolved plan. Acceptable: windowDays is bounded + single-writer.
+          // Per-event/per-plan watermark dedup deferred to 5c. With #20 generation-aware resolveFlag,
+          // the resolve side won't lose signal; only re-flag friction remains.
+          await setReviewFlag(dbh, { targetType: 'plan', targetId: plan.id }, reason);
+          flaggedPlans += 1;
+        } catch (error) {
+          // 单 plan 打标失败隔离，不拖垮同事件其余 plan / 其余事件。
+          log(`打标失败[plan=${plan.id}]`, error);
+        }
       }
     }
   }

@@ -32,6 +32,7 @@ import {
   mrReviewFlag,
   mrSource,
 } from '../../db/schema.js';
+import { mrReviewFlagTargetTypeSchema } from '../../db/mr-schema.zod.js';
 import { resolveFlag, type ReviewFlagTarget } from '../write/flag.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测（对齐 write/flag.ts）。 */
@@ -42,7 +43,11 @@ export interface PendingFlag {
   targetType: string;
   targetId: string;
   reason: string | null;
-  openedAt: Date;
+  /**
+   * `opened_at` 的 full-precision text（如 `'2026-06-25 10:00:00.123456+00'`）——精度安全地回传给
+   * `markChecked({ expectedOpenedAt })` 做 generation 判别（走 JS Date 会丢 timestamptz 微秒，#20）。
+   */
+  openedAtText: string;
 }
 
 /** listPendingFlags 过滤项（均可选；不传 = 列全部 pending）。 */
@@ -51,6 +56,22 @@ export interface ListPendingFlagsOptions {
   targetType?: string;
   /** 仅列 `opened_at` 早于「now - olderThanMs」的（按 age 筛；不传不限龄）。 */
   olderThanMs?: number;
+}
+
+export type MarkCheckedResult =
+  | { outcome: 'checked' }
+  // 无 pending 标，或传了 expectedOpenedAt 但已被重开/resolve（generation mismatch）——合并单态：
+  // 两者都「未 resolve 当前 pending」，处理一致（不刷 last_checked，#4 不凭空清陈旧）。
+  | { outcome: 'not-resolved' };
+
+/** markChecked 可选项：调用方（如 listPendingFlags）回传 list 时见到的 opened_at，做跨调用重开判别。 */
+export interface MarkCheckedOptions {
+  /**
+   * 人在 `listPendingFlags` 时看到的 opened_at（**full-precision text**，取自 `PendingFlag.openedAtText`）。
+   * 传则仅 resolve 该 generation——挡「人在 list 后、markChecked 前该 flag 被重开」的旧复核误清新标（#20）。
+   * 不传则原子 resolve 当前 pending（无跨调用窗口时的常规路径）。
+   */
+  expectedOpenedAt?: string;
 }
 
 /**
@@ -80,7 +101,8 @@ export async function listPendingFlags(
       targetType: mrReviewFlag.targetType,
       targetId: mrReviewFlag.targetId,
       reason: mrReviewFlag.reason,
-      openedAt: mrReviewFlag.openedAt,
+      // full-precision text：使调用方能精度安全地回传给 markChecked({ expectedOpenedAt })。
+      openedAtText: sql<string>`${mrReviewFlag.openedAt}::text`,
     })
     .from(mrReviewFlag)
     .where(and(...conds))
@@ -88,28 +110,46 @@ export async function listPendingFlags(
 }
 
 /**
- * 标记某标的已复核（design D6）：**同一事务**内 resolveFlag + 按粒度刷 last_checked。
+ * 标记某标的已复核（design D6）：**同一事务**内 generation-aware resolveFlag + 按粒度刷 last_checked。
  *
  * 原子性是正确性前提——若 resolve 与刷 last_checked 分两事务，resolve 成功但刷失败会令 D9 立即重开（flag
- * 永不出）；故全程裹在 `db.transaction` 内（target_type Zod 闸在 resolveFlag 内）。
+ * 永不出）；故 resolve、刷 freshness 全程裹在 `db.transaction` 内。
+ *
+ * generation 判别符（`opts.expectedOpenedAt`）**由调用方传入**（人在 `listPendingFlags` 时看到的 opened_at），
+ * 非内部自读——自读当前 opened_at 再与自身比无法检测「人在 list 后、markChecked 前的跨调用重开」（#20）。
+ * 不传则原子 resolve 当前 pending。
  *
  * @param dbh db 实例（自开事务）。
  * @param target 标的（target_type ∈ {plan,source,vendor}，过 resolveFlag 内 Zod 闸）。
+ * @param opts expectedOpenedAt 可选（来自 listPendingFlags 的 openedAtText）。
  */
 export async function markChecked(
   dbh: DbLike = defaultDb,
   target: ReviewFlagTarget,
-): Promise<void> {
-  await dbh.transaction(async (tx) => {
-    // resolve 在前（其 Zod 闸先拒非法 target_type，再不发后续 UPDATE）。
-    await resolveFlag(tx, target);
+  opts: MarkCheckedOptions = {},
+): Promise<MarkCheckedResult> {
+  const targetType = mrReviewFlagTargetTypeSchema.parse(target.targetType);
 
-    if (target.targetType === 'source') {
+  return dbh.transaction(async (tx): Promise<MarkCheckedResult> => {
+    const affected = await resolveFlag(
+      tx,
+      { targetType, targetId: target.targetId },
+      opts.expectedOpenedAt !== undefined
+        ? { expectedOpenedAt: opts.expectedOpenedAt }
+        : {},
+    );
+    if (affected === 0) {
+      // 无 pending 标，或传了 expectedOpenedAt 但已被重开/resolve（generation mismatch）。
+      // 两者皆「未 resolve 当前 pending」→ 不刷 last_checked（#4：不凭空清陈旧）。
+      return { outcome: 'not-resolved' };
+    }
+
+    if (targetType === 'source') {
       await tx
         .update(mrSource)
         .set({ lastChecked: sql`now()` })
         .where(eq(mrSource.id, target.targetId));
-    } else if (target.targetType === 'plan') {
+    } else if (targetType === 'plan') {
       // plan 标的：刷 mr_plans 自身 + 全部 child 事实行（design D6 全刷 child，闭合跑步机）。
       const ts = sql`now()`;
       await tx
@@ -130,5 +170,6 @@ export async function markChecked(
         .where(eq(mrPlanModels.planId, target.targetId));
     }
     // vendor 标的：身份表无 last_checked 列，仅 resolve（已在上方完成）。
+    return { outcome: 'checked' };
   });
 }

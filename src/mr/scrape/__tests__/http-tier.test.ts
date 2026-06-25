@@ -135,6 +135,19 @@ describe('robotsAllows', () => {
   it('无适用组 → 允许', () => {
     expect(robotsAllows('', '/x', 'ai-radar/1.0')).toBe(true);
   });
+
+  it('合并多匹配组：后置 User-agent 组的规则也生效', () => {
+    // 同 bot 声明两组；第二组的 Disallow 必须被合并、不能只取首组。
+    const robots = 'User-agent: ai-radar\nDisallow: /a\n\nUser-agent: ai-radar\nDisallow: /b';
+    expect(robotsAllows(robots, '/a/x', 'ai-radar/1.0')).toBe(false);
+    expect(robotsAllows(robots, '/b/x', 'ai-radar/1.0')).toBe(false); // 后置组生效
+    expect(robotsAllows(robots, '/c/x', 'ai-radar/1.0')).toBe(true);
+  });
+
+  it('等长 Allow/Disallow tie → 优先 Allow（RFC 惯例）', () => {
+    const robots = 'User-agent: *\nDisallow: /p\nAllow: /p';
+    expect(robotsAllows(robots, '/p/x', 'ai-radar/1.0')).toBe(true);
+  });
 });
 
 describe('defaultPriceRegionExtractor', () => {

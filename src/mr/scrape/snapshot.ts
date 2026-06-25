@@ -12,7 +12,7 @@
  *
  * 不入任何 `mr_*` 列、不引新依赖（对象存储留 5c）。
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { env } from '../../config/env.js';
@@ -67,7 +67,8 @@ export async function writeSnapshot(
   const maxTotal = opts.maxTotalBytes ?? env.MR_SNAPSHOT_MAX_TOTAL_BYTES;
   const id = snapshotId(sourceId);
   const finalPath = resolveSnapshotPath(baseDir, id);
-  const tmpPath = `${finalPath}.tmp`; // 同 base-dir 保 rename 原子。
+  // 每次写用唯一 tmp（同 base-dir 保 rename 原子）：并发同源不互相覆盖/破坏对方的 rename。
+  const tmpPath = `${finalPath}.${randomUUID()}.tmp`;
 
   await fs.mkdir(baseDir, { recursive: true });
 

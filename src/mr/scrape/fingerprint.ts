@@ -112,14 +112,16 @@ export async function detectSourceChange(
       return { outcome: 'skipped' };
     }
     body = await fetchBrowser(source, fetchOptions);
-  } else {
-    // http 档（含未知 strategy 兜底当 http——5a Zod 已限 {http,browser,manual}）。
+  } else if (source.fetchStrategy === 'http') {
     const fetchHttp = options.fetchHttp ?? defaultFetchHttp;
     const robotsCheck = options.robotsCheck;
     if (robotsCheck && !(await robotsCheck(source.sourceUrl, fetchOptions))) {
       return { outcome: 'skipped' }; // 注入 robots 桩禁则不抓。
     }
     body = await fetchHttp(source, fetchOptions);
+  } else {
+    // 未知 strategy → fail-closed 不发请求（DB 侧 Zod 已限 {http,browser,manual}，此为纵深防御）。
+    return { outcome: 'skipped' };
   }
 
   if (body == null) return { outcome: 'skipped' }; // 未抓到（robots 禁/manual）。

@@ -12,7 +12,8 @@
  *    预期，`opened_at` 重置为 now 是单行可变标的有意行为（design D5）。
  *    幂等收敛单行：事件/指纹/陈旧度多路并发命中同 target 自然合并为一行（不做「写前查 status」预检——
  *    那是 read-then-write TOCTOU 会与人工 resolve 竞态丢真实触发，design D8）。
- * - 解标 = plain `UPDATE status='resolved', resolved_at=now()`（design D6）。
+ * - 解标 = generation-aware `UPDATE status='resolved', resolved_at=now()`，只命中 pending 行；
+ *   dispose 侧可传 expectedOpenedAt 防旧复核清掉已重开的新 pending 标。
  *
  * Zod 闸（spec「非录入路径写枚举列也过 Zod」）：写前过 `mrReviewFlagTargetTypeSchema`（多态 target_type
  * 是有限值列，事件/指纹经此 helper 写也须过闸）+ `mrReviewFlagStatusSchema`（写入的状态字面亦过闸）。
@@ -44,6 +45,15 @@ export interface ReviewFlagTarget {
   targetType: string;
   /** 对应身份表 PK（varchar(128)）。 */
   targetId: string;
+}
+
+export interface ResolveFlagOptions {
+  /**
+   * 若提供，仅 resolve 该 opened_at generation；0 行表示 generation mismatch 或已被 resolve。
+   * 取 **full-precision text**（如 `'2026-06-25 10:00:00.123456+00'`），与 `opened_at::text` 精确比——
+   * 走 JS Date 会丢 timestamptz 微秒精度致误判 mismatch（参见 listPendingFlags 返回 openedAtText）。
+   */
+  expectedOpenedAt?: string;
 }
 
 /**
@@ -87,26 +97,35 @@ export async function setReviewFlag(
 }
 
 /**
- * 解标（plain UPDATE，design D6）。仅置 status='resolved' + resolved_at=now()，不动 opened_at/reason。
- * 缺标的行时 UPDATE 命中 0 行（幂等，无报错）。
+ * 解标（generation-aware UPDATE，design D6）。仅 pending 行可置 status='resolved' + resolved_at=now()，
+ * 不动 opened_at/reason。缺标、已 resolved、或 expectedOpenedAt 不匹配时返回 0，fail-closed。
  *
  * @param dbh db 实例或已开事务句柄（dispose 面 markChecked 在同事务里 resolve + 刷 last_checked）。
+ * @param opts expectedOpenedAt 可选；用于防旧复核清掉已重开的新 pending 标。
  */
 export async function resolveFlag(
   dbh: DbLike | TxLike,
   target: ReviewFlagTarget,
-): Promise<void> {
+  opts: ResolveFlagOptions = {},
+): Promise<number> {
   // 写前过 Zod：写入的 status 字面 + target_type 均过有限值闸。
   const targetType = mrReviewFlagTargetTypeSchema.parse(target.targetType);
+  const pendingStatus = mrReviewFlagStatusSchema.parse(STATUS_PENDING);
   const status = mrReviewFlagStatusSchema.parse(STATUS_RESOLVED);
+  const conds = [
+    eq(mrReviewFlag.targetType, targetType),
+    eq(mrReviewFlag.targetId, target.targetId),
+    eq(mrReviewFlag.status, pendingStatus),
+  ];
+  if (opts.expectedOpenedAt !== undefined) {
+    // text↔text 精确比：opened_at::text = expected，杜绝 JS Date 丢 timestamptz 微秒致误判。
+    conds.push(sql`${mrReviewFlag.openedAt}::text = ${opts.expectedOpenedAt}`);
+  }
 
-  await dbh
+  const rows = await dbh
     .update(mrReviewFlag)
     .set({ status, resolvedAt: sql`now()` })
-    .where(
-      and(
-        eq(mrReviewFlag.targetType, targetType),
-        eq(mrReviewFlag.targetId, target.targetId),
-      ),
-    );
+    .where(and(...conds))
+    .returning({ id: mrReviewFlag.id });
+  return rows.length;
 }

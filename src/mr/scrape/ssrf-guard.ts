@@ -26,6 +26,7 @@ import { isHostAllowlisted, MR_SOURCE_DOMAIN_ALLOWLIST } from './allowlist.js';
 /** SSRF 拒绝的通用枚举原因（不含 IP/拓扑明细，防探测 oracle）。 */
 export type SsrfRejectReason =
   | 'scheme-not-allowed'
+  | 'url-has-userinfo'
   | 'host-not-allowlisted'
   | 'private-address'
   | 'dns-resolution-failed'
@@ -137,6 +138,10 @@ export function assertUrlAllowed(
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new SsrfBlockedError('scheme-not-allowed');
+  }
+  // 含 userinfo（`user:pass@host`）即拒：node:https.request 会把它变 Basic Authorization 头，违 D12 裸请求。
+  if (url.username || url.password) {
+    throw new SsrfBlockedError('url-has-userinfo');
   }
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, ''); // 去 IPv6 方括号
   // 字面 IP（含 IPv6）命中私网即拒（在白名单前——白名单是域名集，IP 字面本就不该 ∈ 域名白名单）。
