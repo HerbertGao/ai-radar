@@ -26,7 +26,7 @@
 
 **关键路径**：P0 → P1 → P2 → P3 → **P5（Model Radar）**。P0–P4 已上线（含情报流 / 双通道 / 语义去重 / 知识库 / MCP）；**下一关键里程碑 = P5 Model Radar**（约 **5–7 周**），泛化顾问（P6）作为其超集后置。
 
-> **进度（截至 2026-06-21）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`，新增 `ai_experiences` 表 + 独立经验链 `source='blogger'`/`raw_type='experience'`，≥70 价值闸入知识库 + 实践锦囊推送）。**下一步从通用顾问改为 P5 = Model Radar（编程订阅比价 + 选型，已提优先级，数据已核）**，先做 5a（数据模型 + provenance），其余 5b–5e 依赖它；原通用「AI 工具选型顾问」降为 P6 泛化目标（Model Radar 跑通后再泛化）。唯一未结的退出标准是 P3 语义阈值的真实数据复校（接线就位、取 QA §9.2 起点默认，列为持续运营动作，见下「P3 退出标准达成」）。
+> **进度（截至 2026-06-29）**：**P0–P4 关键路径全部落地**，外加 roadmap 外的「AI 博主经验挖掘」链（归档 `add-ai-blogger-experience-mining`）。**P5 Model Radar：5a / 5b / 5c 已落地并归档**——5a 数据模型（`add-model-radar-data-model`）、5b 录入+保鲜回路+三档抓取变更检测（`add-model-radar-ingestion-freshness`，PR #45）、5c 比价/检索 API + 只读快照 + 桶2数据红线（`add-model-radar-compare-api`，PR #46）；主规范现有 `model-radar-catalog`(5a) / `model-radar-ingestion`(5b+5c 红线) / `model-radar-compare-api`(5c) 三谱。**下一步 = 5d**（Web 比价页 + 常驻周期 rebuild worker 链7 + 跨进程 Redis pub/sub 失效 + per-fact age 徽标 + browser-worker 生产 egress 部署封锁勘验），随后 5e（推荐器 + MCP）；原通用「AI 工具选型顾问」为 P6 泛化目标。未结持续运营动作：P3 语义阈值真实数据复校（见下「P3 退出标准达成」）、桶2 真实价格策展（待 browser 勘验，5c 本期 0 已核价占位）。
 
 ## P5 Model Radar 步骤拆解
 
@@ -51,9 +51,9 @@
 
 | 步 | 范围 | 工期 | 退出标准（可观测） |
 |---|---|---|---|
-| **5a** | 数据模型 + provenance：`mr_vendors` / `mr_plans` / `mr_models` / `mr_plan_models`（模型兼容矩阵）/ `mr_plan_clients`（工具+协议兼容）/ `mr_plan_limits`（带类型限额行）/ `mr_price_history`；category facet；provenance 三字段 | ~1 周 | migration 幂等落表 + 唯一约束 + 一家样例厂商完整录入读回；额度走限额行非单 INT |
-| **5b** | 结构化录入 + 保鲜回路（**先于 UI**）：最小录入路径把已核 8 家入库（带 confidence）；`last_checked` / 陈旧度；接 ai-radar 事件流 → 对应 plan 打「待复核」（写状态不改事实） | ~1–1.5 周 | 8 家在库可查；变更流能把某厂商标待复核；源 URL 漂移类问题被 confidence/last_checked 暴露 |
-| **5c** ⭐已开 | 桶2（多模型 Coding Plan：百炼/千帆/腾讯/火山/讯飞）数据 + 比价/检索 API：model × tool × 协议 × 预算 横切筛选；同桶内排序（**同桶同币种**）；「同档家族」折叠**本期延后**（见下注 5c-③） | ~1 周 | API 按 model/tool 过滤返回合格 plan、同桶排序、返回带 provenance |
+| **5a** ✅ | 数据模型 + provenance：`mr_vendors` / `mr_plans` / `mr_models` / `mr_plan_models`（模型兼容矩阵）/ `mr_plan_clients`（工具+协议兼容）/ `mr_plan_limits`（带类型限额行）/ `mr_price_history`；category facet；provenance 三字段 | ~1 周 | migration 幂等落表 + 唯一约束 + 一家样例厂商完整录入读回；额度走限额行非单 INT |
+| **5b** ✅ | 结构化录入 + 保鲜回路（**先于 UI**）：最小录入路径把已核 8 家入库（带 confidence）；`last_checked` / 陈旧度；接 ai-radar 事件流 → 对应 plan 打「待复核」（写状态不改事实） | ~1–1.5 周 | 8 家在库可查；变更流能把某厂商标待复核；源 URL 漂移类问题被 confidence/last_checked 暴露 |
+| **5c** ✅ | 桶2（多模型 Coding Plan：百炼/千帆/腾讯/火山/讯飞）数据 + 比价/检索 API：model × tool × 协议 × 预算 横切筛选；同桶内排序（**同桶同币种**）；「同档家族」折叠**本期延后**（见下注 5c-③） | ~1 周 | **退出标准达成**（见下「5c 退出标准达成」）：API 按 model/tool 过滤返回合格 plan、同桶排序、返回带 provenance |
 | **5d** | Web 比价页（项目**首个真前端**，TS 前后端同栈 + 复用 Zod schema）：筛选 chips + 可排序表 + 行展开看全字段与来源 + 陈旧标；「估算中等任务轮次」做成**带旋钮的区间**、视觉次于官方原始额度、挂 ⚠ 估算 | ~1.5 周 | 浏览器 10s 内答四个 Success 问题；每格可溯源 |
 | **5e** | 垂类选型推荐器：规则硬筛（含某模型/工具/预算）→ RAG 证据（接知识库 + 变更流）→ LLM 解释 → 首选/备选/不推荐/落地；MCP 暴露 `recommend_coding_subscription` | ~1–1.5 周 | 「重度用 Claude Code + GLM-5.2 最便宜可用」给出排名 + 是否撞窗 + 月成本 + 依据 |
 
@@ -65,6 +65,19 @@
 > - **5c-③ 「同档家族」折叠本期延后**：折叠需依赖已核价格+限额做同质判定，而本期桶2价格大多未核（NULL 占位），无可靠数据可依；显式延后到桶2价格核实后再做。
 > - **5c-④ browser/prod gate**：真实 browser 定价页勘验 + browser-worker egress/netns 封锁（封 RFC1918/link-local/metadata、启动自检 fail-closed）是 **browser/prod 启用 gate**，**不阻塞 5c API 开发**；本期不启用 browser-worker 生产消费、不实际抓取任何源。源 `fetch_strategy` 按页面真实性质登记（JS 渲染=browser、文档页=http、登录墙/漂移=manual，不一律降 manual），http/browser 源域扩入 `MR_SOURCE_DOMAIN_ALLOWLIST`。
 > - **5c-⑤ ETag=内容哈希**：5c 唯一公开 version/ETag 源 = 快照内容 canonical 哈希；`mr_catalog_version` 在 5c 不写不读不服务（留未来/内部）。服务表征 freshness **仅暴露离散 `stale`**（不暴露 raw 秒级 last_checked），随数据变更/staleness 阈值穿越失效。
+
+### 5c 退出标准达成
+
+`add-model-radar-compare-api` 提案已实现并归档（PR #46 合并）；退出标准由程序 + DB 保障并有测试覆盖（`src/mr` 全量 vitest 全绿、真实 pg）。经 5 轮对抗性 review（Codex + Code Reviewer + Reality Checker §1b + Ponytail）+ CodeRabbit 复审收敛。
+
+| 退出标准 | 状态 | 实现与证据 |
+|---|---|---|
+| API 按 model/tool 过滤返回合格 plan | ✅ 已实现 | `src/mr/snapshot/query.ts` 确定性 AND 过滤（model `family:version`、tool/protocol clientId 精确匹配、currency/预算）；`GET /model-radar/plans`（`src/mr/api/model-radar.ts`）非法参数 400。覆盖测试 `query.test.ts` + `model-radar.test.ts`。 |
+| 同桶排序（同桶同币种、未知价不参与最便宜） | ✅ 已实现 | 同 (category, currency) 内 known 价升序、未知价归 `sortScope.currency=null` 组不成 cheapest；`priceStatus='known'` 当且仅当 价/币非 NULL + `source_confidence ∈ {official_pricing, official_doc}`（5c-①）；不做 FX（5c-②）。 |
+| 返回带 provenance + 陈旧/待复核 | ✅ 已实现 | 只读快照（`build.ts` 单事务 REPEATABLE READ 读 9 张 `mr_*`、fail-closed）每条断言事实带 `source_url`/`source_confidence`；离散 `stale` 聚合 plan+child+关联源 last_checked（NULL 仅 source 可达）、source/vendor flag 传导；内容哈希 ETag（5c-⑤）。 |
+| 数据红线（未核价不冒充已核） | ✅ 已实现 | confidence↔price 绑定落共享 `mrPlanWriteSchema`（覆盖 `upsertPlan` 新建插入）+ `recordPriceChange` 官方断言；金额量级无关校验（负/NaN/Infinity/超 scale/JS 进制字面量全拒）；provenance `sourceUrl` 非空（读写两侧）。 |
+
+> **持续运营动作（未结，非「写完即完成」）**：桶2 真实价格策展——本期 5 家（百炼/千帆/腾讯/火山/讯飞）结构性录入但 **0 已核价**（NULL + `needs_login_recheck` 占位），真实价待 **browser/prod gate**（5c-④：真实定价页勘验 + browser-worker egress/netns 封锁）通过后经授权改价入口录入。常驻周期 rebuild worker（链7）+ 跨进程 Redis pub/sub 失效随 **5d** 装配（5c 仅交付可调 rebuild job body + CI 测）。
 
 ## P1 退出标准达成
 
