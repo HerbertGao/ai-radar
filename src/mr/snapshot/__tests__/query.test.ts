@@ -35,7 +35,11 @@ function known(
     currentPrice: price,
     currency,
     priceStatus: 'known',
-    provenance: { sourceUrl: 'https://example.com/pricing', sourceConfidence: 'official_pricing' },
+    provenance: {
+      sourceUrl: 'https://example.com/pricing',
+      sourceConfidence: 'official_pricing',
+      lastCheckedDate: '2026-06-20',
+    },
     freshness: { stale: false },
     reviewStatus: { pending: false },
     models: [],
@@ -63,7 +67,11 @@ function unknown(
     currentPrice: opts.price ?? null,
     currency: opts.currency ?? null,
     priceStatus: 'unknown',
-    provenance: { sourceUrl: 'https://example.com/x', sourceConfidence: 'needs_login_recheck' },
+    provenance: {
+      sourceUrl: 'https://example.com/x',
+      sourceConfidence: 'needs_login_recheck',
+      lastCheckedDate: '2026-06-20',
+    },
     freshness: { stale: false },
     reviewStatus: { pending: false },
     models: [],
@@ -236,7 +244,11 @@ describe('3.5 查询参数 Zod 闸（非法 → 拒，组 E 映射 400）', () =
         {
           clientType: 'tool',
           clientId: 'claude-code',
-          provenance: { sourceUrl: 'https://x', sourceConfidence: 'official_doc' },
+          provenance: {
+            sourceUrl: 'https://x',
+            sourceConfidence: 'official_doc',
+            lastCheckedDate: '2026-06-20',
+          },
         },
       ],
     };
@@ -255,13 +267,13 @@ describe('3.5 查询参数 Zod 闸（非法 → 拒，组 E 映射 400）', () =
 describe('5c review FIX CR6：读侧 sourceUrl 拒纯空白（对齐写侧 mrSourceUrlSchema）', () => {
   it('纯空白 sourceUrl → provenance/source schema safeParse 失败；非空通过', () => {
     expect(
-      snapshotProvenanceSchema.safeParse({ sourceUrl: '   ', sourceConfidence: 'official_pricing' }).success,
+      snapshotProvenanceSchema.safeParse({ sourceUrl: '   ', sourceConfidence: 'official_pricing', lastCheckedDate: '2026-06-20' }).success,
     ).toBe(false);
     expect(
-      snapshotProvenanceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', sourceConfidence: 'official_pricing' }).success,
+      snapshotProvenanceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', sourceConfidence: 'official_pricing', lastCheckedDate: '2026-06-20' }).success,
     ).toBe(true);
-    expect(snapshotSourceSchema.safeParse({ sourceUrl: '   ', fetchStrategy: 'http' }).success).toBe(false);
-    expect(snapshotSourceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', fetchStrategy: 'http' }).success).toBe(true);
+    expect(snapshotSourceSchema.safeParse({ sourceUrl: '   ', fetchStrategy: 'http', lastCheckedDate: null }).success).toBe(false);
+    expect(snapshotSourceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', fetchStrategy: 'http', lastCheckedDate: '2026-06-20' }).success).toBe(true);
   });
 });
 

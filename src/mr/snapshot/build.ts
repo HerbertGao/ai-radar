@@ -20,6 +20,11 @@
  *   nullable）——从未抓的 browser 源（last_checked NULL）必须判陈旧，不因 `now − NULL` 误判新鲜。
  * - reviewStatus.pending = 直接 plan flag / vendor flag / 经 mr_plan_sources 关联的 source flag **任一 pending**。
  *
+ * per-fact age（5d-B / design D1）：每条事实行 provenance（plan 价格事实 + models/clients/limits）+ 关联源行带
+ * 日粒度 `lastCheckedDate` = `trunc_UTC(该行 last_checked)`（见 `truncToUtcDate`）；价格事实 date = `trunc(plan.last_checked)`
+ * 单行列、非跨事实聚合（不暴露 plan 级聚合 date）；`mr_source.last_checked` NULL → date 缺省 null（仍判陈旧）。
+ * 按固定 UTC 截断、完全 now 无关 → 进内容哈希仍稳定、跨进程一致。
+ *
  * fail-closed（task 2.4 / spec「schema 校验失败不对外服务」）：构建结果缺必需 provenance/非法枚举/引用悬空时
  * 抛错、**不返回坏快照**。缓存/不覆盖旧快照/冷启动 503 是组 D 缓存层职责——本 builder 只保证校验失败抛错。
  */
@@ -55,6 +60,17 @@ const PENDING = 'pending';
 /** 陈旧判定（与 staleness 排程同口径）：从未核对（NULL）或超阈值即陈旧。 */
 function isStale(lastChecked: Date | null, threshold: Date): boolean {
   return lastChecked === null || lastChecked < threshold;
+}
+
+/**
+ * per-fact age（5d-B / design D1）：把事实行 `last_checked` 截断到**日粒度 ISO 日期** `YYYY-MM-DD`。
+ * **按固定 UTC 截断**（`toISOString()` 恒 UTC）——`lastCheckedDate` 是该 DB 行值的纯函数、**完全与 build/render
+ * `now` 无关**（now 推进即便跨任何 UTC 午夜也不改它，仅该行 `last_checked` 被写到新 UTC 日才变），故进内容哈希
+ * 仍稳定、不每日过度失效。**禁按进程本地 TZ（`getDate()` 等）**：否则同一 `timestamptz` 瞬间在不同 `process.env.TZ`
+ * 进程截成不同日 → 内容哈希分叉 → 破 5d-A 跨进程免协调一致性。「N 天前」相对文案只在 render 层算、绝不进 DTO/哈希。
+ */
+function truncToUtcDate(lastChecked: Date): string {
+  return lastChecked.toISOString().slice(0, 10);
 }
 
 /** 按 key 分组、保留输入顺序（输入已按 id 升序 → 各组内仍 id 升序，保 canonical）。 */
@@ -149,7 +165,11 @@ export async function buildModelRadarSnapshot(
             modelId: model.id,
             family: model.family,
             version: model.version,
-            provenance: { sourceUrl: pm.sourceUrl, sourceConfidence: pm.sourceConfidence },
+            provenance: {
+              sourceUrl: pm.sourceUrl,
+              sourceConfidence: pm.sourceConfidence,
+              lastCheckedDate: truncToUtcDate(pm.lastChecked),
+            },
           };
         });
 
@@ -157,7 +177,11 @@ export async function buildModelRadarSnapshot(
         const dtoClients = clientRows.map((c) => ({
           clientType: c.clientType,
           clientId: c.clientId,
-          provenance: { sourceUrl: c.sourceUrl, sourceConfidence: c.sourceConfidence },
+          provenance: {
+            sourceUrl: c.sourceUrl,
+            sourceConfidence: c.sourceConfidence,
+            lastCheckedDate: truncToUtcDate(c.lastChecked),
+          },
         }));
 
         const limitRows = limitsByPlan.get(plan.id) ?? [];
@@ -165,7 +189,11 @@ export async function buildModelRadarSnapshot(
           limitType: l.limitType,
           value: l.value,
           window: l.window,
-          provenance: { sourceUrl: l.sourceUrl, sourceConfidence: l.sourceConfidence },
+          provenance: {
+            sourceUrl: l.sourceUrl,
+            sourceConfidence: l.sourceConfidence,
+            lastCheckedDate: truncToUtcDate(l.lastChecked),
+          },
         }));
 
         const sourceRows = (planSourcesByPlan.get(plan.id) ?? []).map((ps) => {
@@ -186,6 +214,8 @@ export async function buildModelRadarSnapshot(
         const dtoSources = sourceRows.map((s) => ({
           sourceUrl: s.sourceUrl,
           fetchStrategy: s.fetchStrategy,
+          // mr_source.last_checked 可 NULL（从未抓源）→ date 缺省 null（仍经 isStale 判陈旧）。
+          lastCheckedDate: s.lastChecked === null ? null : truncToUtcDate(s.lastChecked),
         }));
 
         // freshness 聚合：plan 自身 + child 事实行 + 关联源 last_checked 任一陈旧。
@@ -222,6 +252,8 @@ export async function buildModelRadarSnapshot(
           provenance: {
             sourceUrl: plan.sourceUrl,
             sourceConfidence: plan.sourceConfidence,
+            // 价格事实 date = trunc(plan.last_checked)（单行列、非跨事实聚合，design D1）。
+            lastCheckedDate: truncToUtcDate(plan.lastChecked),
           },
           freshness: { stale },
           reviewStatus: { pending },

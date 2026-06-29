@@ -6,18 +6,20 @@
  * - **唯一公开 version/ETag 源 = 快照内容哈希**（方案①，design D8）：canonical 序列化（对象键排序 +
  *   数组/行序固定，行序由 build.ts 各表 ORDER BY id 保证）后 sha256。
  *
- * ETag = **服务表征的纯函数**（design D8 哈希内容契约）：
- * - 哈希输入 = 组 B DTO（`ModelRadarSnapshot`）的全部服务表征字段，**含离散 `freshness.stale`**
- *   （由注入 now 算）；DTO 本身**不含** `builtAt`/`version`/raw `last_checked`/now 派生连续量，故
- *   「排除构建时刻 / now 连续量 / raw last_checked」对 hash 与 served 同时成立、无 served-vs-hash 错配。
+ * ETag = **服务表征的纯函数**（design D1/D8 哈希内容契约）：
+ * - 哈希输入 = 组 B DTO（`ModelRadarSnapshot`）的全部服务表征字段，**含离散 `freshness.stale`**（由注入 now 算）
+ *   **与 per-fact 日粒度 `lastCheckedDate`**（= `trunc_UTC(该行 last_checked)`、5d-B/design D1）；DTO 本身**不含**
+ *   `builtAt`/`version`/raw 秒级 `last_checked`/now 派生连续量，故「排除构建时刻 / now 连续量 / raw 秒级 last_checked」
+ *   对 hash 与 served 同时成立、无 served-vs-hash 错配。`lastCheckedDate` 进哈希但因按固定 UTC 截断、**完全 now 无关**
+ *   → now 推进（即便跨 UTC 午夜）不改它、哈希仍稳定，仅该行被重核**写**到新 UTC 日才变。
  * - `version` == 该哈希，是从 canonical 服务表征派生的**传输别名**，包在响应外层（组 E）、**不入哈希输入**
  *   （DTO 无 version 字段，天然无自引用）。
  * - `mr_catalog_version`/`builtAt` 纯内部、**绝不进服务表征、不作公开 version 源**；5c 不引入「bump
  *   mr_catalog_version 作公开 version」备选；GET 路径只读、绝不写库（rebuild 写的是进程内缓存、非 mr_*）。
  *
  * 由此：① 同一注入 now、无服务表征变化 → 哈希稳定、304 命中、不过度失效；② now 跨 staleness 阈值 →
- * `stale` 翻转 → 服务表征变 → 哈希变（客户端不会拿到 304-with-stale）；③ 仅推 raw last_checked（未翻 stale）
- * 的写不改服务表征 → 哈希可不变。
+ * `stale` 翻转 → 服务表征变 → 哈希变（客户端不会拿到 304-with-stale）；③ 仅推 raw last_checked、**未翻 stale
+ * 且未跨其 UTC 日界**的写不改服务表征 → 哈希可不变；若推到**新 UTC 日**则其 `lastCheckedDate` 变 → 哈希变。
  *
  * **fail-closed**（task 5.4 / spec「schema 校验失败不对外服务且不覆盖旧快照」）：rebuild = 先 build（可抛）
  * 再原子替换——build 抛错则替换不发生、旧快照保留、错误上抛。冷启动首建失败同样上抛（供组 E API 接 503）、

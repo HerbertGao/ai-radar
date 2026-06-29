@@ -27,10 +27,12 @@ type ModelRadarQueryResponse = import('../../snapshot/dto.js').ModelRadarQueryRe
 const PROV_OFFICIAL = {
   sourceUrl: 'https://example.com/pricing',
   sourceConfidence: 'official_pricing' as const,
+  lastCheckedDate: '2026-06-20',
 };
 const PROV_UNKNOWN = {
   sourceUrl: 'https://example.com/x',
   sourceConfidence: 'needs_login_recheck' as const,
+  lastCheckedDate: '2026-06-20',
 };
 
 /** 已核官方价 plan（priceStatus=known，满足 dto.superRefine）。 */
