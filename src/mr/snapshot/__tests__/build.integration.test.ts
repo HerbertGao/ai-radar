@@ -241,6 +241,33 @@ describeIfDb('2.5 快照构建', () => {
     }
   });
 
+  it('跨厂 plan_model junction → 快照构建抛错 fail-closed（同厂 ownership 校验）', async () => {
+    const vendorA = await makeVendor('ownerA');
+    const vendorB = await makeVendor('ownerB');
+    const planId = await makePlan(vendorA, 'owner'); // plan 属 vendorA
+    // model 属他厂 vendorB，经坏 junction 挂到本 plan → ownership 违例。
+    const [model] = await db!
+      .insert(schema.mrModels)
+      .values({ vendorId: vendorB, family: `${PREFIX}fam-owner`, version: '1.0' })
+      .returning();
+    const [pm] = await db!
+      .insert(schema.mrPlanModels)
+      .values({
+        planId,
+        modelId: model!.id,
+        sourceUrl: `${PREFIX}src-owner`,
+        lastChecked: NOW,
+        sourceConfidence: 'official_community',
+      })
+      .returning();
+    try {
+      await expect(buildModelRadarSnapshot(db!, NOW)).rejects.toThrow();
+    } finally {
+      // 立即清理坏 junction，避免污染同库其它套件的全局快照构建。
+      await db!.delete(schema.mrPlanModels).where(eq(schema.mrPlanModels.id, pm!.id));
+    }
+  });
+
   it('从未抓 browser 源（last_checked NULL）判陈旧，不被 now-NULL 误判新鲜', async () => {
     const vendorId = await makeVendor('nullsrc');
     // plan 自身 fresh，但关联源 last_checked NULL → 聚合 stale。

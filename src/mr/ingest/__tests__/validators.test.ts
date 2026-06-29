@@ -217,7 +217,7 @@ describe('1.6 confidence↔price 绑定（共享 schema，发 SQL 前拒）', ()
 });
 
 describe('5c review FIX1：价格金额校验（贴合 numeric(12,2)）', () => {
-  it.each(['20.00', 40, 0, '0', '999.99', 1234567.89, 8888888888.88, 9999999999.99])(
+  it.each(['20.00', 40, 0, '0', '40', '40.00', '999.99', '1234567.89', 1234567.89, 8888888888.88, 9999999999.99])(
     '合法金额 %s 通过',
     (v) => {
       expect(mrPriceAmountSchema.safeParse(v).success).toBe(true);
@@ -237,6 +237,12 @@ describe('5c review FIX1：价格金额校验（贴合 numeric(12,2)）', () => 
     '', // 空串（Number('')→0 假阳）
     'free', // 非数值（Number('free')→NaN）
     '40CNY', // 带单位非数值（Number('40CNY')→NaN）
+    '0x10', // JS 十六进制字面量（Number('0x10')→16 假阳）
+    '0b101', // JS 二进制字面量（Number('0b101')→5 假阳）
+    '0o12', // JS 八进制字面量（Number('0o12')→10 假阳）
+    'Infinity', // 字符串 Infinity（Number→Infinity）
+    'NaN', // 字符串 NaN
+    '1.2.3', // 多小数点非十进制字面量
   ])('非法金额 %s 被拒', (v) => {
     expect(mrPriceAmountSchema.safeParse(v).success).toBe(false);
   });

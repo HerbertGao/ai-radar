@@ -16,7 +16,7 @@ import {
   queryModelRadarSnapshot,
   type ModelRadarQueryParams,
 } from '../query.js';
-import { snapshotPlanSchema } from '../dto.js';
+import { snapshotPlanSchema, snapshotProvenanceSchema, snapshotSourceSchema } from '../dto.js';
 import type { ModelRadarSnapshot, SnapshotPlan } from '../dto.js';
 
 /** 已核官方价 plan（priceStatus=known，满足 dto.superRefine）。 */
@@ -249,6 +249,19 @@ describe('3.5 查询参数 Zod 闸（非法 → 拒，组 E 映射 400）', () =
     expect(
       queryModelRadarSnapshot(s, modelRadarQueryParamsSchema.parse({ tool: 'Claude-Code' })).groups,
     ).toHaveLength(0);
+  });
+});
+
+describe('5c review FIX CR6：读侧 sourceUrl 拒纯空白（对齐写侧 mrSourceUrlSchema）', () => {
+  it('纯空白 sourceUrl → provenance/source schema safeParse 失败；非空通过', () => {
+    expect(
+      snapshotProvenanceSchema.safeParse({ sourceUrl: '   ', sourceConfidence: 'official_pricing' }).success,
+    ).toBe(false);
+    expect(
+      snapshotProvenanceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', sourceConfidence: 'official_pricing' }).success,
+    ).toBe(true);
+    expect(snapshotSourceSchema.safeParse({ sourceUrl: '   ', fetchStrategy: 'http' }).success).toBe(false);
+    expect(snapshotSourceSchema.safeParse({ sourceUrl: 'https://example.com/pricing', fetchStrategy: 'http' }).success).toBe(true);
   });
 });
 

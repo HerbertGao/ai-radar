@@ -139,6 +139,12 @@ export async function buildModelRadarSnapshot(
               `快照构建：plan_model ${pm.id} 引用不存在的 model ${pm.modelId}`,
             );
           }
+          // 同厂 ownership（fail-closed）：坏 junction 不得把他厂 model 挂到本 plan。
+          if (model.vendorId !== plan.vendorId) {
+            throw new Error(
+              `快照构建：plan_model ${pm.id} 的 model 不属于 vendor ${plan.vendorId}`,
+            );
+          }
           return {
             modelId: model.id,
             family: model.family,
@@ -167,6 +173,12 @@ export async function buildModelRadarSnapshot(
           if (!source) {
             throw new Error(
               `快照构建：plan_source ${ps.id} 引用不存在的 source ${ps.sourceId}`,
+            );
+          }
+          // 同厂 ownership（fail-closed）：坏 junction 不得让他厂 source 串进本 plan（含其 stale/pending）。
+          if (source.vendorId !== plan.vendorId) {
+            throw new Error(
+              `快照构建：plan_source ${ps.id} 的 source 不属于 vendor ${plan.vendorId}`,
             );
           }
           return source;

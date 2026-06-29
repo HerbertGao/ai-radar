@@ -28,7 +28,7 @@ import {
 
 /** 每条断言事实的 provenance（design D4：source_url/source_confidence 必带；不暴露 raw last_checked）。 */
 export const snapshotProvenanceSchema = z.object({
-  sourceUrl: z.string().min(1),
+  sourceUrl: z.string().refine((s) => s.trim().length > 0, 'source_url 不可为空（不可纯空白）'),
   sourceConfidence: mrSourceConfidenceSchema,
 });
 
@@ -59,7 +59,7 @@ export const snapshotLimitSchema = z.object({
 
 /** 套餐关联源（mr_source + mr_plan_sources 定位边去规范化；用于透明展示，不含 raw last_checked）。 */
 export const snapshotSourceSchema = z.object({
-  sourceUrl: z.string().min(1),
+  sourceUrl: z.string().refine((s) => s.trim().length > 0, 'source_url 不可为空（不可纯空白）'),
   fetchStrategy: mrFetchStrategySchema,
 });
 

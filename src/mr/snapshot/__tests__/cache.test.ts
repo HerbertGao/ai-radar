@@ -154,6 +154,38 @@ describe('5.1/5.4 缓存 fail-closed + 失效 + 只读命中', () => {
     expect(peekCachedSnapshot()).toBeUndefined();
   });
 
+  it('并发 rebuild/get 去重：N 并发只 build 1 次、拿同一 version（防冷启动 thundering-herd）', async () => {
+    const snap = makeSnapshot([makePlan()]);
+    let calls = 0;
+    const counting = async (): Promise<ModelRadarSnapshot> => {
+      calls += 1;
+      return snap;
+    };
+    const results = await Promise.all([
+      rebuildModelRadarSnapshot(dummyDb, NOW, counting),
+      rebuildModelRadarSnapshot(dummyDb, NOW, counting),
+      getModelRadarSnapshot(dummyDb, NOW, counting),
+      getModelRadarSnapshot(dummyDb, NOW, counting),
+      rebuildModelRadarSnapshot(dummyDb, NOW, counting),
+    ]);
+    expect(calls).toBe(1);
+    expect(new Set(results.map((r) => r.version)).size).toBe(1);
+
+    // build 抛后 inFlight 须清空：下一次 rebuild 仍能重新 build（不被卡在已 settle 的旧 inFlight）。
+    invalidateModelRadarSnapshot();
+    await expect(
+      rebuildModelRadarSnapshot(dummyDb, NOW, async () => {
+        throw new Error('冷启动失败');
+      }),
+    ).rejects.toThrow();
+    let retried = 0;
+    await rebuildModelRadarSnapshot(dummyDb, NOW, async () => {
+      retried += 1;
+      return makeSnapshot([makePlan({ currentPrice: '30.00' })]);
+    });
+    expect(retried).toBe(1);
+  });
+
   it('warm 后 get 命中缓存、不再调 buildFn（请求路径不触 DB）', async () => {
     const build = stubBuild(makeSnapshot());
     await getModelRadarSnapshot(dummyDb, NOW, build); // 冷启动 1 次

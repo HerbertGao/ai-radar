@@ -92,6 +92,12 @@ export const mrPriceAmountSchema = z
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'price 不可为空' });
       return;
     }
+    // 字符串入参限十进制字面量：拒 JS 进制/特殊字面量（0x10/0b101/0o12/Infinity/NaN/1.2.3）——否则 Number()
+    // 放行后 String() 原样进 numeric(12,2) 成 SQL 晚错。负号由 ≥0 闸拒、科学计数法由 scale 闸过滤。
+    if (typeof raw === 'string' && !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'price 须为十进制数值字面量（拒 0x/0b/0o/Infinity/NaN 等）' });
+      return;
+    }
     const n = Number(raw);
     if (!Number.isFinite(n)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'price 须为有限数值（非 NaN/Infinity）' });

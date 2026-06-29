@@ -47,6 +47,9 @@ export interface CachedSnapshot {
 /** 进程内单例缓存（5c 单 blob；跨进程失效随 5d 接线）。 */
 let cached: CachedSnapshot | undefined;
 
+/** 进行中的 rebuild（去重并发：冷启动 thundering-herd + 跨阈值 now-race 共享同一次 build）。 */
+let inFlight: Promise<CachedSnapshot> | undefined;
+
 /**
  * canonical 序列化：递归**排序对象键**（数组/行序由调用方保证 = build.ts ORDER BY id），
  * 使内容哈希与字段书写顺序解耦（build.ts 重排字段不致哈希漂移，spec「canonical 既排序对象键也固定数组/行序」）。
@@ -88,11 +91,20 @@ export async function rebuildModelRadarSnapshot(
   now: Date = new Date(),
   buildFn: SnapshotBuildFn = buildModelRadarSnapshot,
 ): Promise<CachedSnapshot> {
-  // 先 build（可抛）；抛错时下面两行不执行 → cached 不变（fail-closed，不覆盖旧快照）。
-  const snapshot = await buildFn(dbh, now);
-  const version = computeSnapshotVersion(snapshot);
-  cached = { snapshot, version };
-  return cached;
+  // 并发去重：已有进行中的 rebuild 直接复用（N 并发只 build 1 次、拿同一 version）。
+  if (inFlight) return inFlight;
+  // 先 build（可抛）；抛错时不执行替换 → cached 不变（fail-closed，不覆盖旧快照）。finally 清空 inFlight 使下次可重试。
+  inFlight = (async () => {
+    const snapshot = await buildFn(dbh, now);
+    const version = computeSnapshotVersion(snapshot);
+    cached = { snapshot, version };
+    return cached;
+  })();
+  try {
+    return await inFlight;
+  } finally {
+    inFlight = undefined;
+  }
 }
 
 /**
