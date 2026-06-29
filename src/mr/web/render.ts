@@ -108,16 +108,17 @@ export type FreshnessSort = 'stale' | 'fresh';
 /**
  * 按新鲜度对组内 plans 重排（render 层、不碰 query 的价格排序/分组）：
  * `stale` = 最陈旧优先（freshnessSortKey 升序，null 源最前）；`fresh` = 最新核对优先（降序）。
+ * 用方向因子直接排（非 `.reverse()`）→ 稳定排序保同新鲜度键的 plan 维持原有（query 的价/序）相对次序。
  * ponytail: 在 query 既有分组内重排即可——四问的「谁最陈旧」按桶/币种分组内对比已足，跨组全局排名留 v2。
  */
 export function sortPlansByFreshness(plans: SnapshotPlan[], dir: FreshnessSort): SnapshotPlan[] {
-  const sorted = [...plans].sort((a, b) => {
+  const factor = dir === 'fresh' ? -1 : 1;
+  return [...plans].sort((a, b) => {
     const ka = freshnessSortKey(a);
     const kb = freshnessSortKey(b);
     if (ka === kb) return 0;
-    return ka < kb ? -1 : 1;
+    return (ka < kb ? -1 : 1) * factor;
   });
-  return dir === 'fresh' ? sorted.reverse() : sorted;
 }
 
 export interface CheapestInfo {

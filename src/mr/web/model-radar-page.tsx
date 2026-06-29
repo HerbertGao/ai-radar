@@ -50,8 +50,11 @@ function readWebQuery(raw: Record<string, string | undefined>): WebQuery {
     if (v != null && v.trim() !== '') q[k] = v;
   }
   if (raw.sort === 'stale' || raw.sort === 'fresh') q.sort = raw.sort;
-  // 估算旋钮（web-only，不入 .strict() schema / 不进哈希；透传给链接/chip 以跨筛选保留，render 层用）。
-  if (raw.tokensPerRound != null && raw.tokensPerRound.trim() !== '') q.tokensPerRound = raw.tokensPerRound;
+  // 估算旋钮（web-only，不入 .strict() schema / 不进哈希）：**归一到预设值**再透传，使链接/chip 的 URL 参数
+  // 与生效估算一致（防 `?tokensPerRound=9999` 表现为 15000 却把 9999 继续传播）。
+  if (raw.tokensPerRound != null && raw.tokensPerRound.trim() !== '') {
+    q.tokensPerRound = String(resolveTokensPerRound(raw.tokensPerRound));
+  }
   return q;
 }
 

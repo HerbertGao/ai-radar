@@ -423,8 +423,8 @@ const GroupTable: FC<{
     </>
   );
 
-  // aria-sort：默认（无 freshness 排序）= 价格升序列；freshness 排序时标新鲜度列方向。
-  const priceSort = sort ? 'none' : 'ascending';
+  // aria-sort：仅已核组默认价格升序（query 保证同币种组价升序）；未核组无意义价序 / freshness 排序时 → none。
+  const priceSort = !known || sort ? 'none' : 'ascending';
   const freshSort = sort === 'stale' ? 'ascending' : sort === 'fresh' ? 'descending' : 'none';
   const scopeLabel = known ? `Coding Plan ${group.sortScope.currency}` : 'Coding Plan 未核价';
 
