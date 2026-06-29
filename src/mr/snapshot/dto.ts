@@ -4,9 +4,13 @@
  * 这是 5c 读路径的对外服务表征契约——组 C（过滤/排序）与组 D（缓存/ETag/内容哈希）依赖本文件导出的
  * 类型与 schema。本文件**只声明形状**，不含构建逻辑（见 ./build.ts）、不含 canonical 序列化/哈希（组 D）。
  *
- * 关键不变量（design D8 / spec「快照版本与 ETag 必须随数据变更失效」）——**ETag = 服务表征的纯函数**：
- * - 服务表征 freshness **仅暴露离散 `stale: boolean`**（plan 级 = 任一成分事实/源 stale 的聚合）；
- *   **绝不暴露 raw 秒级 `last_checked`、也不暴露 `lastCheckedDate`**（raw last_checked 仅 builder 内部算 staleness）。
+ * 关键不变量（design D1/D8 / spec「快照版本与 ETag 必须随数据变更失效」）——**ETag = 服务表征的纯函数**：
+ * - 服务表征 freshness **plan 级仅暴露离散 `stale: boolean`**（= 任一成分事实/源 stale 的聚合）；
+ *   **绝不暴露 raw 秒级 `last_checked`、也不暴露 plan 级聚合 date**（raw last_checked 仅 builder 内部算 staleness）。
+ * - **但每条事实行 provenance 暴露日粒度 `lastCheckedDate`**（5d-B，design D1）= `trunc_UTC(该行 last_checked)`
+ *   的纯函数、**完全与 build/render `now` 无关**——now 推进即便跨任何 UTC 自然午夜也不改它，仅该行 `last_checked`
+ *   被**写**到新 UTC 日才变 → 进内容哈希仍稳定、不每日过度失效；「N 天前」相对文案只在 render 层算、**绝不**进 DTO/哈希。
+ *   关联源行（`snapshotSourceSchema`）的 date 可为 null（`mr_source.last_checked` 可 NULL，从未抓源无 date）。
  * - **不含构建时刻 / now 派生连续量（ageMs）**：本 DTO 无 `builtAt`、无 `version` 字段——`builtAt` 是 builder
  *   内部、`mr_catalog_version` 留未来/内部，二者绝不进服务表征；`version`/ETag 由组 D 对本 DTO 内容哈希派生、
  *   作传输别名包在响应外层（不入哈希输入，避免自引用）。
@@ -26,10 +30,16 @@ import {
   mrSourceConfidenceSchema,
 } from '../../db/mr-schema.zod.js';
 
-/** 每条断言事实的 provenance（design D4：source_url/source_confidence 必带；不暴露 raw last_checked）。 */
+/**
+ * 每条断言事实的 provenance（plan 价格事实 + models/clients/limits）。
+ * source_url/source_confidence 必带；`lastCheckedDate` = 日粒度 ISO 日期 `YYYY-MM-DD` = `trunc_UTC(该行 last_checked)`
+ * （5d-B / design D1：日粒度、固定 UTC 截断、数据派生、完全 now 无关；这些事实行 `last_checked` 按 DDL NOT NULL → 必填）。
+ * 仍不暴露 raw 秒级 `last_checked`（仅 builder 内部算 staleness）。
+ */
 export const snapshotProvenanceSchema = z.object({
   sourceUrl: z.string().refine((s) => s.trim().length > 0, 'source_url 不可为空（不可纯空白）'),
   sourceConfidence: mrSourceConfidenceSchema,
+  lastCheckedDate: z.iso.date(),
 });
 
 /** 套餐↔模型兼容（去规范化 family:version + 该兼容断言自身 provenance）。 */
@@ -57,10 +67,15 @@ export const snapshotLimitSchema = z.object({
   provenance: snapshotProvenanceSchema,
 });
 
-/** 套餐关联源（mr_source + mr_plan_sources 定位边去规范化；用于透明展示，不含 raw last_checked）。 */
+/**
+ * 套餐关联源（mr_source + mr_plan_sources 定位边去规范化；用于透明展示，不含 raw 秒级 last_checked）。
+ * `lastCheckedDate` = `trunc_UTC(mr_source.last_checked)` 或 **null**——`mr_source.last_checked` 按 DDL 可 NULL
+ * （从未抓源），故仅本 schema 的 date 可 null（事实 provenance 的 date 必填）。
+ */
 export const snapshotSourceSchema = z.object({
   sourceUrl: z.string().refine((s) => s.trim().length > 0, 'source_url 不可为空（不可纯空白）'),
   fetchStrategy: mrFetchStrategySchema,
+  lastCheckedDate: z.iso.date().nullable(),
 });
 
 /** 价格状态（design D4：known 须同币种 + 已核官方 provenance；否则 unknown）。 */

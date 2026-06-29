@@ -156,19 +156,30 @@ describeIfDb('2.5 快照构建', () => {
     expect(plan!.provenance.sourceConfidence).toBe('official_pricing');
     expect(plan!.provenance.sourceUrl).toBe(`${PREFIX}src-full`);
     // 去规范化关系
+    const nowDate = NOW.toISOString().slice(0, 10); // 全行 lastChecked=NOW → 同 UTC 日 date
     expect(plan!.models).toEqual([
       {
         modelId: model!.id,
         family: `${PREFIX}fam-full`,
         version: '4.6',
-        provenance: { sourceUrl: `${PREFIX}src-full`, sourceConfidence: 'official_community' },
+        provenance: {
+          sourceUrl: `${PREFIX}src-full`,
+          sourceConfidence: 'official_community',
+          lastCheckedDate: nowDate,
+        },
       },
     ]);
     expect(plan!.clients).toHaveLength(1);
     expect(plan!.clients[0]!.clientId).toBe('claude-code');
+    expect(plan!.clients[0]!.provenance.lastCheckedDate).toBe(nowDate);
     expect(plan!.limits[0]!.value).toBe('1000000');
     expect(plan!.limits[0]!.window).toBe('month');
-    expect(plan!.sources).toEqual([{ sourceUrl: `${PREFIX}src-full`, fetchStrategy: 'http' }]);
+    expect(plan!.limits[0]!.provenance.lastCheckedDate).toBe(nowDate);
+    // 价格事实 date = trunc(plan.last_checked)
+    expect(plan!.provenance.lastCheckedDate).toBe(nowDate);
+    expect(plan!.sources).toEqual([
+      { sourceUrl: `${PREFIX}src-full`, fetchStrategy: 'http', lastCheckedDate: nowDate },
+    ]);
     // 全 NOW 新鲜、无 flag → 干净
     expect(plan!.freshness.stale).toBe(false);
     expect(plan!.reviewStatus.pending).toBe(false);
@@ -286,6 +297,8 @@ describeIfDb('2.5 快照构建', () => {
 
     const plan = await snapPlan(planId);
     expect(plan!.freshness.stale).toBe(true);
+    // 关联源 last_checked NULL → 其 lastCheckedDate 缺省为 null（仅 source 行 date 可 null）。
+    expect(plan!.sources[0]!.lastCheckedDate).toBeNull();
   });
 
   it('child 限额行陈旧 → plan freshness.stale（plan 自身新鲜亦然）', async () => {
