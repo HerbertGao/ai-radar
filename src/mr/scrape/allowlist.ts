@@ -32,8 +32,12 @@ export const MR_SOURCE_DOMAIN_ALLOWLIST: readonly string[] = [
   'stepfun.com', // Step 阶跃星辰（platform.stepfun.com）
   'trae.ai', // Trae（www.trae.ai）
   'qoder.com', // Qoder
-  'baidu.com', // Comate（comate.baidu.com）
-  'tencent.com', // CodeBuddy（copilot.tencent.com）
+  'baidu.com', // Comate（comate.baidu.com）+ 千帆（cloud.baidu.com）
+  'tencent.com', // CodeBuddy（copilot.tencent.com）+ 腾讯混元 coding plan（cloud.tencent.com）
+  // 5c 桶2 Coding Plan http/browser 源域（百炼/火山/讯飞）：录入闸 assertUrlAllowed 据此放行。
+  'aliyun.com', // 百炼 / 阿里云百炼 Model Studio（help.aliyun.com，国内域；alibabacloud.com 是国际域）
+  'volcengine.com', // 火山方舟 Ark（www.volcengine.com）
+  'xfyun.cn', // 讯飞星火开放平台（www.xfyun.cn）
 ];
 
 /**

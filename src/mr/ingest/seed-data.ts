@@ -11,10 +11,17 @@
  *   （`currentPrice`/`currency`/`value` 皆 NULL，同生同灭由 5a refine 兜），或留 `// TODO 待策展核实`。
  * 宁可少录准确条目，不可多录臆测数字——保鲜回路 + 待复核机制兜后续核实。
  *
- * 已核 8 家全桶（docs/model-radar-tech-plan.md L154 跨桶清单）+ coding_plan 桶典范 Z.ai：
+ * 已核 8 家全桶（docs/model-radar-tech-plan.md L154 跨桶清单）+ coding_plan 桶典范 Z.ai + 5c 桶2 五家：
  * - **已核 8 家**：Token Plan 桶 Kimi / MiniMax / MiMo / Step（4）；IDE会员 桶 Trae / Qoder / Comate / CodeBuddy（4）。
  * - **coding_plan 典范**：Z.ai（GLM / bigmodel.cn，桶2 = v1 主桶，走 browser 档）——补满「三桶各 ≥1 例」。
- *   故 fixture 共 9 个 vendor 条目（8 已核 + Z.ai 典范）。本 fixture 取每桶代表覆盖，扩满全 plan 由策展随核实增补，不臆造。
+ * - **5c 桶2 多模型 Coding Plan（task 1.4）**：百炼（aliyun）/ 千帆（baidu）/ 腾讯混元（tencent）/ 火山方舟（volcengine）/
+ *   讯飞星火（xfyun）——逐家**结构性录入**（vendor + coding_plan plan + source + model/client/limit + provenance）。
+ *   本期价格**一律 NULL 占位 + `needs_login_recheck`**（browser 真实勘验为价格核实前置且为后续 gate，本期 0 已核价即验收，
+ *   禁填传闻/占位价凑数）。源 `fetch_strategy` 按页面真实性质设：上述 5 家为结构化文档页 → `http`（其域已扩入
+ *   `MR_SOURCE_DOMAIN_ALLOWLIST`，见 allowlist.ts，使 `upsertSource → assertUrlAllowed` 放行）；GLM 仍走 `browser`。
+ *   **腾讯混元** coding_plan 用 `normalizedName='tencent-hunyuan'`，与既有 CodeBuddy（腾讯，ide_membership，`codebuddy`）
+ *   **不同 normalizedName**——区分产品、避免 vendor 去重键歧义（task 1.2）。
+ *   故 fixture 共 14 个 vendor 条目（8 已核 + Z.ai 典范 + 5c 桶2 五家）。本 fixture 取每桶代表覆盖，扩满全 plan 由策展随核实增补，不臆造。
  *
  * `name` = 套餐全名约定（含产品上下文，非裸档位，task 1.5）。`normalizedName` 录入前已小写归一（5b 契约）。
  * `family` 由 `upsertModel` 内建 transform 小写归一（design D3），fixture 写系列名即可。
@@ -309,6 +316,115 @@ export const SEED_VENDORS: SeedVendor[] = [
         limits: [{ limitType: 'fast_pass', value: null, window: 'month' }],
         models: [],
         clients: [{ clientType: 'tool', clientId: 'codebuddy-ide' }],
+      },
+    ],
+  },
+
+  // ───────── 5c 桶2 多模型 Coding Plan（task 1.4）：百炼/千帆/腾讯混元/火山方舟/讯飞星火 ─────────
+  // 全部 0 已核价（NULL + needs_login_recheck 占位，禁臆造）；结构化文档页 → http（域已扩入 allowlist）。
+  {
+    normalizedName: 'bailian',
+    name: '百炼（阿里云 Model Studio）',
+    sources: [
+      // 阿里云百炼计费文档页（结构化文档）→ http。aliyun.com 已扩入 allowlist。
+      { sourceUrl: 'https://help.aliyun.com/zh/model-studio/billing', fetchStrategy: 'http' },
+    ],
+    plans: [
+      {
+        name: '百炼 Coding Plan',
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://help.aliyun.com/zh/model-studio/billing',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'qwen', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+      },
+    ],
+  },
+  {
+    normalizedName: 'qianfan',
+    name: '千帆（百度智能云）',
+    sources: [
+      // 百度智能云千帆文档页（结构化文档）→ http。baidu.com 已在 allowlist。
+      { sourceUrl: 'https://cloud.baidu.com/doc/qianfan/index.html', fetchStrategy: 'http' },
+    ],
+    plans: [
+      {
+        name: '千帆 Coding Plan',
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://cloud.baidu.com/doc/qianfan/index.html',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'ernie', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+      },
+    ],
+  },
+  {
+    // task 1.2：与 CodeBuddy（腾讯，ide_membership，normalizedName='codebuddy'）不同 normalizedName，区分产品。
+    normalizedName: 'tencent-hunyuan',
+    name: '腾讯混元（腾讯云）',
+    sources: [
+      // 腾讯云混元文档页（结构化文档）→ http。tencent.com 已在 allowlist。
+      { sourceUrl: 'https://cloud.tencent.com/document/product/1729', fetchStrategy: 'http' },
+    ],
+    plans: [
+      {
+        name: '腾讯混元 Coding Plan',
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://cloud.tencent.com/document/product/1729',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'hunyuan', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+      },
+    ],
+  },
+  {
+    normalizedName: 'volcengine-ark',
+    name: '火山方舟（火山引擎）',
+    sources: [
+      // 火山方舟文档页（结构化文档）→ http。续费价在登录墙后故价格保持 NULL 占位。volcengine.com 已扩入 allowlist。
+      { sourceUrl: 'https://www.volcengine.com/docs/82379', fetchStrategy: 'http' },
+    ],
+    plans: [
+      {
+        name: '火山方舟 Coding Plan',
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://www.volcengine.com/docs/82379',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'doubao', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+      },
+    ],
+  },
+  {
+    normalizedName: 'xfyun-spark',
+    name: '讯飞星火（科大讯飞）',
+    sources: [
+      // 讯飞星火开放平台文档页（结构化文档）→ http。xfyun.cn 已扩入 allowlist。
+      { sourceUrl: 'https://www.xfyun.cn/doc/spark/Web.html', fetchStrategy: 'http' },
+    ],
+    plans: [
+      {
+        name: '讯飞星火 Coding Plan',
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://www.xfyun.cn/doc/spark/Web.html',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'spark', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
       },
     ],
   },

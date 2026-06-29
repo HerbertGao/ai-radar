@@ -39,10 +39,12 @@ import {
   mrPlanLimitWriteSchema,
   mrPlanModelWriteSchema,
   mrPlanWriteValidator,
+  mrSourceUrlSchema,
   mrSourceWriteSchema,
 } from './validators.js';
 import { _recordPriceChangeTx } from './record-price-change.js';
 import { setReviewFlag } from '../write/flag.js';
+import { runSnapshotRebuild } from '../snapshot/rebuild.js';
 // design D10 双层闸的录入侧：录入 source 前断言 source_url 过 SSRF 白名单（scheme/私网/host）。
 // 纯校验函数，不触发抓取——结构守卫只禁 scrape→ingest，不禁 ingest→scrape 的校验 import。
 import { assertUrlAllowed } from '../scrape/ssrf-guard.js';
@@ -150,6 +152,7 @@ export async function upsertSource(
   const { fetchStrategy } = mrSourceWriteSchema.parse({
     fetchStrategy: s.fetchStrategy,
   });
+  mrSourceUrlSchema.parse(s.sourceUrl); // 空串 source_url → 拒（manual 源跳过 assertUrlAllowed，否则空串可落库致快照 fail-closed）。
   // design D10 双层闸（录入侧）：scheme 非 http(s)/私网/host ∉ 白名单 → 抛 SsrfBlockedError 不落库。
   // **仅对 `http`/`browser` will-fetch 源**断言（D10：manual 源不发请求、豁免该闸，URL 仅人类参考）。
   if (fetchStrategy === 'http' || fetchStrategy === 'browser') {
@@ -239,6 +242,7 @@ export async function upsertPlan(
     currency: p.currency,
     sourceConfidence: p.sourceConfidence,
   });
+  mrSourceUrlSchema.parse(p.sourceUrl); // 空串 source_url → 拒（plan.source_url 入快照，空串致 fail-closed）。
 
   // task 1.5：裸档位告警（无法可靠机器识别故仅告警，design 注明）。
   if (BARE_TIER_NAMES.has(p.name.trim().toLowerCase())) {
@@ -248,7 +252,7 @@ export async function upsertPlan(
   }
 
   // design D4 原子性：guarded-read + 价变委托须同事务（否则改价决策与加锁读跨两 tx，TOCTOU）。
-  return dbh.transaction(async (tx): Promise<FactWriteOutcome> => {
+  const result = await dbh.transaction(async (tx): Promise<FactWriteOutcome> => {
     const inserted = await tx
       .insert(mrPlans)
       .values({
@@ -363,6 +367,15 @@ export async function upsertPlan(
 
     return { outcome: 'noop', id: existing.id };
   });
+
+  // 提交后耦合快照 rebuild（add-model-radar-compare-api D8）：upsertPlan 经 `_recordPriceChangeTx` 的**委托
+  // 改价路径**是「两个改价入口」之一（只钩公开 recordPriceChange 会漏它），故 price-delegated 在最外层事务
+  // 提交后触发 rebuild。结构性 INSERT（inserted/noop/conflict 等单条 ad-hoc 结构写）不即时刷 ETag——归
+  // seed/策展脚本末尾触发或 5d 后台周期 rebuild 兜（design D8）。runSnapshotRebuild never-throws。
+  if (result.outcome === 'price-delegated') {
+    await runSnapshotRebuild({ dbh });
+  }
+  return result;
 }
 
 /**
@@ -385,6 +398,7 @@ export async function upsertPlanLimit(
     limitType: l.limitType,
     sourceConfidence: l.sourceConfidence,
   });
+  mrSourceUrlSchema.parse(l.sourceUrl); // 空串 source_url → 拒（limit.source_url 入快照，空串致 fail-closed）。
 
   const inserted = await dbh
     .insert(mrPlanLimits)
@@ -464,6 +478,7 @@ export async function upsertPlanClient(
     clientType: c.clientType,
     sourceConfidence: c.sourceConfidence,
   });
+  mrSourceUrlSchema.parse(c.sourceUrl); // 空串 source_url → 拒（client.source_url 入快照，空串致 fail-closed）。
 
   const inserted = await dbh
     .insert(mrPlanClients)
@@ -541,6 +556,7 @@ export async function upsertPlanModel(
   const { sourceConfidence } = mrPlanModelWriteSchema.parse({
     sourceConfidence: m.sourceConfidence,
   });
+  mrSourceUrlSchema.parse(m.sourceUrl); // 空串 source_url → 拒（plan_model.source_url 入快照，空串致 fail-closed）。
 
   const inserted = await dbh
     .insert(mrPlanModels)

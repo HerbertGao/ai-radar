@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   mrLimitTypeSchema,
   mrCurrencySchema,
+  mrPriceAmountSchema,
 } from '../../../db/mr-schema.zod.js';
 import {
   mrModelWriteSchema,
@@ -18,6 +19,7 @@ import {
   mrPlanModelWriteSchema,
   mrPlanWriteValidator,
   mrPriceHistoryWriteSchema,
+  mrSourceUrlSchema,
   mrSourceWriteSchema,
 } from '../validators.js';
 
@@ -157,6 +159,127 @@ describe('1.1 非法有限值集值被拒（发 SQL 前唯一防线）', () => {
         sourceConfidence: 'guess',
       }),
     ).toThrow();
+  });
+});
+
+describe('1.6 confidence↔price 绑定（共享 schema，发 SQL 前拒）', () => {
+  // 落点是共享 mrPlanWriteValidator，故 upsertPlan 新建 INSERT 与改价委托两路都过此闸。
+  it.each(['needs_login_recheck', 'official_community', 'media_report'] as const)(
+    'upsertPlan 新建分支负例：非官方 confidence %s 带非 NULL 价被拒',
+    (conf) => {
+      expect(() =>
+        mrPlanWriteValidator.parse({
+          category: 'coding_plan',
+          currentPrice: 40,
+          currency: 'CNY',
+          sourceConfidence: conf,
+        }),
+      ).toThrow();
+    },
+  );
+
+  it('官方 confidence 才可带价（official_pricing/official_doc 通过）', () => {
+    for (const conf of ['official_pricing', 'official_doc'] as const) {
+      expect(() =>
+        mrPlanWriteValidator.parse({
+          category: 'coding_plan',
+          currentPrice: 40,
+          currency: 'CNY',
+          sourceConfidence: conf,
+        }),
+      ).not.toThrow();
+    }
+  });
+
+  it('非官方 confidence + NULL 价占位仍合法（占位不受绑定影响）', () => {
+    expect(() =>
+      mrPlanWriteValidator.parse({
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceConfidence: 'needs_login_recheck',
+      }),
+    ).not.toThrow();
+  });
+
+  it('recordPriceChange 路径：非官方 confidence 写价被 mrPriceHistoryWriteSchema 拒', () => {
+    for (const conf of ['needs_login_recheck', 'official_community', 'media_report'] as const) {
+      expect(() =>
+        mrPriceHistoryWriteSchema.parse({ currency: 'CNY', sourceConfidence: conf }),
+      ).toThrow();
+    }
+    // 官方 confidence 通过。
+    expect(
+      mrPriceHistoryWriteSchema.parse({ currency: 'CNY', sourceConfidence: 'official_pricing' })
+        .sourceConfidence,
+    ).toBe('official_pricing');
+  });
+});
+
+describe('5c review FIX1：价格金额校验（贴合 numeric(12,2)）', () => {
+  it.each(['20.00', 40, 0, '0', '999.99', 1234567.89, 8888888888.88, 9999999999.99])(
+    '合法金额 %s 通过',
+    (v) => {
+      expect(mrPriceAmountSchema.safeParse(v).success).toBe(true);
+    },
+  );
+
+  it.each([
+    -1,
+    '-0.01',
+    NaN,
+    Infinity,
+    -Infinity,
+    '20.555', // 3 位小数
+    1e-3, // 科学计数法 number（=0.001，超 scale；字符串小数点判 scale 旧法会漏）
+    1e-7, // 科学计数法 number（String() 无 `.`，旧法绕过 scale 闸）
+    1e10, // 量级溢出 numeric(12,2)
+    '', // 空串（Number('')→0 假阳）
+    'free', // 非数值（Number('free')→NaN）
+    '40CNY', // 带单位非数值（Number('40CNY')→NaN）
+  ])('非法金额 %s 被拒', (v) => {
+    expect(mrPriceAmountSchema.safeParse(v).success).toBe(false);
+  });
+
+  it.each([-1, NaN, Infinity, '20.555', 1e10])(
+    'mrPlanWriteValidator 官方 confidence 带非法价 %s 被拒（叠加金额校验）',
+    (price) => {
+      expect(
+        mrPlanWriteValidator.safeParse({
+          category: 'coding_plan',
+          currentPrice: price,
+          currency: 'CNY',
+          sourceConfidence: 'official_pricing',
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  it('mrPlanWriteValidator 合法官方价仍通过；NULL 占位不受金额闸影响', () => {
+    expect(
+      mrPlanWriteValidator.safeParse({
+        category: 'coding_plan',
+        currentPrice: '40.00',
+        currency: 'CNY',
+        sourceConfidence: 'official_pricing',
+      }).success,
+    ).toBe(true);
+    expect(
+      mrPlanWriteValidator.safeParse({
+        category: 'coding_plan',
+        currentPrice: null,
+        currency: null,
+        sourceConfidence: 'needs_login_recheck',
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe('5c review FIX2：source_url 非空校验（防快照 fail-closed）', () => {
+  it('空串 / 纯空白 source_url 被拒，非空 URL 通过', () => {
+    expect(mrSourceUrlSchema.safeParse('').success).toBe(false);
+    expect(mrSourceUrlSchema.safeParse('   ').success).toBe(false); // 纯空白（旧 min(1) 会放行）
+    expect(mrSourceUrlSchema.safeParse('https://example.com/pricing').success).toBe(true);
   });
 });
 

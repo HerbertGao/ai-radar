@@ -53,11 +53,18 @@
 |---|---|---|---|
 | **5a** | 数据模型 + provenance：`mr_vendors` / `mr_plans` / `mr_models` / `mr_plan_models`（模型兼容矩阵）/ `mr_plan_clients`（工具+协议兼容）/ `mr_plan_limits`（带类型限额行）/ `mr_price_history`；category facet；provenance 三字段 | ~1 周 | migration 幂等落表 + 唯一约束 + 一家样例厂商完整录入读回；额度走限额行非单 INT |
 | **5b** | 结构化录入 + 保鲜回路（**先于 UI**）：最小录入路径把已核 8 家入库（带 confidence）；`last_checked` / 陈旧度；接 ai-radar 事件流 → 对应 plan 打「待复核」（写状态不改事实） | ~1–1.5 周 | 8 家在库可查；变更流能把某厂商标待复核；源 URL 漂移类问题被 confidence/last_checked 暴露 |
-| **5c** | 桶2（多模型 Coding Plan：百炼/千帆/腾讯/火山/讯飞）数据 + 比价/检索 API：model × tool × 协议 × 预算 横切筛选；同桶内排序；「同档家族」折叠（5 家 ¥40/¥200 同质 → 收一组，差异在模型/工具/限制） | ~1 周 | API 按 model/tool 过滤返回合格 plan、同桶排序、返回带 provenance |
+| **5c** ⭐已开 | 桶2（多模型 Coding Plan：百炼/千帆/腾讯/火山/讯飞）数据 + 比价/检索 API：model × tool × 协议 × 预算 横切筛选；同桶内排序（**同桶同币种**）；「同档家族」折叠**本期延后**（见下注 5c-③） | ~1 周 | API 按 model/tool 过滤返回合格 plan、同桶排序、返回带 provenance |
 | **5d** | Web 比价页（项目**首个真前端**，TS 前后端同栈 + 复用 Zod schema）：筛选 chips + 可排序表 + 行展开看全字段与来源 + 陈旧标；「估算中等任务轮次」做成**带旋钮的区间**、视觉次于官方原始额度、挂 ⚠ 估算 | ~1.5 周 | 浏览器 10s 内答四个 Success 问题；每格可溯源 |
 | **5e** | 垂类选型推荐器：规则硬筛（含某模型/工具/预算）→ RAG 证据（接知识库 + 变更流）→ LLM 解释 → 首选/备选/不推荐/落地；MCP 暴露 `recommend_coding_subscription` | ~1–1.5 周 | 「重度用 Claude Code + GLM-5.2 最便宜可用」给出排名 + 是否撞窗 + 月成本 + 依据 |
 
 > 桶2 之后按需补桶：Token/Credit Plan（GLM/MiniMax/MiMo/Step/Kimi，价格有区分但 credit 口径异构需归一化护栏）、IDE会员（Trae/Qoder/Comate/CodeBuddy/Raccoon，最异构）、企业席位。渠道/代理转售包列**第二阶段**单独表，不混入厂商官方榜。
+
+> **5c 开工决策（`add-model-radar-compare-api`）**：
+> - **5c-① 未知价格排序红线**：`priceStatus='known'` 当且仅当 `current_price`/`currency` 非 NULL **且** `source_confidence ∈ {official_pricing, official_doc}`（已核官方 provenance）。未核价不参与「最便宜」，同桶排在已知价之后并标待复核；录入侧 confidence↔price 绑定落进共享 `mrPlanWriteSchema`（`upsertPlan` 新建 + 改价委托两路都过）+ `recordPriceChange` confidence-must-be-official，使未核价无法冒充已核价。
+> - **5c-② 同桶同币种比较，不做汇率换算（FX）**：排序仅在同一 `category` 且同一 `currency` 内有意义；混币（20 EUR vs 40 CNY）不当同单位比，按 (category, currency) 分组。
+> - **5c-③ 「同档家族」折叠本期延后**：折叠需依赖已核价格+限额做同质判定，而本期桶2价格大多未核（NULL 占位），无可靠数据可依；显式延后到桶2价格核实后再做。
+> - **5c-④ browser/prod gate**：真实 browser 定价页勘验 + browser-worker egress/netns 封锁（封 RFC1918/link-local/metadata、启动自检 fail-closed）是 **browser/prod 启用 gate**，**不阻塞 5c API 开发**；本期不启用 browser-worker 生产消费、不实际抓取任何源。源 `fetch_strategy` 按页面真实性质登记（JS 渲染=browser、文档页=http、登录墙/漂移=manual，不一律降 manual），http/browser 源域扩入 `MR_SOURCE_DOMAIN_ALLOWLIST`。
+> - **5c-⑤ ETag=内容哈希**：5c 唯一公开 version/ETag 源 = 快照内容 canonical 哈希；`mr_catalog_version` 在 5c 不写不读不服务（留未来/内部）。服务表征 freshness **仅暴露离散 `stale`**（不暴露 raw 秒级 last_checked），随数据变更/staleness 阈值穿越失效。
 
 ## P1 退出标准达成
 

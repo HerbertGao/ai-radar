@@ -11,7 +11,9 @@
  * **不臆造价格**：fixture 价数无把握处为 `needs_login_recheck` 占位（currentPrice/currency NULL），
  * `upsertPlan` 不触发 recordPriceChange（无真价变），故 seed 只建占位结构，真价靠保鲜回路核实后录入。
  *
- * **不 bump catalog version、不投 rebuild**（design D16：5b 写 mr_* 不碰 mr_catalog_version，留 5c）。
+ * **不 bump catalog version、不投 rebuild**（design D16）。注：**5c 公开 version/ETag = 快照内容哈希**
+ * （add-model-radar-compare-api D8），`mr_catalog_version` 在 5c **不写不读不服务**、留未来/内部用途
+ * （非漏接线）；故 seed 写 mr_* 既不碰该表、5c 也不靠它，rebuild 由内容哈希驱动。
  */
 import { db as defaultDb } from '../../db/index.js';
 import {

@@ -13,6 +13,7 @@
 import { Hono } from 'hono';
 import { pingDb } from './db/index.js';
 import { pingRedis } from './health/redis.js';
+import { createModelRadarApp } from './mr/api/model-radar.js';
 
 /** 单项依赖的连通状态。 */
 export type DependencyStatus = 'ok' | 'down';
@@ -77,3 +78,5 @@ export function createHealthApp(probes: HealthProbes = defaultProbes): Hono {
 
 /** 生产使用的 app 实例（真实探测）。 */
 export const app = createHealthApp();
+// 挂载 Model Radar 只读比价路由（组 E）；/health 行为不变。请求路径只读快照、不写库。
+app.route('/', createModelRadarApp());

@@ -705,8 +705,9 @@ export const mrReviewFlag = pgTable(
 );
 
 /**
- * 目录版本表（design D11）。5c bump/latest 需有序唯一版本。`version bigint NOT NULL UNIQUE`
- * 无 default（由 5c bump 路径产生，5a 仅建表不写）；`built_at` NOT NULL DEFAULT now()。
+ * 目录版本表（design D11）。**5c 公开 version/ETag = 快照内容哈希**（见 add-model-radar-compare-api D8）——
+ * 该表在 5c **不写不读不服务也不哈希**，是 5a 所建、留未来/内部用途（**非死表漏接线**，是有意决定）。
+ * `version bigint NOT NULL UNIQUE` 无 default；`built_at` NOT NULL DEFAULT now()。
  */
 export const mrCatalogVersion = pgTable(
   'mr_catalog_version',
