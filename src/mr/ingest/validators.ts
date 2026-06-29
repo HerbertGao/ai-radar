@@ -19,6 +19,7 @@
  */
 import { z } from 'zod';
 import {
+  isOfficialConfidence,
   mrClientTypeSchema,
   mrCurrencySchema,
   mrFetchStrategySchema,
@@ -32,6 +33,15 @@ import {
  * 取值集 + 价格币种同生同灭 refine，design D6）。直接复用、不重造（避免 refine 漂移）。
  */
 export const mrPlanWriteValidator = mrPlanWriteSchema;
+
+/**
+ * 共享 source_url 非空校验（5c review）——快照所读事实表（plan/limit/client/model junction/source）的
+ * `source_url` 列 DB NOT NULL 但允许空串；空串提交后快照 build 的 DTO `.parse`（`z.string().min(1)`）会拒 →
+ * fail-closed（冷启动 503 / 旧快照不更新）。各 `upsert*` 录入发 SQL **前**过此闸，使空串在写侧即被拒。
+ */
+export const mrSourceUrlSchema = z
+  .string()
+  .refine((s) => s.trim().length > 0, 'source_url 不可为空（不可纯空白）');
 
 /**
  * `upsertModel` 写校验器（design D3）。`mr_models` 唯一键 `UNIQUE(vendor_id, family, version)` 大小写敏感，
@@ -85,8 +95,17 @@ export const mrSourceWriteSchema = z.object({
  * 改价路径写校验器（design D1/D4）。`recordPriceChange` 写 `mr_price_history` 前必校验 provenance 有限值列：
  * `source_confidence`（枚举）+ `currency`（ISO 4217 枚举，含 5b 扩入的 `EUR`）。
  * new_value/old_value 数值非有限值集，留 Group B 改价逻辑。
+ *
+ * **confidence-must-be-official（5c，design D4）**：`mr_price_history` 行恒携带非 NULL `new_value`，故写价 provenance
+ * 必 ∈ 已核官方集合（official_pricing/official_doc）。非官方 confidence（needs_login_recheck/official_community/
+ * media_report）在发 SQL 前被拒——与 `mrPlanWriteSchema` 的 confidence↔price 绑定双层兜，未核价无法进 history/current。
  */
-export const mrPriceHistoryWriteSchema = z.object({
-  currency: mrCurrencySchema,
-  sourceConfidence: mrSourceConfidenceSchema,
-});
+export const mrPriceHistoryWriteSchema = z
+  .object({
+    currency: mrCurrencySchema,
+    sourceConfidence: mrSourceConfidenceSchema,
+  })
+  .refine(
+    (v) => isOfficialConfidence(v.sourceConfidence),
+    'recordPriceChange 写价须官方 provenance（official_pricing/official_doc）；非官方 confidence 不得携带价格',
+  );

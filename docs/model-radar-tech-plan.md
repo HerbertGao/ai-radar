@@ -99,6 +99,7 @@ DB 只在「写入」和「重建快照」时被碰；所有读全部命中**一
 
 - 数据集极小（几十到低百个 plan）→ 整个目录就是个几十~几百 KB 的 JSON。
 - 快照存 **Redis**（键 `mr:snapshot`，带 `version`/ETag）+ 进程内内存缓存一份。
+  > **5c 修正（`add-model-radar-compare-api` D8）**：5c **唯一公开 `version`/ETag 源 = 快照内容 canonical 哈希**（既排序对象键、也固定数组/行序），随数据变更/staleness 阈值穿越失效；**不**用 `mr_catalog_version` bump 作公开 version（会带来每周期/无变化也 bump 的过度失效）。5c 进程内缓存先行，Redis/CDN/pub-sub 写出随 5d 接线。
 - 比价页/检索/compare 的过滤排序：**直接在快照上做**（小到可整包发给浏览器客户端过滤，或服务端在内存对象上过滤）。
 - 规范化 `mr_*` 表只是 SOT，**只在写入和重建快照时被读**，永不进请求热路径。
 
@@ -108,11 +109,14 @@ DB 只在「写入」和「重建快照」时被碰；所有读全部命中**一
 
 ## Q5. 新数据如何及时更新：写触发重建，快照即时翻版
 
-写路径（人工录入保存 / 抓取 diff 被人确认后改值）→ 同一事务里 bump `mr_catalog_version` → 投递一个 `mr-snapshot-rebuild` job → 从 `mr_*` 表全量重建去规范化 JSON → 写回 Redis + bump 版本/ETag + 刷进程内缓存（经 Redis pub/sub 通知各实例）。
+写路径（人工录入保存 / 抓取 diff 被人确认后改值）→ 投递一个 `mr-snapshot-rebuild` job → 从 `mr_*` 表全量重建去规范化 JSON → **由内容哈希派生 version/ETag** + 刷进程内缓存（5d 再接 Redis 写回 + pub/sub 通知各实例）。
+
+> **5c 修正**：上一行原写「同一事务里 bump `mr_catalog_version`」——5c **不采用** catalog-version bump 作公开 version（见 Q4 注 + `add-model-radar-compare-api` D8），公开 version/ETag 唯一来自快照内容哈希；`mr_catalog_version` 在 5c 不写不读不服务、留未来/内部。rebuild 钩在写编排边界（覆盖 `recordPriceChange` + `upsertPlan` 委托改价两入口、最外层事务提交后触发），保鲜回路 flag/staleness 写由后台周期 rebuild 安全网兜底；**请求路径绝不触发写**。
 
 - **重建是全量、不做增量失效**：数据集小，整建一次是毫秒级。ponytail：不写「按字段精准失效」逻辑——那是给大数据集准备的复杂度，这里 YAGNI。
 - **时效**：写到读可见是「秒级」（重建 + 缓存刷新），对定价目录完全够。
 - **`last_checked` / 待复核 是快照里的字段**：直接渲染成「🟢 今日核对 / 🟡 N 天前 / 🔴 待复核」陈旧徽标——把「我们对这条有多新/多确定」诚实暴露给用户，而不是假装全是最新。
+  > **5c 修正**：5c 服务表征（=ETag 哈希内容）**只暴露离散 `stale: boolean`**（🟢/🔴），**不暴露 raw 秒级 `last_checked`、也不暴露 plan 级聚合 `lastCheckedDate`**——这是为守「内容哈希无变更则稳定（不过度失效）+ 跨 staleness 阈值才翻转」。**「🟡 N 天前」per-fact age 徽标延后 5d**：5d 需要时由 builder 已读的 **per-fact `last_checked` 按 per-fact 行重暴露**（per-fact 无聚合歧义），plan 级聚合 date 本期有意丢弃。此为显式 5d 延后、非永久丢失。
 - **一致性权衡**：快照最终一致（秒级窗口），单写者（策展）无写写竞争，足够。
 
 ---

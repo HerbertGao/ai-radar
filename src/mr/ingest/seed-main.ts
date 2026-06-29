@@ -10,6 +10,7 @@
  * 退出码：完成 → 0；抛错 → 1。日志走 stderr，结构化结果（artifact）走 stdout。
  */
 import { runSeed } from './seed.js';
+import { runSnapshotRebuild } from '../snapshot/rebuild.js';
 
 async function main(): Promise<void> {
   console.error(
@@ -21,6 +22,15 @@ async function main(): Promise<void> {
   console.error(
     `[mr-seed] 完成：vendor ${res.vendors}、plan ${res.plans}、limit ${res.limits}、` +
       `model兼容 ${res.models}、client兼容 ${res.clients}、source ${res.sources}、定位边 ${res.planSources}。`,
+  );
+  // 策展脚本末尾触发快照 rebuild（add-model-radar-compare-api D8）：结构性录入事实写经脚本末尾刷 ETag。
+  // 一次性进程内 rebuild 在脚本退出后即弃（5d 接跨进程失效），此处亦作 seed 后快照可构建的烟雾校验。
+  // never-throws：rebuild 失败不让 seed 退出码翻红（fail-closed 旧快照保留）。
+  const rebuild = await runSnapshotRebuild();
+  console.error(
+    rebuild.ok
+      ? `[mr-seed] 快照 rebuild：version=${rebuild.version} plan=${rebuild.planCount}。`
+      : `[mr-seed] 快照 rebuild 失败（不影响 seed 结果）：${rebuild.error}`,
   );
 }
 

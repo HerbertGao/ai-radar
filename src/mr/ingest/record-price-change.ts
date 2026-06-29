@@ -33,9 +33,11 @@
  */
 import { eq, sql, type SQL } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
+import { mrPriceAmountSchema } from '../../db/mr-schema.zod.js';
 import { mrPlans, mrPriceHistory } from '../../db/schema.js';
-import { mrPriceHistoryWriteSchema } from './validators.js';
+import { mrPriceHistoryWriteSchema, mrSourceUrlSchema } from './validators.js';
 import { setReviewFlag } from '../write/flag.js';
+import { runSnapshotRebuild } from '../snapshot/rebuild.js';
 
 /** db 句柄类型（drizzle 实例）。 */
 type DbLike = typeof defaultDb;
@@ -89,6 +91,10 @@ export async function _recordPriceChangeTx(
     currency: input.currency,
     sourceConfidence: input.provenance.sourceConfidence,
   });
+  // 金额闸（5c review）：newValue 恒非 null，须有限/≥0/量级<1e10/小数位≤2（贴合 numeric(12,2)），防 -1/NaN 落库成 cheapest。
+  mrPriceAmountSchema.parse(input.newValue);
+  // source_url 非空闸（5c review）：本入口刷 plan.source_url（入快照），空串致快照 fail-closed。
+  mrSourceUrlSchema.parse(input.provenance.sourceUrl);
 
   // ① 锁行取 old_value（plan 不存在报错——建行是 upsertPlan 职责）。
   const locked = await tx
@@ -212,5 +218,11 @@ export async function recordPriceChange(
   input: PriceChangeInput,
   dbh: DbLike = defaultDb,
 ): Promise<RecordPriceChangeOutcome> {
-  return dbh.transaction((tx) => _recordPriceChangeTx(tx, input));
+  const outcome = await dbh.transaction((tx) => _recordPriceChangeTx(tx, input));
+  // 提交后耦合快照 rebuild（add-model-radar-compare-api D8）：在**最外层事务提交后**触发（提交前重建读不到
+  // 未提交价），覆盖**全部 success outcome**（recompute 必跑；ETag 仅在服务表征真变时变——appended/provenance
+  // 变 → 变，纯 noop-same-tuple 仅推 raw last_checked → 服务表征不变、ETag 可不变）。
+  // runSnapshotRebuild never-throws（fail-closed 旧快照保留）→ 改价结果不受 rebuild 失败影响。
+  await runSnapshotRebuild({ dbh });
+  return outcome;
 }
