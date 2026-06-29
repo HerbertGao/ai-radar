@@ -49,16 +49,23 @@ afterEach(() => {
 describe('4.5 生命周期：优雅关闭清 interval + quit subscriber', () => {
   it('stop() 调 clearInterval（timer 不再触发 rebuild）+ subscriber quit 被调 + quit reject 被 catch', async () => {
     const clearSpy = vi.spyOn(globalThis, 'clearInterval');
+    // stop() 内 quit reject 由 .catch() 吞掉时会 console.error；stub 它（避免测试噪声）并断言确有记日志。
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     // subscriber.quit reject → 须被 stop() 的 .catch() 吞掉、不成 unhandledRejection。
     const failingQuit = vi.fn(async () => {
       throw new Error('redis 挂时 quit reject');
     });
     createSubSpy.mockReturnValueOnce({ quit: failingQuit });
 
-    const handle = startSnapshotBackgroundRefresh(1000);
-    await expect(handle.stop()).resolves.toBeUndefined(); // quit reject 被 catch、stop 不抛
-    expect(failingQuit).toHaveBeenCalledTimes(1);
-    expect(clearSpy).toHaveBeenCalled();
+    try {
+      const handle = startSnapshotBackgroundRefresh(1000);
+      await expect(handle.stop()).resolves.toBeUndefined(); // quit reject 被 catch、stop 不抛
+      expect(errorSpy).toHaveBeenCalled(); // quit 失败确被记日志（不静默吞）
+      expect(failingQuit).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
 
     // interval 已清：再推进时间也不触发周期 rebuild（句柄不泄漏）。
     rebuildSpy.mockClear();

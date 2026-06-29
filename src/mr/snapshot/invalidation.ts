@@ -81,6 +81,17 @@ export function createSnapshotInvalidationSubscriber(
     console.error('[mr-snapshot] subscribe 失败（已挂起至连上，随后随 ioredis 重连自动重订阅）:', err);
   });
   return {
-    quit: () => client.quit().then(() => undefined),
+    // best-effort 优雅 quit；但 quit() 是普通 Redis 命令，subscriber 处于 reconnecting/offline 时它会排进
+    // offline queue、需连上才能发 → 可能挂起（ioredis issue #2025/#1561）。故 race 一个 unref 的短超时后强制
+    // disconnect()（本地立即拆 socket + 清重连定时器），使 stop() 自有界、不单靠调用方 process.exit 兜底（design D4）。
+    quit: async () => {
+      await Promise.race([
+        client.quit().catch(() => undefined),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 1000).unref();
+        }),
+      ]);
+      client.disconnect();
+    },
   };
 }

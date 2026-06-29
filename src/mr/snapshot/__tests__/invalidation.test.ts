@@ -94,6 +94,8 @@ describe('4.1 subscriber 收消息 → onInvalidate', () => {
 
     await sub.quit();
     expect(inst.quit).toHaveBeenCalledTimes(1);
+    // quit 后强制 disconnect 兜底（quit 在 reconnecting/offline 下可能挂起 → race 超时后拆本地连接）。
+    expect(inst.disconnect).toHaveBeenCalled();
   });
 });
 

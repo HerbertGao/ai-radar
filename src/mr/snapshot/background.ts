@@ -11,10 +11,19 @@ import { env } from '../../config/env.js';
 import { createSnapshotInvalidationSubscriber } from './invalidation.js';
 import { invalidateModelRadarSnapshot, rebuildModelRadarSnapshot } from './cache.js';
 
+/** 后台刷新句柄；`stop()` 清周期 rebuild 定时器 + best-effort 关 subscriber（优雅关闭时调，design D4）。 */
 export interface SnapshotBackgroundHandle {
   stop(): Promise<void>;
 }
 
+/**
+ * 启动服务进程后台刷新：建 subscriber（收跨进程失效信号 → invalidate 进程内缓存）+ 周期 rebuild 定时器
+ * （调**非 publish** 的 `rebuildModelRadarSnapshot`，避免每 tick 自 publish→自订阅 thrash，见 design D2）。
+ * 返回 `stop()`：`clearInterval` + best-effort `quit()`，供 `src/index.ts` 优雅关闭调用。
+ *
+ * @param intervalMs 周期 rebuild 间隔（毫秒），默认 `env.MR_SNAPSHOT_REBUILD_INTERVAL_MS`。
+ * @returns 后台刷新句柄（含 `stop()`）。
+ */
 export function startSnapshotBackgroundRefresh(
   intervalMs: number = env.MR_SNAPSHOT_REBUILD_INTERVAL_MS,
 ): SnapshotBackgroundHandle {

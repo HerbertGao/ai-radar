@@ -373,24 +373,26 @@ describeIfDb('4.8 提交后才 publish（B3，publish 不在事务回调内）',
     );
     expect(o1.outcome).toBe('appended');
 
-    // ② 同 changed_at 异价 → ON CONFLICT DO NOTHING → 元组异 → history-conflict + 同事务内 setReviewFlag。
-    const o2 = await db!.transaction((tx) =>
-      _recordPriceChangeTx(tx, { planId, newValue: '99.00', currency: 'USD', provenance: prov }, FIXED),
-    );
-    expect(o2.outcome).toBe('history-conflict');
+    try {
+      // ② 同 changed_at 异价 → ON CONFLICT DO NOTHING → 元组异 → history-conflict + 同事务内 setReviewFlag。
+      const o2 = await db!.transaction((tx) =>
+        _recordPriceChangeTx(tx, { planId, newValue: '99.00', currency: 'USD', provenance: prov }, FIXED),
+      );
+      expect(o2.outcome).toBe('history-conflict');
 
-    // setReviewFlag 确在事务内写了 pending 标。
-    const flags = await db!
-      .select({ status: schema.mrReviewFlag.status })
-      .from(schema.mrReviewFlag)
-      .where(eq(schema.mrReviewFlag.targetId, planId));
-    expect(flags.some((f) => f.status === 'pending')).toBe(true);
+      // setReviewFlag 确在事务内写了 pending 标。
+      const flags = await db!
+        .select({ status: schema.mrReviewFlag.status })
+        .from(schema.mrReviewFlag)
+        .where(eq(schema.mrReviewFlag.targetId, planId));
+      expect(flags.some((f) => f.status === 'pending')).toBe(true);
 
-    // 关键（B3）：publish 只活在 runSnapshotRebuild（最外层提交后），_recordPriceChangeTx 路径绝不触发 publish。
-    expect(publishSpy).not.toHaveBeenCalled();
-
-    // 清理：history-conflict flag 的 reason 非 PREFIX 前缀，cleanup 不覆盖，手动删。
-    await db!.delete(schema.mrReviewFlag).where(eq(schema.mrReviewFlag.targetId, planId));
+      // 关键（B3）：publish 只活在 runSnapshotRebuild（最外层提交后），_recordPriceChangeTx 路径绝不触发 publish。
+      expect(publishSpy).not.toHaveBeenCalled();
+    } finally {
+      // 清理：history-conflict flag 的 reason 非 PREFIX 前缀，cleanup 不覆盖，手动删（前置断言失败也须跑，免泄漏到后续用例）。
+      await db!.delete(schema.mrReviewFlag).where(eq(schema.mrReviewFlag.targetId, planId));
+    }
   });
 
   it('公开 recordPriceChange：publish 只在最外层事务提交后发出一次（publish 读到已提交新价）', async () => {
