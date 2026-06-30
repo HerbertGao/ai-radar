@@ -150,6 +150,25 @@ describeIfDb('7.6 陈旧度', () => {
     expect(r[0]!.reason).toContain('周期价行陈旧');
   });
 
+  it('孤儿 period price 不应再给不存在的 plan 打标', async () => {
+    const vendorId = await makeVendor('orphan-period');
+    const planId = await makePlan(vendorId, 'orphan-period', NOW);
+    await db!.insert(schema.mrPlanPrices).values({
+      planId,
+      billingPeriod: 'annual',
+      price: '120.00',
+      currency: 'USD',
+      sourceUrl: `${PREFIX}src-orphan-period`,
+      lastChecked: OLD,
+      sourceConfidence: 'official_pricing',
+    });
+    await db!.delete(schema.mrPlans).where(eq(schema.mrPlans.id, planId));
+
+    await runStaleness(db!, { thresholdDays: 30 });
+    const r = await flagRows(planId);
+    expect(r).toHaveLength(0);
+  });
+
   it('source last_checked NULL 也进复核', async () => {
     const vendorId = await makeVendor('null-src');
     const [src] = await db!

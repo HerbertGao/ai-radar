@@ -17,7 +17,7 @@
  * 多 plan/source 打标 per-target 独立（setReviewFlag 单语句 CAS 自治、幂等收敛单行）；同一 run 内同 plan 经
  * 多个陈旧 child 命中只首次打标（本地去重，省重复 CAS）。
  */
-import { lt, or, isNull } from 'drizzle-orm';
+import { eq, lt, or, isNull } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
 import {
   mrPlanClients,
@@ -126,6 +126,7 @@ export async function runStaleness(
   const stalePeriodPrices = await dbh
     .select({ planId: mrPlanPrices.planId })
     .from(mrPlanPrices)
+    .innerJoin(mrPlans, eq(mrPlans.id, mrPlanPrices.planId))
     .where(stale(mrPlanPrices.lastChecked));
   for (const p of stalePeriodPrices) flagPlan(p.planId, REASON_PERIOD_PRICE);
 

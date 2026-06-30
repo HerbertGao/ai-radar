@@ -17,8 +17,6 @@
  * （非漏接线）。本变更的授权 lifecycle/周期价写入口会在提交后触发 snapshot rebuild/invalidation。
  */
 import { db as defaultDb } from '../../db/index.js';
-import { and, eq } from 'drizzle-orm';
-import { mrPlans } from '../../db/schema.js';
 import {
   setPlanAvailability,
   upsertModel,
@@ -93,17 +91,6 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
     // 套餐 + child 事实行。plan id 收集供定位边录入。
     const planIds: string[] = [];
     for (const p of v.plans) {
-      const existingPlan = (
-        await dbh
-          .select({ id: mrPlans.id, availability: mrPlans.availability })
-          .from(mrPlans)
-          .where(and(eq(mrPlans.vendorId, vendor.id), eq(mrPlans.name, p.name)))
-          .limit(1)
-      )[0];
-      if (existingPlan && existingPlan.availability !== p.availability) {
-        await setPlanAvailability(dbh, existingPlan.id, p.availability);
-      }
-
       const plan = await upsertPlan(dbh, {
         vendorId: vendor.id,
         name: p.name,
@@ -118,6 +105,14 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
       // 幂等重跑分支：inserted/noop/conflict/price-delegated 均带 id；noop-race（无 id）极罕见，跳过 child。
       const planId = 'id' in plan ? plan.id : undefined;
       if (!planId) continue;
+
+      // 仅 availability 冲突允许继续做生命周期修正；category/source/price 冲突都代表该 parent 不是可继续灌 child 的
+      // 目标记录，直接跳过后续 child 写，避免把事实挂到错误 plan 上。
+      if (plan.outcome === 'conflict') {
+        if (plan.field !== 'availability') continue;
+        await setPlanAvailability(dbh, planId, p.availability);
+      }
+
       planIds.push(planId);
 
       // 已停售 plan：打 mr_review_flag「已停售」（价保持 NULL、不计入 cheapest），不留作普通待核

@@ -53,7 +53,12 @@ function makeStub(opts: {
           else if (table === schema.mrPlanModels) rows = opts.staleModels;
           else if (table === schema.mrPlanPrices) rows = opts.stalePeriodPrices;
           else throw new Error('unexpected table in stub.select');
-          return { where: async () => rows };
+          return {
+            innerJoin: () => ({
+              where: async () => rows,
+            }),
+            where: async () => rows,
+          };
         },
       };
     },

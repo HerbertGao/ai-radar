@@ -261,6 +261,13 @@ describeIfDb('7.1 录入 Zod 闸 + identity/fact 写契约', () => {
     });
     expect(b.outcome).toBe('conflict');
     expect((b as { field: string }).field).toBe('availability');
+    const flags = await db!
+      .select()
+      .from(schema.mrReviewFlag)
+      .where(eq(schema.mrReviewFlag.targetId, planId));
+    expect(flags).toHaveLength(1);
+    expect(flags[0]!.status).toBe('pending');
+    expect(flags[0]!.reason).toContain('availability');
 
     let planRows = await db!
       .select()
@@ -333,6 +340,7 @@ describeIfDb('7.1 录入 Zod 闸 + identity/fact 写契约', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.sourceUrl).toBe(`${PREFIX}src-period-b`);
     expect(rows[0]!.sourceConfidence).toBe('official_doc');
+    expect(rows[0]!.lastChecked.toISOString()).toBe('2026-06-02T00:00:00.000Z');
 
     const conflict = await upsertPlanPeriodPrice(db!, {
       planId,

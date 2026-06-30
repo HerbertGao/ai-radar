@@ -163,7 +163,13 @@ describe('5.2 版本 = 服务表征内容哈希（纯函数）', () => {
     const priceChanged = makeSnapshot([
       makePlan({
         currency: 'CNY',
-        periodPrices: [{ ...period, price: '456.00', effectiveMonthly: 38 }],
+        periodPrices: [{ ...period, price: '456.00' }],
+      }),
+    ]);
+    const effectiveMonthlyChanged = makeSnapshot([
+      makePlan({
+        currency: 'CNY',
+        periodPrices: [{ ...period, effectiveMonthly: 38 }],
       }),
     ]);
     const provenanceChanged = makeSnapshot([
@@ -189,6 +195,7 @@ describe('5.2 版本 = 服务表征内容哈希（纯函数）', () => {
       }),
     ]);
     expect(computeSnapshotVersion(priceChanged)).not.toBe(computeSnapshotVersion(base));
+    expect(computeSnapshotVersion(effectiveMonthlyChanged)).not.toBe(computeSnapshotVersion(base));
     expect(computeSnapshotVersion(provenanceChanged)).not.toBe(computeSnapshotVersion(base));
     expect(computeSnapshotVersion(dateChanged)).not.toBe(computeSnapshotVersion(base));
   });
