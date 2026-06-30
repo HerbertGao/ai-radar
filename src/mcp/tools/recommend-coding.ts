@@ -40,7 +40,7 @@ import type { McpToolDescriptor } from './types.js';
 const inputSchema = {
   model: z
     .string()
-    .refine((s) => s.includes(':'), 'model 须为「family:version」，冒号必带')
+    .refine((s) => /^[^:]+:.+/.test(s), 'model 须为「family:version」，family/version 均非空')
     .optional()
     .describe('模型「家族:版本」，如 "glm:4.6"（冒号必带、版本精确匹配）；省略=不限模型'),
   tool: z

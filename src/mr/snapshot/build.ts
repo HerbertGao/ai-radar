@@ -101,6 +101,10 @@ export async function buildModelRadarSnapshot(
   now: Date,
   thresholdDays: number,
 ): Promise<ModelRadarSnapshot> {
+  // fail-closed：thresholdDays 现由 caller 供（env-clean 后无默认），非正整数会静默歪曲陈旧截断 → 抛错。
+  if (!Number.isInteger(thresholdDays) || thresholdDays <= 0) {
+    throw new Error(`buildModelRadarSnapshot: thresholdDays 须为正整数天数，收到 ${thresholdDays}`);
+  }
   const threshold = new Date(now.getTime() - thresholdDays * DAY_MS);
 
   // 单事务 REPEATABLE READ + read only：point-in-time 一致读，禁行锁。各表 ORDER BY id 固定行序。

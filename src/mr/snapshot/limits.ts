@@ -87,6 +87,7 @@ export function fitsWindow(
   demandedRounds: number,
   tokensPerRound: number,
 ): FitsWindow {
+  if (!Number.isFinite(demandedRounds) || demandedRounds < 0) return 'unknown'; // 非有限/负 → fail-closed，不据坏值假装 fits
   if (limits.length === 0) return 'unknown';
   let sawUnknown = false;
   for (const limit of limits) {

@@ -177,10 +177,13 @@ describe('3.1 inputSchema 边界校验（SDK 自动校验、handler 前拦非法
   // 直接验 inputSchema raw shape——SDK 据此自校验，故 family:version 冒号/非空在 handler 前即拦下。
   const schema = z.object(recommendCodingTool.inputSchema);
 
-  it('model 须 family:version：拒绝无冒号/空串、接受 glm:4.6、允许省略（FIX 2a 边界）', () => {
+  it('model 须 family:version：拒绝无冒号/空串/空 family/空 version、接受 glm:4.6、允许省略（FIX 2a 边界）', () => {
     expect(schema.safeParse({ model: 'glm' }).success).toBe(false); // 无冒号 → SDK 拒（不再下沉误标 snapshot unavailable）
     expect(schema.safeParse({ model: '' }).success).toBe(false); // 空串 → 拒
+    expect(schema.safeParse({ model: ':4.6' }).success).toBe(false); // 空 family → 拒
+    expect(schema.safeParse({ model: 'glm:' }).success).toBe(false); // 空 version → 拒
     expect(schema.safeParse({ model: 'glm:4.6' }).success).toBe(true); // 合法
+    expect(schema.safeParse({ model: 'glm:4.6:beta' }).success).toBe(true); // version 可含冒号（首冒号后非空即可）
     expect(schema.safeParse({}).success).toBe(true); // 省略 → optional 短路、合法
   });
 

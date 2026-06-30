@@ -88,6 +88,10 @@ describe('4.1 多限额取最紧 + 空限额诚实', () => {
   it('空 limits[] → unknown（聚合恒等元 = unknown，绝非 vacuous fits）', () => {
     expect(fitsWindow([], 10, PER_ROUND)).toBe('unknown');
   });
+
+  it('负 demandedRounds → unknown（非有限/负 fail-closed，不据坏值假装 fits）', () => {
+    expect(fitsWindow([mkLimit('monthly_tokens', TOKENS)], -1, PER_ROUND)).toBe('unknown');
+  });
 });
 
 describe('4.1 下沉后 estimateRounds 与原 render 行为等价（同输入同输出）', () => {

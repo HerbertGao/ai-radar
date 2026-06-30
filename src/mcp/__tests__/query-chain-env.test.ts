@@ -73,15 +73,15 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
         // recommend-coding.ts 现已存在；try/catch 仅留作文件缺失安全网，不再宽容跳过该文件。
         continue;
       }
-      // 取所有以 import 开头的整行（含跨行的简单近似：按行）。
-      const importLines = src
-        .split('\n')
-        .filter((l) => /^\s*import\b/.test(l));
+      // 抓每条完整 `import … from '<spec>'` 语句（多行感知、对齐下方 build.ts 守卫）——
+      // 按行过滤会让跨多行的顶层 forbidden import 漏网，故全语句提取。
+      // `^...gm` 锚定行首：只取顶层（列 0）import，跳过 JSDoc 里 ` * import('…')` 之类注释提及
+      //（如 push-event-now.ts 注释含动态 import dispatcher 字样），避免误判。
+      const importStatements = src.match(/^import\b[\s\S]*?from\s+['"][^'"]+['"]/gm) ?? [];
       for (const spec of forbidden) {
-        const offending = importLines.filter((l) => l.includes(spec));
-        for (const line of offending) {
+        for (const stmt of importStatements.filter((s) => s.includes(spec))) {
           // 放行 `import type` 仅类型导入（编译期擦除、不触发运行时 parseEnv）。
-          expect(line.trimStart().startsWith('import type'), `${f}: ${line.trim()}`).toBe(true);
+          expect(stmt.trimStart().startsWith('import type'), `${f}: ${stmt.replace(/\s+/g, ' ').trim()}`).toBe(true);
         }
       }
     }
@@ -89,9 +89,9 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
     // build.ts 前向脆弱性守卫：顶层 import db/index.js 须 `import type`、且不得顶层 import config/env.js
     //（把 `import type`→`import` 改回会编译通过但破坏 env-clean，此处静态拦住）。
     const buildSrc = await readFile(snapshotBuild, 'utf8');
-    // 多行感知（非按行）：抓每条完整 `import … from '<spec>'` 语句，使跨行 value import 不漏网
-    //（懒量词在每个 `from '…'` 处收口，单行/多行皆正确切分）。
-    const buildImportStatements = buildSrc.match(/import\b[\s\S]*?from\s+['"][^'"]+['"]/g) ?? [];
+    // 多行感知（非按行）：抓每条完整 `import … from '<spec>'` 语句，使跨行 value import 不漏网。
+    // `^…/gm` 行首锚定：跨行 import 仍整条命中，且不误吞注释里的 `import('…')` 字样（与 8-文件守卫同口径）。
+    const buildImportStatements = buildSrc.match(/^import\b[\s\S]*?from\s+['"][^'"]+['"]/gm) ?? [];
     // db/index.js 须以 `import type`（块式）引入——运行期擦除；value import（含多行）即破坏 env-clean。
     for (const stmt of buildImportStatements.filter((s) => s.includes('../../db/index.js'))) {
       expect(stmt.startsWith('import type'), `build.ts db/index 须 import type：${stmt}`).toBe(true);

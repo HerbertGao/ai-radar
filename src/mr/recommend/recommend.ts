@@ -110,6 +110,12 @@ function classify(
   }
 
   // ② 已核 + (超预算 同币种内 ∨ exceeds) → not_recommended。
+  // 防御（money-path fail-closed）：已标 known 但缺价/币种（快照不完整）→ 按未核处理，
+  // 绝不让 Number(null)===0 造出免费幻影候选。
+  if (plan.currentPrice === null || plan.currency === null) {
+    reasons.push({ kind: 'unreviewed', detail: '已标已核但缺价/币种（快照不完整），按未核处理' });
+    return { fw, base: 'insufficient_data', reasons };
+  }
   const price = Number(plan.currentPrice);
   reasons.push({ kind: 'monthly_cost', detail: `月成本 ${price} ${plan.currency}` });
   const overBudget = input.maxMonthlyPrice !== undefined && price > input.maxMonthlyPrice;
