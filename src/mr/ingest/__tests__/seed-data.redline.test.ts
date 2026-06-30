@@ -62,7 +62,8 @@ describe('1.3 seed fixture 数据红线', () => {
 
   it('桶2 五家结构性录入：结构齐全 + 5d-C 在售录 CNY 官方真月价（同档可比 ≥2）/ 停售留占位 + 停售 flag', () => {
     const bucket2 = ['bailian', 'qianfan', 'tencent-hunyuan', 'volcengine-ark', 'xfyun-spark'];
-    let knownCny = 0;
+    const inSale = ['bailian', 'qianfan', 'volcengine-ark', 'xfyun-spark']; // 5d-C 在售四家（腾讯停售除外）
+    const pricedVendors = new Set<string>();
     for (const name of bucket2) {
       const v = SEED_VENDORS.find((x) => x.normalizedName === name);
       expect(v, `桶2 vendor ${name} 缺失`).toBeDefined();
@@ -73,19 +74,23 @@ describe('1.3 seed fixture 数据红线', () => {
         expect(p.models.length).toBeGreaterThan(0);
         expect(p.clients.length).toBeGreaterThan(0);
         expect(p.limits.length).toBeGreaterThan(0);
-        // 5d-C 策展三态：在售 → CNY 官方真月价（confidence 官方 + 币种 CNY）；占位 → NULL + needs_login_recheck（同生同灭）。
+        // 5d-C 策展三态：在售 → CNY 官方真月价（confidence 官方 + 币种 CNY）；占位 → 价/币种皆 NULL + needs_login_recheck（同生同灭）。
         if (p.currentPrice !== null) {
           expect(isOfficialConfidence(p.sourceConfidence)).toBe(true);
           expect(p.currency).toBe('CNY');
-          knownCny += 1;
+          pricedVendors.add(name);
         } else {
           expect(p.sourceConfidence).toBe('needs_login_recheck');
+          expect(p.currency).toBeNull(); // 同生同灭：占位分支也须断言 currency NULL（CR）
         }
       }
     }
-    // 退出锚（5d-C）：桶2 同档已凑到可比 ≥2 个 CNY 官方真月价（不再「0 已核价」）。
-    expect(knownCny).toBeGreaterThanOrEqual(2);
-    // spec「已停售 plan 不留作普通待核」：腾讯混元（停售）占位必带停售 review flag，不留普通待核。
+    // 退出锚（5d-C 契约冻结）：**在售四家各录到 CNY 真月价**（非仅 ≥2——防两家回退 NULL 漏检，CR）。
+    for (const name of inSale) {
+      expect(pricedVendors.has(name), `5d-C 在售 ${name} 应已录 CNY 官方真月价`).toBe(true);
+    }
+    // spec「已停售 plan 不留作普通待核」：腾讯混元停售占位价 NULL + 必带停售 review flag、不计入已核。
+    expect(pricedVendors.has('tencent-hunyuan')).toBe(false);
     const tencent = SEED_VENDORS.find((x) => x.normalizedName === 'tencent-hunyuan')!;
     expect(tencent.plans.every((p) => p.currentPrice === null && Boolean(p.reviewFlagReason))).toBe(true);
   });

@@ -14,7 +14,7 @@
  *
  * builder 全局读（读全库 mr_*），故按 seed vendorId 隔离断言、不假设库内只有 seed 行。
  * 不触网（mock invalidation publisher，仿 bucket2-curation：守「测试绝不连真 Redis」并免 publish 阻塞）；
- * 缺 DATABASE_URL 自动跳过；afterAll 按 SEED_VENDORS 反查清理自造行。
+ * 缺 DATABASE_URL **或非本地 DB** 自动跳过（fail-closed：cleanup 销毁性删 SEED_VENDORS 行，不对非一次性 DB 跑）；afterAll 按 SEED_VENDORS 反查清理自造行。
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
@@ -24,6 +24,11 @@ import * as schema from '../../../db/schema.js';
 import type { SnapshotPlan, SnapshotPlanGroup } from '../dto.js';
 
 const databaseUrl = process.env.DATABASE_URL;
+
+// fail-closed（CR）：本套件 cleanup 按 SEED_VENDORS normalizedName **销毁性删行**，仅对**本地/一次性** DB 安全；
+// DATABASE_URL 指向远程/生产 DB 会误删共享厂商行（不止本套件自造行）。故仅当 host 为 localhost/127.0.0.1/::1
+// 才跑（CI postgres service + 本地 dev 均本地）；指向非本地 DB → 跳过（不对非一次性 DB 跑销毁性 cleanup）。
+const isLocalDb = !!databaseUrl && /@(localhost|127\.0\.0\.1|\[::1\])[:/]/.test(databaseUrl);
 
 process.env.DATABASE_URL ||= 'postgres://u:p@localhost:5432/test';
 process.env.TELEGRAM_BOT_TOKEN ||= 'test-token';
@@ -46,9 +51,9 @@ const { queryModelRadarSnapshot, modelRadarQueryParamsSchema } = await import('.
 const { runSeed } = await import('../../ingest/seed.js');
 const { SEED_VENDORS } = await import('../../ingest/seed-data.js');
 
-const pool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
+const pool = isLocalDb ? new Pool({ connectionString: databaseUrl }) : null;
 const db = pool ? drizzle(pool, { schema }) : null;
-const describeIfDb = databaseUrl ? describe : describe.skip;
+const describeIfDb = isLocalDb ? describe : describe.skip;
 
 const SEED_NORMALIZED_NAMES = SEED_VENDORS.map((v) => v.normalizedName);
 
