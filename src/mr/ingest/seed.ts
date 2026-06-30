@@ -31,7 +31,7 @@ import {
 } from './upsert.js';
 import { SEED_VENDORS } from './seed-data.js';
 // ingest → write 方向允许（结构守卫只禁 scrape/事件消费者 → ingest writers）；upsert.ts 亦如此 import。
-import { setReviewFlag } from '../write/flag.js';
+import { resolveFlag, setReviewFlag } from '../write/flag.js';
 
 /** db 句柄类型（顶层 drizzle 实例），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
@@ -111,6 +111,7 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
       if (plan.outcome === 'conflict') {
         if (plan.field !== 'availability') continue;
         await setPlanAvailability(dbh, planId, p.availability);
+        await resolveFlag(dbh, { targetType: 'plan', targetId: planId });
       }
 
       planIds.push(planId);
