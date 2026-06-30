@@ -8,8 +8,9 @@
  * 录入顺序（引用依赖）：vendor → (model 身份, source 身份) → plan → (limit/model 兼容/client 兼容 child)
  * → 定位边（source ↔ 同 vendor 全部 plan）。
  *
- * **不臆造价格**：fixture 价数无把握处为 `needs_login_recheck` 占位（currentPrice/currency NULL），
- * `upsertPlan` 不触发 recordPriceChange（无真价变），故 seed 只建占位结构，真价靠保鲜回路核实后录入。
+ * **不臆造价格**：fixture 价数无把握处为 `needs_login_recheck` 占位（currentPrice/currency NULL）。5d-C 已为 6 个在售
+ * coding_plan 烘焙 CNY 官方真月价——**首播种**经 `upsertPlan` INSERT 落价；**重播**（行已存）经 `upsertPlan` 检出价变
+ * 委托 `recordPriceChange`（design D2/D4 授权改价入口，非盲覆盖）。停售 plan 经 `reviewFlagReason → setReviewFlag` 打停售 flag。
  *
  * **不 bump catalog version、不投 rebuild**（design D16）。注：**5c 公开 version/ETag = 快照内容哈希**
  * （add-model-radar-compare-api D8），`mr_catalog_version` 在 5c **不写不读不服务**、留未来/内部用途
@@ -27,6 +28,8 @@ import {
   upsertVendor,
 } from './upsert.js';
 import { SEED_VENDORS } from './seed-data.js';
+// ingest → write 方向允许（结构守卫只禁 scrape/事件消费者 → ingest writers）；upsert.ts 亦如此 import。
+import { setReviewFlag } from '../write/flag.js';
 
 /** db 句柄类型（顶层 drizzle 实例），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
@@ -97,6 +100,12 @@ export async function runSeed(dbh: DbLike = defaultDb): Promise<SeedResult> {
       const planId = 'id' in plan ? plan.id : undefined;
       if (!planId) continue;
       planIds.push(planId);
+
+      // 已停售 plan：打 mr_review_flag「已停售」（价保持 NULL、不计入 cheapest），不留作普通待核
+      // （spec「已停售 plan 不留作普通待核」）。CAS 幂等收敛单行，可安全重跑。
+      if (p.reviewFlagReason) {
+        await setReviewFlag(dbh, { targetType: 'plan', targetId: planId }, p.reviewFlagReason);
+      }
 
       for (const l of p.limits) {
         await upsertPlanLimit(dbh, {

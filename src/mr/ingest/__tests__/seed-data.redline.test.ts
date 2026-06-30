@@ -7,7 +7,8 @@
  *   其 source_confidence 必属已核官方集合；反之占位价 plan 必为非官方 confidence。
  *   机械落点 = 每条 seed plan 过共享 `mrPlanWriteValidator`（confidence↔price 绑定，task 1.6）。
  * - MiMo（非 5c 主桶）未核 provenance 保持 `manual` + `needs_login_recheck` 占位（design D6）。
- * - 桶2 五家（百炼/千帆/腾讯混元/火山方舟/讯飞星火）本期 0 已核价（结构性录入即验收）。
+ * - 桶2 五家（百炼/千帆/腾讯混元/火山方舟/讯飞星火）经 **5d-C 人在环策展**：在售四家录 CNY 官方真月价
+ *   （同档可比 ≥2）、腾讯混元停售留 NULL 占位 + 停售 flag（spec「已停售 plan 不留作普通待核」）。
  */
 import { describe, expect, it } from 'vitest';
 import { SEED_VENDORS } from '../seed-data.js';
@@ -59,23 +60,44 @@ describe('1.3 seed fixture 数据红线', () => {
     }
   });
 
-  it('桶2 五家结构性录入：coding_plan 占位齐全、0 已核价（本期允许）', () => {
+  it('桶2 五家结构性录入：结构齐全 + 5d-C 在售录 CNY 官方真月价（同档可比 ≥2）/ 停售留占位 + 停售 flag', () => {
     const bucket2 = ['bailian', 'qianfan', 'tencent-hunyuan', 'volcengine-ark', 'xfyun-spark'];
+    let knownCny = 0;
     for (const name of bucket2) {
       const v = SEED_VENDORS.find((x) => x.normalizedName === name);
       expect(v, `桶2 vendor ${name} 缺失`).toBeDefined();
       expect(v!.plans.length).toBeGreaterThan(0);
       for (const p of v!.plans) {
         expect(p.category).toBe('coding_plan');
-        // 0 已核价：本期一律 NULL 占位。
-        expect(p.currentPrice).toBeNull();
-        expect(p.sourceConfidence).toBe('needs_login_recheck');
         // 结构性录入：model/client/limit 各 ≥1。
         expect(p.models.length).toBeGreaterThan(0);
         expect(p.clients.length).toBeGreaterThan(0);
         expect(p.limits.length).toBeGreaterThan(0);
+        // 5d-C 策展三态：在售 → CNY 官方真月价（confidence 官方 + 币种 CNY）；占位 → NULL + needs_login_recheck（同生同灭）。
+        if (p.currentPrice !== null) {
+          expect(isOfficialConfidence(p.sourceConfidence)).toBe(true);
+          expect(p.currency).toBe('CNY');
+          knownCny += 1;
+        } else {
+          expect(p.sourceConfidence).toBe('needs_login_recheck');
+        }
       }
     }
+    // 退出锚（5d-C）：桶2 同档已凑到可比 ≥2 个 CNY 官方真月价（不再「0 已核价」）。
+    expect(knownCny).toBeGreaterThanOrEqual(2);
+    // spec「已停售 plan 不留作普通待核」：腾讯混元（停售）占位必带停售 review flag，不留普通待核。
+    const tencent = SEED_VENDORS.find((x) => x.normalizedName === 'tencent-hunyuan')!;
+    expect(tencent.plans.every((p) => p.currentPrice === null && Boolean(p.reviewFlagReason))).toBe(true);
+  });
+
+  it('seed coding_plan CNY 真价同档最低 = 讯飞星火 ¥19（no-DB 价序回归守卫，CR）', () => {
+    const cnyCoding = allPlans.filter(
+      (p) => p.category === 'coding_plan' && p.currency === 'CNY' && p.currentPrice !== null,
+    );
+    expect(cnyCoding.length).toBeGreaterThanOrEqual(2);
+    const cheapest = cnyCoding.reduce((a, b) => (a.currentPrice! <= b.currentPrice! ? a : b));
+    expect(cheapest.vendor).toBe('xfyun-spark');
+    expect(cheapest.currentPrice).toBe(19);
   });
 
   it('腾讯 coding_plan 与 CodeBuddy(ide_membership) 用不同 normalizedName（task 1.2 vendor 去重键不歧义）', () => {

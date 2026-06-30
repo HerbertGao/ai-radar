@@ -100,6 +100,35 @@ describe('7.2 诚实呈现：徽标分层 + 未核不入最划算 + 桶2 gate', 
   });
 });
 
+describe('5d-C 桶2 真价策展：≥2 真月价转出 cheapest 赢家 + 1 价仍数据不足（task 2.2，合成 fixture）', () => {
+  // 组 A 已策展的 6 个 (coding_plan, CNY) 真月价（讯飞无忧 ¥19 为同档最低）。合成 fixture 镜像真价、不触 DB。
+  const curatedCny = (): ReturnType<typeof known>[] => [
+    known('讯飞星火 Coding Plan 无忧', '19', 'CNY'),
+    known('千帆 Coding Plan Lite', '40', 'CNY'),
+    known('火山方舟 Coding Plan Lite', '40', 'CNY'),
+    known('GLM Coding Plan Lite', '49', 'CNY'),
+    known('GLM Coding Plan Pro', '149', 'CNY'),
+    known('百炼 Coding Plan Pro', '200', 'CNY'),
+  ];
+
+  it('6 个真月价 + 腾讯停售未核 → 最划算转出讯飞无忧 ¥19、腾讯未核不入', async () => {
+    const tencent = unknown('腾讯混元 Coding Plan', { reviewStatus: { pending: true } }); // 停售占位（NULL 价 + 停售待复核）
+    const { html } = await render(provider(snap(...curatedCny(), tencent)));
+    expect(html).toContain('class="badge badge-cheap"'); // 渲出最划算徽标
+    expect(html).toContain('最划算：讯飞星火 Coding Plan'); // ¥19 同档最低赢家
+    expect(html).toContain('另有 1 个未核价未参与'); // 腾讯停售未核不参与
+    expect(html).toContain('待核'); // 腾讯显式占位
+    expect(html).toContain('待复核'); // 腾讯停售 → plan 级待复核徽标（已停售≠普通待核，render 层验证）
+  });
+
+  it('对照：仅 1 个真月价（讯飞 ¥19）→ 仍 render「已核价不足 2」、不评最划算（证 compare-web ≥2 闸生效）', async () => {
+    const { html } = await render(provider(snap(known('讯飞星火 Coding Plan 无忧', '19', 'CNY'))));
+    expect(html).toContain('已核价不足 2');
+    expect(html).not.toContain('class="badge badge-cheap"');
+    expect(html).not.toContain('最划算：'); // 不编造名次
+  });
+});
+
 describe('7.3 XSS：危险 scheme source_url 降级纯文本 + CSP 头', () => {
   it('javascript:/data: source_url → 无可点 <a href>、以纯文本出现、无原始 <script>', async () => {
     const p = known('Xss', '30', 'CNY', {

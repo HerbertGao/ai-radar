@@ -236,3 +236,15 @@ DB 只在「写入」和「重建快照」时被碰；所有读全部命中**一
 ### 最大风险
 
 5d-C（browser/egress 生产 gate + 人工策展）是通往真价的唯一长杆且最难；前端会先以「结构齐全、永远待核」的诚实空壳上线——**若 5d-C 不被优先，管线全铺好但比价核心价值始终落不了地**。
+
+### 决策 5（2026-06-30 更新）：5d-C 拆分——桶2真价策展 与 browser egress 启用正交、egress gate 延后
+
+> 上面「提案分解」把 C 写成 `enable-model-radar-browser-egress-prod-and-curate-bucket2`（egress 启用 + 桶2 策展一体）。实现阶段 6/6 评审后**进一步拆分**，落地提案 `add-model-radar-bucket2-price-curation` 仅做**纯桶2真价人工策展**。
+
+- **策展与 egress 启用正交（决策 3「快/慢解耦」的延续）**：真价进库只走既有**单一授权改价入口** `recordPriceChange`（confidence 必官方 + 金额量级校验），录入后经既有 5d-A rebuild + 跨进程失效**自动**流到只读快照/比价页（零新接线）。这条路径**不依赖** browser-worker 自动抓取——curator 在自己浏览器核对真实定价页即可，故策展不以 egress/browser 启用为前置。
+- **egress gate 因「目标不可正向验证 + 重复 ingestion 既有需求」而延后**：egress 部署封锁 gate 保护的是 browser-worker；本期不开自动抓取、不消费 job，此刻建并「勘验」一个闲置 gate 既无保护对象、又在交付物关键路径之外。且经 6/6 评审判定该 gate 在本目标（Docker Desktop）上**不可正向验证**（无法实跑证明 fail-closed 真的封住 RFC1918/metadata/link-local）；而既有 `model-radar-ingestion`「Playwright 沙箱锁定」需求**已拥有** egress/netns + fail-closed 自检契约，新建一个等价 gate 属**结构性重复**。故 egress 生产启用 + 自动抓取**剥离延后**到真开自动抓取那步——届时 **MODIFY** `model-radar-ingestion`「Playwright 沙箱锁定」补部署机制 + 正向勘验，**即用即验**，而非现在为闲置 gate 空验。
+- ROADMAP 步骤表已据此把原「5d-C」拆成「**5d-C 桶2真价策展（本变更）**」+「**browser egress 生产启用（延后）**」两行。
+
+### Follow-up（后续增强，非本期）：多周期定价
+
+- **多周期定价（月/季/年同时记录 + 给最佳方案）** 是用户提出的后续增强：需改数据模型（加 `billing_period` 维度 / 新 `mr_plan_prices` 表），让同一 plan 并存月/季/年价并由选型顾问算「总持有成本最优周期」。属**独立后续提案**（归 5e 选型顾问，或新 5d-D），**不在本期 curation**——本期 curation 只录**真月付(month-to-month)单价**（仅年/季付者留占位、不÷12 admit），避免年承诺折扣冒充更便宜月价。
