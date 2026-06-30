@@ -16,9 +16,14 @@
  * - **coding_plan 典范**：Z.ai（GLM / bigmodel.cn，桶2 = v1 主桶，走 browser 档）——补满「三桶各 ≥1 例」。
  * - **5c 桶2 多模型 Coding Plan（task 1.4）**：百炼（aliyun）/ 千帆（baidu）/ 腾讯混元（tencent）/ 火山方舟（volcengine）/
  *   讯飞星火（xfyun）——逐家**结构性录入**（vendor + coding_plan plan + source + model/client/limit + provenance）。
- *   本期价格**一律 NULL 占位 + `needs_login_recheck`**（browser 真实勘验为价格核实前置且为后续 gate，本期 0 已核价即验收，
- *   禁填传闻/占位价凑数）。源 `fetch_strategy` 按页面真实性质设：上述 5 家为结构化文档页 → `http`（其域已扩入
- *   `MR_SOURCE_DOMAIN_ALLOWLIST`，见 allowlist.ts，使 `upsertSource → assertUrlAllowed` 放行）；GLM 仍走 `browser`。
+ *   5d-C 人在环策展（tri-state）：**6 个在售 coding_plan plan 录 CNY 官方真月价**（GLM Lite/Pro + 百炼/千帆/火山/讯飞，
+ *   `official_pricing` + 真订阅页 URL，经 `upsertPlan→recordPriceChange` 授权改价入口入库）；其余未核仍 `needs_login_recheck`
+ *   占位（currentPrice/currency NULL，同生同灭）；**腾讯混元停售** → 价保持 NULL + `reviewFlagReason` 打停售 flag，不留普通待核。
+ *   **再播种 caveat**：5d-C 校正了 source_url；`upsertSource` 键 `(vendor_id, source_url)`、`upsertPlan` 键 `(vendor_id, name)`
+ *   均 upsert-only 不删行，故对**已用旧数据播种过的 DB** 增量重播会留 orphan 旧 source / 旧 plan——curation 设定为**干净重播**
+ *   或经 `recordPriceChange` 运行时更新；key 迁移不在本期（out-of-scope follow-up）。
+ *   源 `fetch_strategy` 按页面真实性质设：在售四家结构化文档页 → `http`（其域已扩入 `MR_SOURCE_DOMAIN_ALLOWLIST`，见 allowlist.ts，
+ *   使 `upsertSource → assertUrlAllowed` 放行）、讯飞登录墙真页 → `manual`；GLM 仍走 `browser`。
  *   **腾讯混元** coding_plan 用 `normalizedName='tencent-hunyuan'`，与既有 CodeBuddy（腾讯，ide_membership，`codebuddy`）
  *   **不同 normalizedName**——区分产品、避免 vendor 去重键歧义（task 1.2）。
  *   故 fixture 共 14 个 vendor 条目（8 已核 + Z.ai 典范 + 5c 桶2 五家）。本 fixture 取每桶代表覆盖，扩满全 plan 由策展随核实增补，不臆造。
@@ -76,6 +81,12 @@ interface SeedPlan {
   currency: 'CNY' | 'USD' | 'EUR' | null;
   sourceUrl: string;
   sourceConfidence: SourceConfidence;
+  /**
+   * 若该 plan 已停售（discontinued），填停售原因 → seed 录入后经 setReviewFlag 打 `mr_review_flag`
+   * （reason 记停售）。停售 plan 价保持 NULL、不计入 cheapest，且**不留作普通 needs_login_recheck 待核**
+   * （待核暗示「待定价」会误导用户，spec「已停售 plan 不留作普通待核」）。
+   */
+  reviewFlagReason?: string;
   limits: SeedLimit[];
   models: SeedModel[];
   clients: SeedClient[];
@@ -119,11 +130,11 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'GLM Coding Plan Lite',
         category: 'coding_plan',
-        // 登录墙/活动浮动，具体价无把握 → 占位待核实，不臆造。
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://bigmodel.cn/glm-coding',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核（web-search + 实勘真页）：真月付标准价 ¥49/月（排首月促销、非年付÷12）。
+        currentPrice: 49,
+        currency: 'CNY',
+        sourceUrl: 'https://docs.bigmodel.cn/cn/coding-plan/overview',
+        sourceConfidence: 'official_pricing',
         limits: [
           // 额度类型确定（按请求滚动窗），具体 value 无把握 → null 占位。
           { limitType: 'rolling_5h_requests', value: null, window: '5h' },
@@ -137,10 +148,11 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: 'GLM Coding Plan Pro',
         category: 'coding_plan',
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://bigmodel.cn/glm-coding',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核：真月付标准价 ¥149/月。
+        currentPrice: 149,
+        currency: 'CNY',
+        sourceUrl: 'https://docs.bigmodel.cn/cn/coding-plan/overview',
+        sourceConfidence: 'official_pricing',
         limits: [{ limitType: 'rolling_5h_requests', value: null, window: '5h' }],
         models: [{ family: 'glm', version: '4.6' }],
         clients: [{ clientType: 'tool', clientId: 'claude-code' }],
@@ -321,22 +333,25 @@ export const SEED_VENDORS: SeedVendor[] = [
   },
 
   // ───────── 5c 桶2 多模型 Coding Plan（task 1.4）：百炼/千帆/腾讯混元/火山方舟/讯飞星火 ─────────
-  // 全部 0 已核价（NULL + needs_login_recheck 占位，禁臆造）；结构化文档页 → http（域已扩入 allowlist）。
+  // 5d-C 人在环已核（web-search + 实勘真 Coding Plan 页）：在售四家录**真月付标准价**（CNY，排首月促销/年付÷12，
+  // 经 upsertPlan→recordPriceChange 授权改价入口 official_pricing 入库）；source_url 校正→真订阅页（讯飞登录墙→manual）。
+  // **腾讯混元已停售** → 价保持 NULL + 打 mr_review_flag「已停售」，不留普通 needs_login_recheck 待核（spec 边界①）。
   {
     normalizedName: 'bailian',
     name: '百炼（阿里云 Model Studio）',
     sources: [
-      // 阿里云百炼计费文档页（结构化文档）→ http。aliyun.com 已扩入 allowlist。
-      { sourceUrl: 'https://help.aliyun.com/zh/model-studio/billing', fetchStrategy: 'http' },
+      // 5d-C 校正→真 Coding Plan 订阅页（原指向计费总览页）。结构化文档页 → http。aliyun.com 在 allowlist。
+      { sourceUrl: 'https://help.aliyun.com/zh/model-studio/coding-plan', fetchStrategy: 'http' },
     ],
     plans: [
       {
         name: '百炼 Coding Plan',
         category: 'coding_plan',
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://help.aliyun.com/zh/model-studio/billing',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核：真月付标准价 ¥200/月。
+        currentPrice: 200,
+        currency: 'CNY',
+        sourceUrl: 'https://help.aliyun.com/zh/model-studio/coding-plan',
+        sourceConfidence: 'official_pricing',
         limits: [{ limitType: 'credit', value: null, window: 'month' }],
         models: [{ family: 'qwen', version: '' }],
         clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
@@ -347,17 +362,18 @@ export const SEED_VENDORS: SeedVendor[] = [
     normalizedName: 'qianfan',
     name: '千帆（百度智能云）',
     sources: [
-      // 百度智能云千帆文档页（结构化文档）→ http。baidu.com 已在 allowlist。
-      { sourceUrl: 'https://cloud.baidu.com/doc/qianfan/index.html', fetchStrategy: 'http' },
+      // 5d-C 校正→真 Coding Plan 订阅页（原指向千帆文档总览页）。结构化文档页 → http。baidu.com 在 allowlist。
+      { sourceUrl: 'https://cloud.baidu.com/doc/qianfan/s/imlg0beiu', fetchStrategy: 'http' },
     ],
     plans: [
       {
         name: '千帆 Coding Plan',
         category: 'coding_plan',
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://cloud.baidu.com/doc/qianfan/index.html',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核：真月付标准价 ¥40/月。
+        currentPrice: 40,
+        currency: 'CNY',
+        sourceUrl: 'https://cloud.baidu.com/doc/qianfan/s/imlg0beiu',
+        sourceConfidence: 'official_pricing',
         limits: [{ limitType: 'credit', value: null, window: 'month' }],
         models: [{ family: 'ernie', version: '' }],
         clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
@@ -376,10 +392,14 @@ export const SEED_VENDORS: SeedVendor[] = [
       {
         name: '腾讯混元 Coding Plan',
         category: 'coding_plan',
+        // 5d-C 核实：腾讯混元 Coding Plan 现已停售（无在售订阅）→ 价保持 NULL、不计入 cheapest，
+        // 经 reviewFlagReason 打 mr_review_flag「已停售」，不留普通待核（spec「已停售 plan 不留作普通待核」）。
         currentPrice: null,
         currency: null,
         sourceUrl: 'https://cloud.tencent.com/document/product/1729',
         sourceConfidence: 'needs_login_recheck',
+        reviewFlagReason:
+          '已停售/discontinued：腾讯混元 Coding Plan 现已无在售订阅（停售待复核，不计入 cheapest；结构删除走授权路径，本期不硬删）',
         limits: [{ limitType: 'credit', value: null, window: 'month' }],
         models: [{ family: 'hunyuan', version: '' }],
         clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
@@ -390,17 +410,18 @@ export const SEED_VENDORS: SeedVendor[] = [
     normalizedName: 'volcengine-ark',
     name: '火山方舟（火山引擎）',
     sources: [
-      // 火山方舟文档页（结构化文档）→ http。续费价在登录墙后故价格保持 NULL 占位。volcengine.com 已扩入 allowlist。
-      { sourceUrl: 'https://www.volcengine.com/docs/82379', fetchStrategy: 'http' },
+      // 5d-C 校正→真 Coding Plan 活动订阅页（原指向方舟文档页）。结构化页 → http。volcengine.com 在 allowlist。
+      { sourceUrl: 'https://www.volcengine.com/activity/codingplan', fetchStrategy: 'http' },
     ],
     plans: [
       {
         name: '火山方舟 Coding Plan',
         category: 'coding_plan',
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://www.volcengine.com/docs/82379',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核：真月付标准价 ¥40/月。
+        currentPrice: 40,
+        currency: 'CNY',
+        sourceUrl: 'https://www.volcengine.com/activity/codingplan',
+        sourceConfidence: 'official_pricing',
         limits: [{ limitType: 'credit', value: null, window: 'month' }],
         models: [{ family: 'doubao', version: '' }],
         clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
@@ -411,17 +432,19 @@ export const SEED_VENDORS: SeedVendor[] = [
     normalizedName: 'xfyun-spark',
     name: '讯飞星火（科大讯飞）',
     sources: [
-      // 讯飞星火开放平台文档页（结构化文档）→ http。xfyun.cn 已扩入 allowlist。
-      { sourceUrl: 'https://www.xfyun.cn/doc/spark/Web.html', fetchStrategy: 'http' },
+      // 5d-C 校正→真订阅页 maas.xfyun.cn/packageSubscription；真页需登录 → fetchStrategy=manual（人工登录核，
+      // manual 源不发请求、豁免 allowlist 闸，URL 仅人类参考）。
+      { sourceUrl: 'https://maas.xfyun.cn/packageSubscription', fetchStrategy: 'manual' },
     ],
     plans: [
       {
         name: '讯飞星火 Coding Plan',
         category: 'coding_plan',
-        currentPrice: null,
-        currency: null,
-        sourceUrl: 'https://www.xfyun.cn/doc/spark/Web.html',
-        sourceConfidence: 'needs_login_recheck',
+        // 5d-C 人在环已核（登录后真页）：真月付标准价 ¥19/月（无忧档）。
+        currentPrice: 19,
+        currency: 'CNY',
+        sourceUrl: 'https://maas.xfyun.cn/packageSubscription',
+        sourceConfidence: 'official_pricing',
         limits: [{ limitType: 'credit', value: null, window: 'month' }],
         models: [{ family: 'spark', version: '' }],
         clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
