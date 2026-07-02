@@ -21,16 +21,19 @@
  * 仿 api/model-radar.ts 的可注入风格：`getSnapshot` 可注入，使 `app.request('/model-radar')` 直接测（合成快照、不触 DB）。
  */
 import { Hono } from 'hono';
+import { serveStatic } from '@hono/node-server/serve-static';
 import type { Child } from 'hono/jsx';
 import { getModelRadarSnapshot, type CachedSnapshot } from '../snapshot/cache.js';
 import { modelRadarQueryParamsSchema, queryModelRadarSnapshot } from '../snapshot/query.js';
 import { ComparePage, PageShell, type WebQuery } from './components.js';
 import { facetOptions, resolveTokensPerRound, type FreshnessSort } from './render.js';
 
-// default-src 'none' 收口未声明取数指令（object/connect/img/font…全拦）；显式 style-src 容内联 <style>；
-// base-uri/form-action/frame-ancestors 补纵深（防 <base> 劫持 / 表单外泄 / 点击劫持）。首个公开页基线。
+// default-src 'none' 收口未声明取数指令（object/connect/img…全拦）；显式 style-src 容内联 <style>；
+// font-src 'self' 放行同源自托管 webfont（未列 font-src 时字体由 default-src 'none' 兜底拦截），且不放行任何
+// 外部/CDN 源——其余取数指令仍全拦；base-uri/form-action/frame-ancestors 补纵深（防 <base> 劫持 / 表单外泄
+// / 点击劫持）。首个公开页基线。
 const CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+  "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /** 本页桶2 gate（枚举字面，design D6/task 4.3）。 */
 const GATE_CATEGORY = 'coding_plan';
@@ -81,6 +84,29 @@ async function renderDocument(title: string, body: Child): Promise<string> {
  */
 export function createModelRadarWebApp(getSnapshot: SnapshotProvider = defaultProvider): Hono {
   const app = new Hono();
+
+  // 自托管 Latin webfont（首个静态资源路由）。root 钉死到 `src/mr/web/assets`（唯一放行目录，MUST NOT
+  // 放宽到仓库其它目录）；`rewriteRequestPath` 剥 `/model-radar/assets` 前缀映射到 root 下同名文件；路径穿越
+  // （`../`、`\\`、`//`）由 serveStatic 在 rewrite 前拦截 → 404（见 @hono/node-server serve-static）。
+  // 注意：serveStatic 的 root 是**进程 cwd 相对**——容器化 / 编译产物运行时工作目录须含 `src/mr/web/assets`
+  //（GHCR 镜像须打进字体资产），否则 prod 字体 404（需 prod smoke 验证 /model-radar/assets/*.woff2 可达）。
+  // 长缓存头在**外层中间件 after-next** 里落位，而非 serveStatic 的 `onFound`——该版本 @hono/node-server 的
+  // onFound 在 `c.body()` 生成响应之后才回调，其时再写头不进响应；故只对已命中的 200 woff2 响应补 immutable
+  // 缓存头（404 不缓存）。Content-Type `font/woff2` 由 serveStatic 自身 mime 查表已给出。
+  app.use('/model-radar/assets/*', async (c, next) => {
+    c.header('Content-Security-Policy', CSP); // 纵深防御：资源响应也携带 CSP（仅页面路由设不够）
+    await next();
+    if (c.res.status === 200 && c.req.path.endsWith('.woff2')) {
+      c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  });
+  app.use(
+    '/model-radar/assets/*',
+    serveStatic({
+      root: 'src/mr/web/assets',
+      rewriteRequestPath: (p) => p.replace(/^\/model-radar\/assets/, ''),
+    }),
+  );
 
   app.get('/model-radar', async (c) => {
     c.header('Content-Security-Policy', CSP);

@@ -1,0 +1,22 @@
+Hanken Grotesk — 自托管 webfont 资产（Model Radar 比价页）
+
+字体族: Hanken Grotesk（family name "Hanken Grotesk"）
+许可: SIL Open Font License 1.1（见 LICENSE-OFL.txt）
+版权: Copyright 2021 The Hanken Grotesk Project Authors
+      https://github.com/marcologous/hanken-grotesk
+
+文件:
+  hanken-grotesk-latin-400.woff2  Regular（正文/数字）
+  hanken-grotesk-latin-600.woff2  SemiBold（标题）
+
+来源: Google Fonts 托管的静态 TTF（v12），经 fontTools/pyftsubset 子集化为
+  Latin + 数字 + 常用标点（含 ≈ U+2248），flavor=woff2。
+  子集 unicode 范围: U+0020-007E, U+00A0-00FF, U+2013 U+2014 U+2018 U+2019
+    U+201C U+201D U+2026 U+2248 U+00D7
+  保留 layout features: kern liga clig calt ccmp mark mkmk locl
+
+tabular 数字: 本字体默认数字即等宽（每个数字 advance 560 单位），价格列天然
+  竖直对齐；页面仍声明 font-variant-numeric: tabular-nums（默认已等宽，
+  该声明为幂等兜底，非依赖 tnum GSUB feature——该 cut 未含 tnum feature）。
+
+同源自托管: 经 Hono serveStatic 路由 /model-radar/assets/* 提供，零外部/CDN。

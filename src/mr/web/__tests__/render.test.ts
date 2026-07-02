@@ -22,19 +22,25 @@ import {
 import { estimateRounds } from '../../snapshot/limits.js';
 import { client, group, known, limit, model, prov, source, unknown } from './fixtures.js';
 
+/** 9 个状态 emoji（🟢🟡🔴🟠⭐🏆🚫❓⚠）——弃 emoji 改 CSS 记号后，badge 对象/label 均不得残留。 */
+const STATUS_EMOJI = /[🟢🟡🔴🟠⭐🏆🚫❓⚠]/u;
+
 describe('7.4 per-fact age 徽标 live（render_now − lastCheckedDate，相对文案只在 render 层算）', () => {
-  it('同一 date、不同 now → 不同文案（证 age 由 render 时钟派生、live）', () => {
+  it('同一 date、不同 now → 不同文案（证 age 由 render 时钟派生、live）；状态由 kind+文字承载、无 emoji 字段', () => {
     const date = '2026-06-20';
     const sameDay = ageBadge(date, new Date('2026-06-20T08:00:00Z'));
     expect(sameDay.kind).toBe('today');
     expect(sameDay.label).toBe('今日核对');
-    expect(sameDay.emoji).toBe('🟢');
 
     const threeDaysLater = ageBadge(date, new Date('2026-06-23T23:30:00Z'));
     expect(threeDaysLater.kind).toBe('days');
     expect(threeDaysLater.days).toBe(3);
     expect(threeDaysLater.label).toBe('3 天前核对');
-    expect(threeDaysLater.emoji).toBe('🟡');
+
+    // 弃 emoji：badge 无 emoji 字段（记号由组件按 kind 用 CSS 绘制、上色），label 无残留状态 emoji 字符。
+    expect('emoji' in sameDay).toBe(false);
+    expect(sameDay.label).not.toMatch(STATUS_EMOJI);
+    expect(threeDaysLater.label).not.toMatch(STATUS_EMOJI);
 
     // 同数据 date 产出不同 label → 文案绝非数据派生常量，而是 render_now 相对量（live，不会被 304 冻住）。
     expect(sameDay.label).not.toBe(threeDaysLater.label);
@@ -44,11 +50,12 @@ describe('7.4 per-fact age 徽标 live（render_now − lastCheckedDate，相对
     expect(ageBadge('2026-06-20', new Date('2026-06-21T00:00:01Z')).days).toBe(1);
   });
 
-  it('lastCheckedDate=null（从未抓的关联源）→ 待核态、无 emoji、不显 🟢🟡', () => {
+  it('lastCheckedDate=null（从未抓的关联源）→ 待核态、label 无 emoji（记号 CSS 绘制）', () => {
     const b = ageBadge(null, new Date('2026-06-23T00:00:00Z'));
     expect(b.kind).toBe('unchecked');
-    expect(b.emoji).toBe('');
     expect(b.label).toContain('待核');
+    expect(b.label).not.toMatch(STATUS_EMOJI);
+    expect('emoji' in b).toBe(false);
   });
 
   it('未来日期（时钟偏移）并入「今日」不出现负数天', () => {

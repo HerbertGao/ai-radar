@@ -12,7 +12,7 @@
 import type { Child } from 'hono/jsx';
 import { describe, expect, it } from 'vitest';
 import { ComparePage } from '../components.js';
-import { availabilityBadge, bestPeriod, cheapestInfo, periodPriceLine } from '../render.js';
+import { availabilityBadge, bestPeriod, bestPeriodSummary, cheapestInfo, periodPriceLine } from '../render.js';
 import type { SnapshotPlan, SnapshotPlanGroup } from '../../snapshot/dto.js';
 import { group, known, periodPrice, unknown } from './fixtures.js';
 
@@ -102,6 +102,48 @@ describe('3.1 bestPeriod：同币种已核周期严格低于 canonical 月价才
   });
 });
 
+describe('3.1 bestPeriodSummary：主列摘要 {periodLabel, priceToken}，三元谓词定位 + 复用 displayMonthly', () => {
+  it('命中 winner → {periodLabel, priceToken}（整除折算去末尾 0，复用 displayMonthly）', () => {
+    const p = known('P', '100', 'CNY', { periodPrices: [periodPrice('annual', '948', 'CNY', 948 / 12)] });
+    expect(bestPeriodSummary(p)).toEqual({ periodLabel: '年付', priceToken: 'CNY 79' }); // 79 非 79.00
+  });
+
+  it('季付 winner → periodLabel 季付、priceToken 同 formatter', () => {
+    const p = known('P', '100', 'CNY', { periodPrices: [periodPrice('quarterly', '270', 'CNY', 90)] });
+    expect(bestPeriodSummary(p)).toEqual({ periodLabel: '季付', priceToken: 'CNY 90' });
+  });
+
+  it('非整除折算保两位（1099/12 → 91.58）', () => {
+    const p = known('P', '100', 'CNY', { periodPrices: [periodPrice('annual', '1099', 'CNY', 1099 / 12)] });
+    expect(bestPeriodSummary(p)).toEqual({ periodLabel: '年付', priceToken: 'CNY 91.58' });
+  });
+
+  it('异币种同周期：以三元谓词定位 plan 币种(CNY)获胜行、不误取数值更低的 USD 行', () => {
+    // USD 年付折算 50 < CNY 年付折算 90，但 bestPeriod 只比同币种 → winner=(annual,CNY)；摘要须取 CNY 90、非 USD 50。
+    const p = known('P', '100', 'CNY', {
+      periodPrices: [periodPrice('annual', '1080', 'CNY', 90), periodPrice('annual', '600', 'USD', 50)],
+    });
+    expect(bestPeriodSummary(p)).toEqual({ periodLabel: '年付', priceToken: 'CNY 90' });
+  });
+
+  it('bestPeriod 返 null → 摘要 null（月付最低 / 停售 / 月价待核）', () => {
+    expect(
+      bestPeriodSummary(known('P', '30', 'CNY', { periodPrices: [periodPrice('annual', '480', 'CNY', 40)] })),
+    ).toBeNull(); // 月付最低
+    expect(
+      bestPeriodSummary(
+        known('P', '100', 'CNY', {
+          availability: 'discontinued',
+          periodPrices: [periodPrice('annual', '1080', 'CNY', 90)],
+        }),
+      ),
+    ).toBeNull(); // 停售抑制
+    expect(
+      bestPeriodSummary(unknown('P', { periodPrices: [periodPrice('annual', '600', 'CNY', 50)] })),
+    ).toBeNull(); // 月价无基线
+  });
+});
+
 describe('3.2 periodPriceLine：已核显原始价 + 折算（取整去末尾 0）、未核显待核不折算', () => {
   it('非整除 1099/12 → 折算保两位 91.58', () => {
     const line = periodPriceLine(periodPrice('annual', '1099', 'CNY', 1099 / 12));
@@ -122,75 +164,88 @@ describe('3.2 periodPriceLine：已核显原始价 + 折算（取整去末尾 0�
   });
 });
 
-describe('3.3 availabilityBadge 三值 + PlanStatusCell 不吞 unknown（M2）', () => {
+describe('3.3 availabilityBadge 三值 + 套餐格 availability 不吞 unknown（重排后无独立状态列/无「正常」文案）', () => {
   it('discontinued → 已停售 / unknown → 状态未知 / on_sale → 无标（null）', () => {
     expect(availabilityBadge('discontinued')).toMatchObject({ kind: 'discontinued', label: '已停售' });
     expect(availabilityBadge('unknown')).toMatchObject({ kind: 'unknown', label: '状态未知' });
     expect(availabilityBadge('on_sale')).toBeNull();
   });
 
-  it('fresh+已复核的 unknown 行仍出「状态未知」、不被「正常」提前返回吞掉', async () => {
-    // known() 默认 availability='unknown'、stale=false、pending=false → 命中「!stale && !pending」提前返回条件。
+  it('fresh+已复核的 unknown 行仍在套餐格出「状态未知」、不因恰不陈旧不待复核被吞', async () => {
+    // known() 默认 availability='unknown'、stale=false、pending=false → availability 求值独立于「陈旧/待复核」。
     const html = await renderGroup([known('U', '30', 'CNY', { availability: 'unknown' })]);
-    expect(html).toContain('状态未知');
-    expect(html).not.toContain('正常'); // availability 先于/独立于「正常」求值
+    const th = html.slice(html.indexOf('id="plan-U"'), html.indexOf('</th>', html.indexOf('id="plan-U"')));
+    expect(th).toContain('状态未知'); // availability 标贴套餐名
   });
 
-  it('on_sale + fresh + 已复核 → 显「正常」、不出任何 availability 标', async () => {
+  it('on_sale + fresh + 已复核 → 套餐格不出任何 availability 标（默认态、无「正常」文案、无 badge-unknown/discontinued）', async () => {
     const html = await renderGroup([known('N', '30', 'CNY', { availability: 'on_sale' })]);
-    expect(html).toContain('正常');
-    expect(html).not.toContain('状态未知');
-    expect(html).not.toContain('已停售');
+    const th = html.slice(html.indexOf('id="plan-N"'), html.indexOf('</th>', html.indexOf('id="plan-N"')));
+    expect(th).not.toContain('状态未知');
+    expect(th).not.toContain('已停售');
+    expect(th).not.toContain('badge-unknown');
+    expect(th).not.toContain('badge-discontinued');
   });
 });
 
-describe('3.4 组件渲染（不 boot server）：拆段 / 停售抑制 / 溯源周期行 / 空 periodPrices no-op', () => {
-  it('月价待核 + 年付已核 → 月价段显待核、年付子行仍照实渲（原始价 + 折算）', async () => {
+describe('3.4 组件渲染（不 boot server）：详情季年付明细 / 最佳周期主列 / 停售抑制 / 溯源周期行 / 空 periodPrices no-op', () => {
+  it('月价待核 + 年付已核 → 月价列显待核、详情季/年付明细仍照实渲（原始价 + 折算）', async () => {
     const p = unknown('X', { periodPrices: [periodPrice('annual', '1080', 'CNY', 90)] });
     const html = await renderGroup([p]);
-    expect(html).toContain('待核'); // 月价段
-    expect(html).toContain('period-price'); // 周期子行渲出
-    expect(html).toContain('年付 CNY 1080（≈CNY 90/月）'); // 月价待核不遮蔽已核周期价
+    expect(html).toContain('待核'); // 月价列
+    expect(html).toContain('<dt>季 / 年付明细</dt>'); // 详情分区段
+    expect(html).toContain('年付 CNY 1080（≈CNY 90/月）'); // 月价待核不遮蔽已核周期价（明细照实渲）
   });
 
-  it('周期真省钱 → 挂「最佳周期 · 年付」徽标、不报省额', async () => {
+  it('周期真省钱 → 主列显「年付 ≈CNY 90/月」摘要 + 详情明细挂 🏆 最佳周期徽标、不报省额', async () => {
     const p = known('B', '100', 'CNY', { periodPrices: [periodPrice('annual', '1080', 'CNY', 90)] });
     const html = await renderGroup([p]);
+    // 主列摘要：中文标签在外、数字+币种进等宽 .price
+    expect(html).toContain('年付 ≈<span class="price">CNY 90</span>/月');
+    // 详情季年付明细挂 🏆 徽标（label「最佳周期」）
     expect(html).toContain('badge-best-period');
-    expect(html).toContain('最佳周期 · 年付');
+    expect(html).toContain('最佳周期');
+    expect(html).not.toContain('省'); // 不报省额
   });
 
-  it('跨币同周期：徽标只挂同币种(CNY)年付子行，异币种(USD)同周期子行不误标（F1 守卫）', async () => {
+  it('跨币同周期：🏆 只挂同币种(CNY)明细行，异币种(USD)同周期行不误标（m-c 三元谓词守卫）', async () => {
     // schema 允许 UNIQUE(plan_id, billing_period, currency)：同 plan 可有同周期两币种行。
-    // bestPeriod 只比同币种 → winner 唯一是 (annual, CNY)；徽标须同样受同币种约束。
+    // bestPeriod 只比同币种 → winner 唯一是 (annual, CNY)；🏆 与主列摘要均须受同币种约束。
     const p = known('B', '100', 'CNY', {
       periodPrices: [periodPrice('annual', '1080', 'CNY', 90), periodPrice('annual', '600', 'USD', 50)],
     });
     const html = await renderGroup([p]);
-    // 徽标唯一：只挂 winner 的同币种子行（若回退 F1，异币种同周期子行也被误标 → 2 个）。
+    // 详情 🏆 徽标唯一：只挂 winner 的同币种明细行（若回退 F1，异币种同周期行也被误标 → 2 个）。
     expect(html.match(/badge-best-period/g)?.length).toBe(1);
-    // 异币种(USD)年付子行片段内不得含最佳周期徽标（先锚定该行确已渲染，否则 indexOf=-1 会让负断言空过）。
-    const usdStart = html.indexOf('年付 USD 600');
+    // CNY 年付明细行紧跟 🏆 徽标；USD 年付明细行（异币种）无徽标。
+    expect(html).toContain('年付 CNY 1080（≈CNY 90/月） <span class="badge badge-best-period">');
+    const usdStart = html.indexOf('年付 USD 600（≈USD 50/月）');
     expect(usdStart).toBeGreaterThanOrEqual(0);
-    const usdSegment = html.slice(usdStart).split('period-price')[0]!;
-    expect(usdSegment).not.toContain('badge-best-period');
-    // 同币种(CNY)年付子行片段内确实挂了徽标。
-    const cnyStart = html.indexOf('年付 CNY 1080');
-    expect(cnyStart).toBeGreaterThanOrEqual(0);
-    const cnySegment = html.slice(cnyStart).split('period-price')[0]!;
-    expect(cnySegment).toContain('badge-best-period');
+    const usdDiv = html.slice(usdStart, html.indexOf('</div>', usdStart));
+    expect(usdDiv).not.toContain('badge-best-period');
+    // 主列摘要取同币种(CNY)行、不误取 USD 行。
+    expect(html).toContain('年付 ≈<span class="price">CNY 90</span>/月');
   });
 
-  it('停售行有 .row-discontinued + 月价删除线 + 无最佳周期徽标', async () => {
+  it('主列摘要与详情季/年付明细对同一 effectiveMonthly 用同一 formatter（均 91.58，非整除保两位）', async () => {
+    const p = known('P', '100', 'CNY', { periodPrices: [periodPrice('annual', '1099', 'CNY', 1099 / 12)] });
+    const html = await renderGroup([p]);
+    expect(html).toContain('年付 ≈<span class="price">CNY 91.58</span>/月'); // 主列
+    expect(html).toContain('年付 CNY 1099（≈CNY 91.58/月）'); // 详情明细（同 displayMonthly）
+  });
+
+  it('停售行有 .row-discontinued + 月价删除线 + 主列 —（无最佳周期徽标）', async () => {
     const p = known('D', '100', 'CNY', {
       availability: 'discontinued',
       periodPrices: [periodPrice('annual', '1080', 'CNY', 90)],
     });
     const html = await renderGroup([p]);
-    expect(html).toContain('row-discontinued');
+    // 主行 + 详情行同挂 .row-discontinued（两处降权）
+    expect((html.match(/class="row-discontinued"/g) ?? []).length).toBe(2);
     expect(html).toContain('price-struck');
     expect(html).toContain('已停售');
     expect(html).not.toContain('badge-best-period'); // 停售抑制（bestPeriod 返 null）
+    expect(html).toContain('<td><span class="muted">—</span></td>'); // 最佳周期主列 —（唯一 <td> — 空态）
     expect(html).toContain('年付 CNY 1080'); // 停售仍可看周期价（可看不可买）
   });
 
@@ -200,11 +255,12 @@ describe('3.4 组件渲染（不 boot server）：拆段 / 停售抑制 / 溯源
     expect(html).toContain('年付价'); // ProvenanceLine label
   });
 
-  it('空 periodPrices（现有主流 plan）→ 不渲周期子行、月价路径与现状一致（no-op 回归）', async () => {
+  it('空 periodPrices（现有主流 plan）→ 详情季/年付明细段显 —、主列 —、月价路径与现状一致（no-op 回归）', async () => {
     const html = await renderGroup([known('M', '30', 'CNY')]);
-    expect(html).toContain('CNY 30'); // 月价照旧
-    expect(html).not.toContain('period-price'); // 无周期子行
-    expect(html).not.toContain('badge-best-period'); // 无最佳周期
+    expect(html).toContain('<span class="price">CNY 30</span>'); // 月价照旧（等宽）
+    expect(html).toContain('<dt>季 / 年付明细</dt><dd><span class="muted">—</span></dd>'); // 明细段空 → — 占位
+    expect(html).not.toContain('badge-best-period'); // 无最佳周期 🏆
+    expect(html).toContain('<td><span class="muted">—</span></td>'); // 最佳周期主列 —
     expect(html).not.toContain('待核'); // 月价已核、无未核周期占位
   });
 });
