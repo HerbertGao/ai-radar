@@ -30,25 +30,23 @@ function utcDayDiff(dateStr: string, now: Date): number {
 
 export interface AgeBadge {
   kind: 'today' | 'days' | 'unchecked';
-  /** 文字标签（a11y：状态不靠颜色/emoji 单独承载，见 spec WCAG ③）。 */
+  /** 文字标签（a11y：状态不靠颜色/CSS 记号单独承载，见 spec WCAG ③；CSS 绘制记号由组件按 kind 上色，无 emoji）。 */
   label: string;
-  /** 装饰 emoji（渲染时 `aria-hidden`）；待核态无 emoji。 */
-  emoji: string;
   days: number | null;
 }
 
 /**
- * per-fact age 徽标（task 4.1）：🟢 今日 / 🟡 N 天前 由 `render_now − lastCheckedDate` 算。
- * `lastCheckedDate === null`（仅关联源行可能，从未抓的 browser 源）→「待核 / 从未核对」、**不**显 🟢🟡。
+ * per-fact age 徽标（task 4.1）：今日 / N 天前 由 `render_now − lastCheckedDate` 算（记号由组件 CSS 绘制、按 kind 上色）。
+ * `lastCheckedDate === null`（仅关联源行可能，从未抓的 browser 源）→「待核 / 从未核对」。
  * 未来日期（时钟偏移）并入「今日」避免出现负数天。
  */
 export function ageBadge(lastCheckedDate: string | null, now: Date): AgeBadge {
   if (lastCheckedDate === null) {
-    return { kind: 'unchecked', label: '待核 / 从未核对', emoji: '', days: null };
+    return { kind: 'unchecked', label: '待核 / 从未核对', days: null };
   }
   const days = utcDayDiff(lastCheckedDate, now);
-  if (days <= 0) return { kind: 'today', label: '今日核对', emoji: '🟢', days: 0 };
-  return { kind: 'days', label: `${days} 天前核对`, emoji: '🟡', days };
+  if (days <= 0) return { kind: 'today', label: '今日核对', days: 0 };
+  return { kind: 'days', label: `${days} 天前核对`, days };
 }
 
 /**
@@ -271,19 +269,17 @@ export function bestPeriod(plan: SnapshotPlan): MrBillingPeriod | null {
 
 export interface AvailabilityBadge {
   kind: 'discontinued' | 'unknown';
-  /** 文字标签（a11y：状态不靠颜色/emoji 单独承载）。 */
+  /** 文字标签（a11y：状态不靠颜色/CSS 记号单独承载）。 */
   label: string;
-  /** 装饰 emoji（渲染时 `aria-hidden`）。 */
-  emoji: string;
 }
 
 /**
  * availability 徽标判定（task 1.2 / design D4）：`discontinued`→已停售、`unknown`→状态未知、
- * `on_sale`→无标（返回 null，组件不渲染）。与 age/status 徽标同风格（文字标签 + 装饰 emoji）。
+ * `on_sale`→无标（返回 null，组件不渲染）。与 age/status 徽标同风格（文字标签 + CSS 绘制记号，无 emoji）。
  */
 export function availabilityBadge(availability: SnapshotPlan['availability']): AvailabilityBadge | null {
-  if (availability === 'discontinued') return { kind: 'discontinued', label: '已停售', emoji: '🚫' };
-  if (availability === 'unknown') return { kind: 'unknown', label: '状态未知', emoji: '❓' };
+  if (availability === 'discontinued') return { kind: 'discontinued', label: '已停售' };
+  if (availability === 'unknown') return { kind: 'unknown', label: '状态未知' };
   return null; // on_sale 默认态，静默
 }
 
@@ -303,4 +299,32 @@ export function periodPriceLine(pp: SnapshotPeriodPrice): string {
     return `${period} 待核`;
   }
   return `${period} ${pp.currency} ${pp.price}（≈${pp.currency} ${displayMonthly(pp.effectiveMonthly)}/月）`;
+}
+
+/** 最佳周期主列摘要（task 2.4）：中文周期标签 + 折算月价 token（`数字+币种`）分离，供组件把 token 塞进等宽 `.price` span、中文标签留在外（防 CJK monospace 方块）。 */
+export interface BestPeriodSummary {
+  /** 中文周期名（`年付`/`季付`）——MUST 在等宽 span 之外渲染。 */
+  periodLabel: string;
+  /** `币种 空格 折算月价` token（如 `CNY 15`）——进等宽 `.price` span。 */
+  priceToken: string;
+}
+
+/**
+ * 最佳周期主列摘要文案（task 2.4 / spec「摘要 MUST 用与 bestPeriod 一致的谓词定位获胜周期价行」）：
+ * 判定复用 `bestPeriod`；以 `billingPeriod===winner ∧ currency===plan.currency ∧ priceStatus==='known'`
+ * 三元谓词 re-find 获胜行（`mr_plan_prices UNIQUE(plan_id,billing_period,currency)` 保证 ≤1 命中，
+ * 不会误取同周期异币种行），对其未取整 `effectiveMonthly` 复用 `displayMonthly`（与详情季/年付明细同 formatter）。
+ * `bestPeriod` 返 null（月付最低/平局/无同币种已核周期/月价待核/停售）→ 本函数返 null（主列显 `—`）。
+ */
+export function bestPeriodSummary(plan: SnapshotPlan): BestPeriodSummary | null {
+  const winner = bestPeriod(plan);
+  if (winner === null) return null;
+  const pp = plan.periodPrices.find(
+    (p) => p.billingPeriod === winner && p.currency === plan.currency && p.priceStatus === 'known',
+  );
+  if (!pp || pp.effectiveMonthly === null) return null;
+  return {
+    periodLabel: PERIOD_LABELS[winner],
+    priceToken: `${pp.currency} ${displayMonthly(pp.effectiveMonthly)}`,
+  };
 }
