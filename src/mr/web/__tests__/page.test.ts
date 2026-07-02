@@ -191,6 +191,9 @@ describe('4.1 自托管 webfont：CSP font-src + @font-face/@view-transition + s
       '/model-radar/assets/../model-radar-page.tsx',        // 明文 `../`：URL 归一后不匹配 assets 路由
       '/model-radar/assets/%2e%2e%2fmodel-radar-page.tsx',  // 编码 `../`：new URL() 不预归一
       '/model-radar/assets/%2e%2e%2frender.ts',
+      '/model-radar/assets/..%2f..%2frender.ts',            // 混合 `..%2f`
+      '/model-radar/assets/%2e%2e%5cmodel-radar-page.tsx',  // 反斜杠 `..\` 形式
+      '/model-radar/assets//model-radar-page.tsx',          // 双斜杠 `//` 形式
     ]) {
       const res = await app.request(p);
       expect(res.status).not.toBe(200);

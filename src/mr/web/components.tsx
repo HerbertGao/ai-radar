@@ -188,7 +188,7 @@ const PAGE_CSS = `
   .badge-discontinued { color: var(--state-discontinued); font-weight: 600; }  /* 已停售：中性（+整行降权+删除线承载） */
   .badge-unknown { color: var(--state-discontinued); font-weight: 600; }        /* 状态未知：次级 */
   /* ── CSS 绘制状态记号（弃 emoji）：伪元素、aria-hidden 由标签本身不含记号保证；形状尽量可辨、语义状态 ramp 上色。
-     forced-colors 下这些装饰记号消失可接受（状态由文字标签承载，见文末 @media forced-colors）。 */
+     forced-colors 下这些装饰记号由系统调色板重着色（不 pin 自定义色），状态始终由文字标签承载（见文末 @media forced-colors）。 */
   .age-today::before, .age-days::before, .age-unchecked::before,
   .badge-stale::before, .badge-review::before, .badge-estimate::before,
   .badge-cheap::before, .badge-best-period::before,
@@ -245,13 +245,11 @@ const PAGE_CSS = `
   /* 估算轮次：视觉次于官方额度（小字次级色），文字承载「估算」。 */
   .estimate { margin: .35rem 0 0; font-size: var(--fs-2); color: var(--muted); }
   .estimate-note { color: var(--muted); }
-  /* forced-colors（Windows 高对比）兜底：面板真实 border 承载分隔、focus outline 仍可见；装饰记号消失可接受。 */
+  /* forced-colors（Windows 高对比）兜底：面板真实 border 承载分隔、focus outline 仍可见。
+     装饰记号 MUST NOT pin 自定义色——交给 forced-colors 以系统调色板重着色（形状仍在、状态由文字标签承载），
+     尊重用户的高对比主题；不设 forced-color-adjust: none。 */
   @media (forced-colors: active) {
     form.filters, .table-scroll, .chip, .detail-dl { border: 1px solid; }
-    .age-today::before, .age-days::before, .age-unchecked::before,
-    .badge-stale::before, .badge-review::before, .badge-estimate::before,
-    .badge-cheap::before, .badge-best-period::before,
-    .badge-discontinued::before, .badge-unknown::before { forced-color-adjust: none; }
   }
 `;
 
