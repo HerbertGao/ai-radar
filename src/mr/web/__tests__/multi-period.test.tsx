@@ -169,11 +169,15 @@ describe('3.4 组件渲染（不 boot server）：拆段 / 停售抑制 / 溯源
     const html = await renderGroup([p]);
     // 徽标唯一：只挂 winner 的同币种子行（若回退 F1，异币种同周期子行也被误标 → 2 个）。
     expect(html.match(/badge-best-period/g)?.length).toBe(1);
-    // 异币种(USD)年付子行片段内不得含最佳周期徽标。
-    const usdSegment = html.slice(html.indexOf('年付 USD 600')).split('period-price')[0]!;
+    // 异币种(USD)年付子行片段内不得含最佳周期徽标（先锚定该行确已渲染，否则 indexOf=-1 会让负断言空过）。
+    const usdStart = html.indexOf('年付 USD 600');
+    expect(usdStart).toBeGreaterThanOrEqual(0);
+    const usdSegment = html.slice(usdStart).split('period-price')[0]!;
     expect(usdSegment).not.toContain('badge-best-period');
     // 同币种(CNY)年付子行片段内确实挂了徽标。
-    const cnySegment = html.slice(html.indexOf('年付 CNY 1080')).split('period-price')[0]!;
+    const cnyStart = html.indexOf('年付 CNY 1080');
+    expect(cnyStart).toBeGreaterThanOrEqual(0);
+    const cnySegment = html.slice(cnyStart).split('period-price')[0]!;
     expect(cnySegment).toContain('badge-best-period');
   });
 

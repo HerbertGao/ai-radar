@@ -314,7 +314,7 @@ const ProvenanceDetails: FC<{ plan: SnapshotPlan; now: Date }> = ({ plan, now })
     <ul>
       <ProvenanceLine label="价格" prov={plan.provenance} now={now} />
       {plan.periodPrices.map((pp) => (
-        <ProvenanceLine label={`${PERIOD_LABELS[pp.billingPeriod]}价`} prov={pp.provenance} now={now} />
+        <ProvenanceLine label={`${PERIOD_LABELS[pp.billingPeriod]}价（${pp.currency}）`} prov={pp.provenance} now={now} />
       ))}
       {plan.models.map((m) => (
         <ProvenanceLine label={`模型 ${modelLabel(m.family, m.version)}`} prov={m.provenance} now={now} />
