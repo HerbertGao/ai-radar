@@ -60,7 +60,13 @@ const parsedBudgetSchema = z.string().transform((raw, ctx) => {
     });
     return z.NEVER;
   }
-  return { amount: Number(m[1]), currency: currency.data };
+  const amount = Number(m[1]);
+  if (!Number.isFinite(amount)) {
+    // 超大位数（如 400 个 9）Number() 溢出为 Infinity；引擎 schema `.finite()` 会拒 → 若放行则 recommend() 抛 500。此处边界即拒 → 400。
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'maxMonthlyPrice 数额过大（非有限值）' });
+    return z.NEVER;
+  }
+  return { amount, currency: currency.data };
 });
 
 /**

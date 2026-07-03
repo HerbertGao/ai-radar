@@ -283,8 +283,8 @@ export function availabilityBadge(availability: SnapshotPlan['availability']): A
   return null; // on_sale 默认态，静默
 }
 
-/** 折算月价展示值：四舍五入到最多两位小数并去末尾 0（`79` 而非 `79.00`；`91.58` 保留）。仅展示、不改写 DTO。 */
-function displayMonthly(effectiveMonthly: number): string {
+/** 折算月价展示值：四舍五入到最多两位小数并去末尾 0（`79` 而非 `79.00`；`91.58` 保留）。仅展示、不改写 DTO、不碰 money-path（答案卡的 `monthlyCost` 数值同复用此取整）。 */
+export function displayMonthly(effectiveMonthly: number): string {
   return String(Math.round(effectiveMonthly * 100) / 100);
 }
 

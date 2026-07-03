@@ -1,22 +1,26 @@
 /**
- * Model Radar 只读比价 **Web 页**（5d-B / add-model-radar-compare-web-page，组 B1，task 2.1/2.2/2.3/4.3）。
+ * Model Radar **答案优先 Web 页**（add-model-radar-answer-first-web，组 2：路由改答案优先 + setup 校验/适配边界）。
  *
- * `GET /model-radar`：Hono JSX SSR。**只读**——经组 D `getModelRadarSnapshot()` 取进程内快照、SSR 出 HTML；
- * 不查规范化 `mr_*` 表、不写库、不 bump version（design D3）。
+ * `GET /model-radar`：Hono JSX SSR。**只读呈现层**——经组 D `getModelRadarSnapshot()` 取进程内快照，
+ * 把校验后的 setup 参数适配成 `RecommendInput` → `await recommend()` → 按 `candidates[].verdict` 四态过滤装配
+ * 答案卡 / 备选 / 说明 / 输入 / 证据抽屉。**零判定**：不查规范化 `mr_*` 表、不写库、不 bump version、
+ * 不重排 / 不重判 / 不重算 primary、不手搓 cheapest（money-path/判定全在 `recommend.ts`/`queryModelRadarSnapshot`）。
  *
  * 关键不变量：
- * - **不挂 version-304**（design D3 / spec）：每请求以 live `render_now`（`new Date()`）重渲——HTML 含 render-time
- *   相对 age（「N 天前」），用 snapshot version 作 ETag 会在快照未变而日界已过时服务陈旧「今日」。JSON
- *   `/model-radar/snapshot`（api/model-radar.ts）的内容哈希 ETag 不受本页影响。
- * - **冷启动首建失败 → 503**（沿用 5c fail-closed，镜像 api/model-radar.ts 的 try/catch），不渲坏快照。
- * - **桶2 UI gate**（task 4.3）：把 `category:'coding_plan'` 强行注入查询参数（枚举字面）——用户无 category chip、
- *   不读用户传入的 category，故无文档化手段切桶；不动数据层。
- * - **money-path 经 vetted 函数**（design D4）：过滤/排序/最划算由 `queryModelRadarSnapshot` 决定；只把 API 子集
- *   喂 `.strict()` `modelRadarQueryParamsSchema`（ZodError→400），web-only 参数（`sort`）留 schema 外、render 层用。
+ * - **setup 校验/适配先于 `recommend()`**（design D8）：schema 参数（model/tool/protocol/currency/`maxMonthlyPrice`）
+ *   经 `modelRadarQueryParamsSchema` 直接 `.parse()`（该 schema 已 strict + superRefine、是 `ZodEffects`、无 `.strict()`
+ *   方法），ZodError → **400**（不让其流进 `recommend()` 抛 500）；预算 wire `"100 CNY"` 解析出数值 amount + 币种，
+ *   币种优先级 `显式 currency ?? 预算串币种 ?? 引擎默认`；web-only `usageProfile` 先从待 parse 的 map 剔除、单独校
+ *   枚举，非法 clamp 到引擎默认（软旋钮、不崩不 400）。
+ * - **不挂 version-304**（沿用比价页）：每请求以 live `render_now`（`new Date()`）重渲，相对 age 每请求重算。
+ * - **冷启动首建失败 → 503**（沿用 5c fail-closed），不渲坏快照。
+ * - **桶2 gate**：`category:'coding_plan'` 强注入召回参数（枚举字面）；用户不读 category、无切桶手段。
+ * - **证据抽屉只按召回维度查**（design D6）：`queryModelRadarSnapshot` 只传 `{category, model, tool, protocol}`，
+ *   **MUST NOT 传 currency/maxMonthlyPrice**——否则 `matchesFilters` 滤掉超预算 / 他币种 plan，使答案区 guidance
+ *   引用的落选候选在证据里不可见。
  * - **安全头**（design D7）：CSP `default-src 'none'` 收口 + `script-src 'self'` + `style-src 'self' 'unsafe-inline'`
- *   （容内联 `<style>`——`default-src 'none'` 配**显式** style-src 不拦内联样式，与禁 `default-src 'self'` 不矛盾）
- *   + `base-uri 'none'`（防注入 `<base>` 劫持相对链接，对 5d-C 流入抓取内容尤要）+ `form-action 'self'`
- *   + `frame-ancestors 'none'`（防点击劫持）。`source_url` 经 render 层 `safeHref` scheme 闸（主防线）。
+ *   + `font-src 'self'` + `base-uri 'none'` + `form-action 'self'` + `frame-ancestors 'none'`；`source_url` 经
+ *   render 层 `safeHref` scheme 闸（主防线）。
  *
  * 仿 api/model-radar.ts 的可注入风格：`getSnapshot` 可注入，使 `app.request('/model-radar')` 直接测（合成快照、不触 DB）。
  */
@@ -25,7 +29,10 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import type { Child } from 'hono/jsx';
 import { getModelRadarSnapshot, type CachedSnapshot } from '../snapshot/cache.js';
 import { modelRadarQueryParamsSchema, queryModelRadarSnapshot } from '../snapshot/query.js';
-import { ComparePage, PageShell, type WebQuery } from './components.js';
+import { recommend, type RecommendInput } from '../recommend/recommend.js';
+import { usageProfileSchema } from '../recommend/schema.js';
+import { AlternativeCards, AnswerCard, ExplanationNote, SetupForm, type SetupQuery } from './answer.js';
+import { EvidenceDrawer, PageShell, type WebQuery } from './components.js';
 import { facetOptions, resolveTokensPerRound, type FreshnessSort } from './render.js';
 
 // default-src 'none' 收口未声明取数指令（object/connect/img…全拦）；显式 style-src 容内联 <style>；
@@ -58,17 +65,24 @@ function readWebQuery(raw: Record<string, string | undefined>): WebQuery {
   if (raw.tokensPerRound != null && raw.tokensPerRound.trim() !== '') {
     q.tokensPerRound = String(resolveTokensPerRound(raw.tokensPerRound));
   }
+  // 用量档带入排序链接：否则 `?usageProfile=heavy` 点抽屉排序会丢该参 → recommend() 静默回落默认 medium。非法值不透传。
+  const up = usageProfileSchema.safeParse(raw.usageProfile);
+  if (up.success) q.usageProfile = up.data;
   return q;
 }
 
-/** 描述性 `<title>`（随筛选反映当前态，spec WCAG ⑧）。 */
-function pageTitle(q: WebQuery): string {
-  const parts = ['Model Radar 比价 · Coding Plan'];
+/**
+ * 描述性 `<title>`（反映 setup 且**四态皆有意义**，spec WCAG 2.4.2）：有 primary → 「推荐 X」；无 primary（guidance
+ * 态）→ 「未找到匹配首选」，不用「答案/推荐」误导措辞。
+ */
+function pageTitle(q: SetupQuery, primaryName: string | null): string {
+  const parts = [primaryName ? `推荐 ${primaryName}` : '未找到匹配首选'];
   if (q.model) parts.push(`模型 ${q.model}`);
   if (q.tool) parts.push(`工具 ${q.tool}`);
   if (q.protocol) parts.push(`协议 ${q.protocol}`);
   if (q.currency) parts.push(`币种 ${q.currency}`);
   if (q.maxMonthlyPrice) parts.push(`预算 ${q.maxMonthlyPrice}`);
+  parts.push('Model Radar · Coding Plan');
   return parts.join(' · ');
 }
 
@@ -112,28 +126,46 @@ export function createModelRadarWebApp(getSnapshot: SnapshotProvider = defaultPr
     c.header('Content-Security-Policy', CSP);
 
     const raw = c.req.query();
-    const webQuery = readWebQuery(raw);
+    const webQuery = readWebQuery(raw); // 抽屉表内排序链接的参数保留（不参与快照过滤）。
     const sort: FreshnessSort | undefined = webQuery.sort as FreshnessSort | undefined;
 
-    // 只把 API 子集喂 .strict() schema（去空值防 `?model=` 触 400；强注入 category gate；不读用户 category）。
-    const apiInput: Record<string, string> = { category: GATE_CATEGORY };
+    // ── setup 校验/适配边界（task 1.4，MUST 在 recommend() 之前，防公开页 fail-open 抛 500/崩）──
+    // ① 只把 schema 子集喂 strict schema（剔 web-only usageProfile；去空值防 `?model=` 触 400）；ZodError → 400。
+    //    直接 `.parse()`（该 schema 已 strict + superRefine、是 ZodEffects、无 `.strict()` 方法）。
+    const schemaInput: Record<string, string> = {};
     for (const k of API_QUERY_KEYS) {
       const v = raw[k];
-      if (v != null && v.trim() !== '') apiInput[k] = v;
+      if (v != null && v.trim() !== '') schemaInput[k] = v;
     }
-    const parsed = modelRadarQueryParamsSchema.safeParse(apiInput);
+    const parsed = modelRadarQueryParamsSchema.safeParse(schemaInput);
     if (!parsed.success) {
       const html = await renderDocument(
-        '筛选参数无效 · Model Radar',
+        'setup 参数无效 · Model Radar',
         (
           <p>
-            筛选参数无效（如模型须 <code>family:version</code>、预算须「数额 币种」如 <code>100 CNY</code>）。{' '}
-            <a href="/model-radar">返回比价页</a>
+            配置参数无效（如模型须 <code>family:version</code>、预算须「数额 币种」如 <code>100 CNY</code>、
+            currency 与预算币种须一致）。 <a href="/model-radar">返回 Model Radar</a>
           </p>
         ),
       );
       return c.html(html, 400);
     }
+    // ② 预算 wire → 数值 amount + 币种优先级（显式 currency ?? 预算串币种 ?? 引擎默认）。冲突已由 schema superRefine →400。
+    const budget = parsed.data.maxMonthlyPrice;
+    const currency = parsed.data.currency ?? budget?.currency;
+    // ③ usageProfile（web-only、不在 schema）单独校枚举；非法/缺省 → clamp（undefined 交引擎默认，不崩不 400）。
+    const usage = usageProfileSchema.safeParse(raw.usageProfile);
+    const usageProfile = usage.success ? usage.data : undefined;
+
+    // 组 RecommendInput：model/tool/protocol 传**原始串**（recall 内部再 parse）；web-only 参数不喂引擎。
+    const input: RecommendInput = {
+      ...(raw.model && raw.model.trim() !== '' ? { model: raw.model } : {}),
+      ...(raw.tool && raw.tool.trim() !== '' ? { tool: raw.tool } : {}),
+      ...(raw.protocol && raw.protocol.trim() !== '' ? { protocol: raw.protocol } : {}),
+      ...(currency ? { currency } : {}),
+      ...(budget ? { maxMonthlyPrice: budget.amount } : {}),
+      ...(usageProfile ? { usageProfile } : {}),
+    };
 
     let cached: CachedSnapshot;
     try {
@@ -145,28 +177,56 @@ export function createModelRadarWebApp(getSnapshot: SnapshotProvider = defaultPr
     }
 
     const snapshot = cached.snapshot;
-    // money-path：过滤/排序/最划算经 vetted 函数；裸快照只用于派生下拉选项（桶2 全集）。
-    const result = queryModelRadarSnapshot(snapshot, parsed.data);
-    const options = facetOptions(snapshot.plans.filter((p) => p.category === GATE_CATEGORY));
+    // 呈现层零判定：答案/备选/说明全由引擎输出映射，按 verdict 过滤（非重排/重判/重算 primary）。
+    const result = await recommend(snapshot, input);
+    const primary = result.candidates.find((c2) => c2.verdict === 'primary');
+    const alternatives = result.candidates.filter((c2) => c2.verdict === 'alternative');
+
+    // 证据抽屉：**只按召回维度**查（category + model/tool/protocol；MUST NOT 传 currency/maxMonthlyPrice），
+    // 使超预算/他币种落选候选仍在证据可见（与 recommend 的 recall 同维度）。参数已在①校验过，此 parse 不会抛。
+    const evidenceRaw: Record<string, string> = { category: GATE_CATEGORY };
+    if (input.model) evidenceRaw.model = input.model;
+    if (input.tool) evidenceRaw.tool = input.tool;
+    if (input.protocol) evidenceRaw.protocol = input.protocol;
+    const evidence = queryModelRadarSnapshot(snapshot, modelRadarQueryParamsSchema.parse(evidenceRaw));
     // 「另有 N 未核未参与」的 N：跨引该 category 的 currency=null 组 unknownCount（已核组上恒 0，design D4）。
-    const unknownGroup = result.groups.find((g) => g.sortScope.currency === null);
+    const unknownGroup = evidence.groups.find((g) => g.sortScope.currency === null);
     const unknownInCategory = unknownGroup ? unknownGroup.unknownCount : 0;
 
+    // 「描述你的配置」回显串（含 clamp 后的 usageProfile）；下拉选项取桶2 全集。
+    const setupQuery: SetupQuery = {
+      ...(raw.model && raw.model.trim() !== '' ? { model: raw.model } : {}),
+      ...(raw.tool && raw.tool.trim() !== '' ? { tool: raw.tool } : {}),
+      ...(raw.protocol && raw.protocol.trim() !== '' ? { protocol: raw.protocol } : {}),
+      // 回显**生效**币种（显式 ?? 预算串币种）：预算 "100 USD" 无显式 currency 时下拉如实显 USD，而非误导的「默认币种」。
+      ...(currency ? { currency } : {}),
+      ...(raw.maxMonthlyPrice && raw.maxMonthlyPrice.trim() !== '' ? { maxMonthlyPrice: raw.maxMonthlyPrice } : {}),
+      // 缺省/非法用量档回显引擎默认 medium（recommend.ts DEFAULT_USAGE）：否则下拉无选中项 → 浏览器默认首项 light，
+      // 与实际按 medium 计算的答案自相矛盾、且提交未改表单会静默降档。
+      usageProfile: usageProfile ?? 'medium',
+    };
+    const options = facetOptions(snapshot.plans.filter((p) => p.category === GATE_CATEGORY));
+
     const now = new Date(); // live render_now：相对 age 每请求重算（不挂 version-304）。
-    // 估算旋钮假设：web-only query-param、render 层算（不喂 .strict() schema、不进哈希，design D5）。
-    const tokensPerRound = resolveTokensPerRound(raw.tokensPerRound);
+    const tokensPerRound = resolveTokensPerRound(raw.tokensPerRound); // web-only 估算旋钮（不喂 schema/引擎）。
     const body = (
-      <ComparePage
-        groups={result.groups}
-        unknownInCategory={unknownInCategory}
-        options={options}
-        query={webQuery}
-        now={now}
-        tokensPerRound={tokensPerRound}
-        {...(sort ? { sort } : {})}
-      />
+      <>
+        {primary ? <AnswerCard candidate={primary} now={now} /> : null}
+        {/* 备选（轻量账本）紧随答案卡 → 强→轻→中 的节奏；密集的「推荐说明」大表降为下方的支撑证据。 */}
+        <AlternativeCards candidates={alternatives} />
+        <ExplanationNote candidates={result.candidates} explanation={result.explanation} hasPrimary={!!primary} />
+        <SetupForm options={options} query={setupQuery} />
+        <EvidenceDrawer
+          groups={evidence.groups}
+          unknownInCategory={unknownInCategory}
+          query={webQuery}
+          now={now}
+          tokensPerRound={tokensPerRound}
+          {...(sort ? { sort } : {})}
+        />
+      </>
     );
-    return c.html(await renderDocument(pageTitle(webQuery), body));
+    return c.html(await renderDocument(pageTitle(setupQuery, primary?.name ?? null), body));
   });
 
   return app;
