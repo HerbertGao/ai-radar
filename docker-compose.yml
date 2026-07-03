@@ -160,6 +160,12 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    # web 多网卡：default 达 postgres/redis，edge 供 cloudflared 回源（design D5：只约束 cloudflared，web 保持两网）。
+    networks: [default, edge]
+    # 资源上限（design D5）：web 是 recommend()-per-request 的爆炸半径主体。TODO 按实测基线
+    # （快照 + recommend() 峰值 RSS）留头寸调整，勿留空；太松无防护、太紧 OOM 触发 healthcheck 重启环。
+    mem_limit: 512m
+    cpus: "1.0"
     # 把 /health 接入编排：busybox wget 在 503（DB/Redis down）时非零退出 → 容器转 unhealthy，
     # 使 `docker compose ps` 的健康状态可信、而非进程活着就恒显 Up。
     healthcheck:
@@ -169,6 +175,36 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── Model Radar 公网暴露：Cloudflare Tunnel 出站代理（profile=app）。
+  #    locally-managed 隧道：cloudflared/config.yml 权威 ingress + 挂载凭据 JSON（非 token、非 env）。
+  #    只在 edge 网络（不达 postgres/redis，design D5）；不映射任何宿主端口（纯出站）。
+  cloudflared:
+    # ⚠️ 按 digest 钉死（design D5）：部署前把 :latest 换成 @sha256:<digest>（如
+    #    cloudflare/cloudflared:2024.x.x@sha256:<digest>），并定期刷新（renovate/dependabot）防 CVE 陈旧（DEPLOY.md 耦合清单）。
+    image: cloudflare/cloudflared:latest  # TODO 换 @sha256:<digest> 钉死
+    profiles: ["app"]
+    # locally-managed：config.yml 权威 ingress（token 模式会忽略 config.yml，故不用 --token）。
+    # 凭据缺/空/畸形 → cloudflared 原生非零退出 fail-closed（公网无路由）；无效/吊销 → 边缘 CF 1033。
+    command: ["tunnel", "--config", "/etc/cloudflared/config.yml", "run"]
+    networks: [edge]
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      # 凭据 JSON（gitignore、挂载文件非 env）；用户 `cloudflared tunnel create` 生成后放此路径。
+      - ${CF_TUNNEL_CRED_FILE:-./cloudflared/credentials.json}:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: "0.5"
+
 volumes:
   postgres_data:
   redis_data:
+
+networks:
+  # 数据网络（默认）：postgres/redis/migrate/worker/web 在此互联。
+  default:
+  # 公网面专用网：只含 web + cloudflared；postgres/redis 不在此，
+  # 使 cloudflared 即便 ingress 配错也无法 L3 触达数据层（design D5 网络分段）。
+  edge:
