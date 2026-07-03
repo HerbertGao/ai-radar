@@ -179,9 +179,9 @@ services:
   #    locally-managed 隧道：cloudflared/config.yml 权威 ingress + 挂载凭据 JSON（非 token、非 env）。
   #    只在 edge 网络（不达 postgres/redis，design D5）；不映射任何宿主端口（纯出站）。
   cloudflared:
-    # ⚠️ 按 digest 钉死（design D5）：部署前把 :latest 换成 @sha256:<digest>（如
-    #    cloudflare/cloudflared:2024.x.x@sha256:<digest>），并定期刷新（renovate/dependabot）防 CVE 陈旧（DEPLOY.md 耦合清单）。
-    image: cloudflare/cloudflared:latest  # TODO 换 @sha256:<digest> 钉死
+    # digest 钉死（design D5）：多架构 manifest-list digest（跨 amd64/arm64）。定期刷新
+    #    （renovate/dependabot digest bump 或手动，见 DEPLOY.md 耦合清单）防网络面守护进程 CVE 陈旧。
+    image: cloudflare/cloudflared:2026.6.1@sha256:6d91c121b803126f7a5344005d17a9324788fc09d305b6e2560ec6040a7ae283
     profiles: ["app"]
     # locally-managed：config.yml 权威 ingress（token 模式会忽略 config.yml，故不用 --token）。
     # 凭据缺/空/畸形 → cloudflared 原生非零退出 fail-closed（公网无路由）；无效/吊销 → 边缘 CF 1033。
