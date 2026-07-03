@@ -11,6 +11,10 @@ build/
 .env.*
 !.env.example
 
+# Cloudflare Tunnel 凭据（locally-managed 隧道的 credentials JSON；config.yml 可入库、凭据不入库）
+cloudflared/credentials.json
+cloudflared/*.json
+
 # Logs
 *.log
 npm-debug.log*

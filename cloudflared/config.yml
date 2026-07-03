@@ -1,0 +1,17 @@
+# Cloudflare Tunnel（locally-managed）——config.yml 权威 ingress、被 cloudflared 实际读取。
+# 提交进仓、不含 secret。<占位> 由用户 provision 后填（tunnel UUID / hostname 非 secret；凭据 JSON 另挂载、gitignore）。
+tunnel: <TUNNEL_UUID>            # `cloudflared tunnel create` 输出的隧道 UUID
+credentials-file: /etc/cloudflared/credentials.json
+
+# ingress 只做作用域（WAF / 限流 / cache 规则在 CF 侧配，见 DEPLOY.md）。
+ingress:
+  # 仅答案页（精确 ^/model-radar$，match origin 严格路由；querystring 不在 path，表单 GET 仍匹配）
+  - hostname: <PUBLIC_HOST>
+    path: ^/model-radar$
+    service: http://web:3000
+  # 仅自托管字体文件名（严格 .woff2；不放行 assets/ 下任意子路径，堵 ..%2f 遍历在边缘转发）
+  - hostname: <PUBLIC_HOST>
+    path: ^/model-radar/assets/[A-Za-z0-9._-]+\.woff2$
+    service: http://web:3000
+  # catch-all：/model-radar/snapshot、/model-radar/plans、/health、遍历载荷、其余一律 404（不回源）
+  - service: http_status:404
