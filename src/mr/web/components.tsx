@@ -40,6 +40,8 @@ export interface WebQuery {
   currency?: string;
   maxMonthlyPrice?: string;
   sort?: string;
+  /** 用量档（web-only；带入抽屉排序链接以免点排序丢失该设定 → 静默回落引擎默认 medium）。 */
+  usageProfile?: string;
   /** 估算旋钮（web-only query-param，不入 .strict() schema / 不进哈希；render 层用，task 5.x）。 */
   tokensPerRound?: string;
 }
@@ -104,6 +106,16 @@ const PAGE_CSS = `
     --font-ui: "Hanken Grotesk", system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
     --font-num: "Hanken Grotesk", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", sans-serif;
     --font-display: "Hanken Grotesk", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    /* ── 品牌 / 现代：深色「定论面板」+ 大气页头（answer-first v3）；深底色均以 WCAG 相对亮度实测 ≥4.5:1 */
+    --brand-navy: #0e1424;       /* 定论面板深底（蓝黑，品牌向） */
+    --brand-navy-2: #1a2236;     /* 面板内次级底（警告条） */
+    --brand-navy-hair: rgba(255,255,255,.14);  /* 深底发丝线 */
+    --on-navy: #f2f5fb;          /* 深底主文本 16.8:1 */
+    --on-navy-muted: #b8c0cf;    /* 深底次级 10:1 */
+    --accent-lift: #7aa2ff;      /* 深底品牌蓝 7.4:1（链接/记号/chip 底） */
+    --on-navy-fresh: #63d69b;    /* fit 够用 10:1 */
+    --on-navy-exceeds: #ff9d9d;  /* fit 不够 9.2:1 */
+    --on-navy-estimate: #ffcf85; /* fit 未知/警告 12.7:1 */
   }
   /* 跨文档整页 GET 导航的 app 般转场（纯 CSS，无 JS）；reduce 下把三个伪元素动画置零（非仅省 at-rule） */
   @view-transition { navigation: auto; }
@@ -111,7 +123,10 @@ const PAGE_CSS = `
     ::view-transition-old(*), ::view-transition-new(*), ::view-transition-group(*) { animation: none !important; }
   }
   * { box-sizing: border-box; }
-  body { font: 16px/1.6 var(--font-ui); margin: 0; color: var(--ink); background: var(--page-bg); }
+  /* 大气 page 底：顶部一抹极浅冷色光晕（品牌氛围，非 glassmorphism/非渐变文字），其下微冷中性 */
+  body { font: 16px/1.6 var(--font-ui); margin: 0; color: var(--ink);
+    background: radial-gradient(130% 62% at 50% -12%, #e7edf8 0%, rgba(231,237,248,0) 58%), var(--page-bg);
+    background-attachment: fixed; }
   a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   a:hover { text-decoration-thickness: 2px; }
   /* 可见焦点环（2.4.7）MUST 用 outline（forced-colors 不剥离、不被圆角面板 overflow 裁）、MUST NOT box-shadow；签名蓝对相邻面 ≥3:1 */
@@ -121,9 +136,18 @@ const PAGE_CSS = `
   }
   .skip-link { position: absolute; left: -9999px; top: 0; background: var(--ink); color: #fff; padding: .5rem 1rem; z-index: 10; border-radius: 0 0 var(--r-1) 0; }
   .skip-link:focus { left: 0; }                      /* skip-link（2.4.1） */
-  header { padding: 1.6rem 1.25rem 1.2rem; max-width: 1180px; margin: 0 auto; }
-  h1 { font-family: var(--font-display); font-size: var(--fs-7); font-weight: 700; letter-spacing: -.015em; margin: 0; text-wrap: balance; }
-  header .muted { font-size: var(--fs-3); margin-top: .4rem; max-width: 60ch; }
+  /* 品牌页头：wordmark + 雷达 mark + 定位 tagline（品牌官网气质） */
+  .site-header { padding: 2.5rem 1.25rem 1.4rem; max-width: 1180px; margin: 0 auto; }
+  .brand { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .brand-mark { width: 1.6rem; height: 1.6rem; border-radius: 8px; flex: none; position: relative;
+    background: linear-gradient(145deg, var(--accent) 0%, #3f6fe4 100%); box-shadow: 0 2px 8px rgba(29,78,216,.35); }
+  .brand-mark::before { content: ""; position: absolute; inset: 38%; border-radius: 50%; background: #fff; }
+  .brand-mark::after { content: ""; position: absolute; inset: 16%; border: 1.5px solid rgba(255,255,255,.6);
+    border-radius: 50%; border-top-color: transparent; border-right-color: transparent; }  /* 雷达扫描弧 */
+  .brand-name { font-family: var(--font-display); font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; margin: 0; color: var(--ink); }
+  .brand-sub { font-size: var(--fs-1); font-weight: 700; letter-spacing: .04em; color: var(--accent);
+    background: var(--accent-soft); padding: .25em .65em; border-radius: 999px; }              /* accent on accent-soft 6.0:1 */
+  .brand-tagline { margin: .75rem 0 0; font-size: var(--fs-3); color: var(--muted); max-width: 54ch; text-wrap: pretty; }  /* muted on page-bg 6.3:1 */
   nav, main { padding: 0 1.25rem; max-width: 1180px; margin: 0 auto; }
   nav { padding-top: .4rem; padding-bottom: 1rem; font-size: var(--fs-3); }
   main { padding-bottom: 3rem; }
@@ -249,12 +273,146 @@ const PAGE_CSS = `
      装饰记号 MUST NOT pin 自定义色——交给 forced-colors 以系统调色板重着色（形状仍在、状态由文字标签承载），
      尊重用户的高对比主题；不设 forced-color-adjust: none。 */
   @media (forced-colors: active) {
-    form.filters, .table-scroll, .chip, .detail-dl { border: 1px solid; }
+    form.filters, .table-scroll, .chip, .detail-dl,
+    .answer-card, .rec-section, .evidence-drawer { border: 1px solid; }
   }
+
+  /* ── 答案优先层 v3「深色定论面板 + 排名账本」──────────────────────────────────────────────────
+     答案卡=**深色定论面板**（--brand-navy #0e1424 深底 → 答案作独立高级材质、一锤定音；on-navy 16.8:1/
+     on-navy-muted 10:1/accent-lift 7.4:1/fit 浅色变体 ≥9:1 均实测）。备选=账本行平铺于 page-bg（--ink 15.6:1/
+     --muted 6.3:1），层级分明：深色答案 ≫ 浅色账本。价格作 tabular 锚数字、accent-lift chip。mobile-first：默认单列、
+     宽屏面板头双栏；320px 无表外双向横滚。状态记号 CSS 绘制 + 文字（无 emoji）。 */
+  .answer-card { position: relative; background: var(--brand-navy); border: 1px solid var(--brand-navy);
+    border-radius: 14px; color: var(--on-navy);
+    box-shadow: 0 22px 48px -18px rgba(14,20,36,.55), 0 4px 14px rgba(14,20,36,.28);
+    padding: 1.55rem 1.6rem; margin: 0 0 1.9rem; overflow: hidden; }
+  @media (min-width: 720px) { .answer-card { padding: 2rem 2.2rem; } }
+  .answer-card a { color: var(--accent-lift); }                                                /* 深底链接 7.4:1 */
+  /* 深色面板上焦点环改用 accent-lift（#7aa2ff 对 brand-navy 7.4:1）；默认 --accent(#1d4ed8) 对深底仅 2.74:1，破 WCAG 2.4.11/1.4.11 */
+  .answer-card a:focus-visible, .answer-card [tabindex]:focus-visible { outline-color: var(--accent-lift); }
+  .answer-card .muted { color: var(--on-navy-muted); }                                         /* 置信度等 10:1 */
+  .answer-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+    gap: .5rem 1.6rem; padding-bottom: 1.1rem; border-bottom: 1px solid var(--brand-navy-hair); }
+  .answer-lede { flex: 1 1 58%; min-width: 12rem; }
+  .answer-verdict { margin: 0 0 .7rem; }
+  .verdict-chip { display: inline-flex; align-items: center; gap: .45em; background: var(--accent-lift); color: var(--brand-navy);
+    font-size: var(--fs-1); font-weight: 800; letter-spacing: .04em; padding: .32em .8em; border-radius: 999px; }  /* navy on accent-lift 7.4:1 */
+  .verdict-chip::before { content: ""; width: .46em; height: .46em; border-radius: 50%; background: var(--brand-navy); }
+  .answer-title { font-family: var(--font-display); font-size: var(--fs-7); line-height: 1.1; font-weight: 700;
+    letter-spacing: -.02em; margin: 0; color: var(--on-navy); text-wrap: balance; }             /* on-navy 16.8:1 */
+  .answer-vendor { font-size: var(--fs-4); font-weight: 400; letter-spacing: 0; color: var(--on-navy-muted); }  /* 10:1 */
+  .answer-figure { flex: 0 0 auto; margin: 0; text-align: right; white-space: nowrap; }
+  .answer-cost { font-family: var(--font-num); font-variant-numeric: tabular-nums; font-size: 2.55rem; line-height: 1;
+    font-weight: 700; letter-spacing: -.02em; color: var(--on-navy); }                          /* on-navy 16.8:1 */
+  .answer-unit { font-size: var(--fs-4); font-weight: 500; color: var(--on-navy-muted); margin-left: .12em; }
+  .answer-fit { margin: 1.1rem 0 0; }
+  .answer-reasons { list-style: none; margin: 1rem 0 0; padding: 0; display: grid; gap: .5rem;
+    color: var(--on-navy); font-size: var(--fs-3); line-height: 1.5; }                          /* on-navy 16.8:1 */
+  .answer-reasons li { position: relative; padding-left: 1.15rem; }
+  .answer-reasons li::before { content: ""; position: absolute; left: .12rem; top: .58em; width: .34rem; height: .34rem;
+    border-radius: 50%; background: var(--accent-lift); }                                       /* accent-lift 记号 */
+  .answer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .7rem; margin: 1.2rem 0 0;
+    padding-top: .95rem; border-top: 1px solid var(--brand-navy-hair); font-size: var(--fs-2); color: var(--on-navy-muted); }  /* 10:1 */
+  .answer-meta-sep { color: var(--brand-navy-hair); }
+  .answer-card .badge-stale { color: var(--on-navy-exceeds); }                                  /* 深底陈旧标 9.2:1 */
+  /* thin-data 撞窗未知警告：一等公民、DOM 序先于结论；深底琥珀 #ffcf85 on #1a2236 实测 11:1 */
+  .answer-warn { margin: 0 0 1.15rem; padding: .62rem .9rem; font-size: var(--fs-3); font-weight: 600;
+    color: var(--on-navy-estimate); background: var(--brand-navy-2); border: 1px solid rgba(255,207,133,.4); border-radius: var(--r-1); }
+  /* fitsWindow 结论徽标（CSS 记号 + 文字）——默认浅面（备选账本/表）用深色 state；深色答案面板内用浅色变体（scoped） */
+  .badge-fits { color: var(--state-fresh); }                                                    /* on #fff/page-bg ≥5.5:1 */
+  .badge-exceeds { color: var(--state-stale); }
+  .badge-unknown-fit { color: var(--state-estimate); }
+  .answer-card .badge-fits { color: var(--on-navy-fresh); }                                     /* 深底浅绿 10:1 */
+  .answer-card .badge-exceeds { color: var(--on-navy-exceeds); }                                /* 深底浅红 9.2:1 */
+  .answer-card .badge-unknown-fit { color: var(--on-navy-estimate); }                           /* 深底浅琥珀 12.7:1 */
+  .badge-fits::before, .badge-exceeds::before, .badge-unknown-fit::before {
+    content: ""; display: inline-block; width: .62em; height: .62em; margin-right: .42em; flex: none; }
+  .badge-fits::before { border-radius: 50%; background: var(--state-fresh); }                 /* 实心圆（绿） */
+  .badge-exceeds::before { background: var(--state-stale); transform: rotate(45deg); }        /* 实心菱形（红） */
+  .badge-unknown-fit::before { width: 0; height: 0; margin-right: .42em; background: transparent;
+    border-left: .34em solid transparent; border-right: .34em solid transparent; border-bottom: .56em solid var(--state-estimate); }  /* 实心三角（琥珀） */
+  .answer-card .badge-fits::before { background: var(--on-navy-fresh); }
+  .answer-card .badge-exceeds::before { background: var(--on-navy-exceeds); }
+  .answer-card .badge-unknown-fit::before { border-bottom-color: var(--on-navy-estimate); }
+  /* 深色面板内的新鲜度 age 徽标（AgeBadgeView）：浅色变体，记号同步 */
+  .answer-card .age-today { color: var(--on-navy-fresh); }
+  .answer-card .age-today::before { background: var(--on-navy-fresh); }
+  .answer-card .age-days, .answer-card .age-unchecked { color: var(--on-navy-muted); }
+  .answer-card .age-days::before, .answer-card .age-unchecked::before { border-color: var(--on-navy-muted); }
+  /* 一处克制的品牌动效：深色定论面板 load 时轻抬入（reduced-motion 关） */
+  @media (prefers-reduced-motion: no-preference) {
+    .answer-card { animation: verdict-in .6s cubic-bezier(.22,.61,.36,1) both; }
+  }
+  @keyframes verdict-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+  /* 备选=排名账本行（非卡网格）：rank 索引 + 名称 + 右对齐 tabular 价格 + fit/来源 副行；发丝线分隔，平铺 page-bg */
+  .section-heading { font-family: var(--font-ui); font-size: var(--fs-2); font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 .5rem; }                        /* muted on page-bg 6.3:1 */
+  .alt-section { margin: 0 0 1.75rem; }
+  .alt-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--hair); }
+  .alt-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline; column-gap: .95rem;
+    row-gap: .2rem; padding: .9rem .1rem; border-bottom: 1px solid var(--hair); }
+  .alt-name { grid-column: 1; font-family: var(--font-display); font-size: var(--fs-4); font-weight: 600;
+    color: var(--ink); min-width: 0; }                                                          /* ink 15.6:1 */
+  .alt-vendor { font-family: var(--font-ui); font-size: var(--fs-3); font-weight: 400; color: var(--muted); }
+  .alt-cost { grid-column: 2; grid-row: 1; text-align: right; font-family: var(--font-num); font-variant-numeric: tabular-nums;
+    font-size: var(--fs-5); font-weight: 700; color: var(--ink); white-space: nowrap; }
+  .alt-unit { font-size: var(--fs-2); font-weight: 500; color: var(--muted); }
+  .alt-sub { grid-column: 1 / 3; display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .7rem; font-size: var(--fs-2); color: var(--muted); }
+  .alt-overflow { margin: .85rem 0 0; font-size: var(--fs-3); }
+  /* ── 推荐说明 = 结构化候选表（从 structured candidates 渲染、非解析 explanation 串）：逐候选 判级/月成本/撞窗/缘由，
+     含未入选（不推荐/待核）行、判级 CSS 上色无 emoji；表在 --surface 卡（#fff → A 已验对比复用）、.table-scroll 单向横滚 reflow。
+     引擎完整 explanation 原文折叠保留于表下（thin-data：原样、不裁剪）。 */
+  .rec-section { background: var(--surface); border: 1px solid var(--ring); border-radius: var(--r-2); box-shadow: var(--shadow-1);
+    padding: 1.1rem 1.3rem 1.2rem; margin: 0 0 1.75rem; }
+  .rec-section .section-heading { margin: 0 0 .4rem; }
+  .rec-caption { caption-side: top; text-align: left; font-size: var(--fs-2); color: var(--muted); margin-bottom: .6rem; }  /* muted 6.8:1 */
+  .rec-table { width: 100%; border-collapse: collapse; font-size: var(--fs-3); min-width: 620px; }
+  .rec-table thead th { text-align: left; font-size: var(--fs-1); font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--muted); padding: .35rem .7rem .55rem; border-bottom: 1px solid var(--ring); white-space: nowrap; }
+  .rec-table tbody th, .rec-table tbody td { text-align: left; padding: .7rem .7rem; border-bottom: 1px solid var(--hair);
+    vertical-align: top; color: var(--ink); font-weight: 400; }                                   /* ink 16.8:1 */
+  .rec-table tbody tr:last-child th, .rec-table tbody tr:last-child td { border-bottom: 0; }
+  .rec-plan { font-family: var(--font-display); font-weight: 600; }
+  .rec-vendor { font-weight: 400; color: var(--muted); }                                          /* muted 6.8:1 */
+  .rec-table thead th.rec-col-cost, .rec-table td.rec-cost { text-align: right; white-space: nowrap; }
+  .rec-cost { font-family: var(--font-num); font-variant-numeric: tabular-nums; font-weight: 700; }
+  .rec-reason { color: var(--muted); max-width: 36ch; line-height: 1.5; }                          /* muted 6.8:1 */
+  .v-badge { display: inline-flex; align-items: center; gap: .4em; font-weight: 700; font-size: var(--fs-2); white-space: nowrap; }
+  .v-badge::before { content: ""; width: .5em; height: .5em; border-radius: 50%; flex: none; }
+  .v-primary { color: var(--accent); } .v-primary::before { background: var(--accent); }          /* accent 6.7:1 */
+  .v-alt { color: var(--ink); } .v-alt::before { background: var(--accent); }                      /* ink 16.8:1，点用 accent */
+  .v-no { color: var(--state-stale); } .v-no::before { background: var(--state-stale); }           /* 7.75:1 */
+  .v-pend { color: var(--state-estimate); } .v-pend::before { background: var(--state-estimate); } /* 5.9:1 */
+  /* 引擎完整说明原文（折叠、从属；原样透传、pre-line 保换行）——后代选择器绕开内联 style 的 > 转义 */
+  .explanation-note { margin: 1rem 0 0; }
+  .explanation-note summary { color: var(--muted); font-size: var(--fs-2); font-weight: 600; }     /* muted 6.8:1 */
+  .explanation-body { white-space: pre-line; color: var(--ink); font-size: var(--fs-3); line-height: 1.7; margin-top: .5rem; }  /* ink 16.8:1 */
+  /* 「描述你的配置」输入区：fieldset 用响应式 grid 铺满宽度（窄屏 1 列 / 平板 2 / 桌面 3），legend 跨整行给组语义
+     （1.3.1/3.3.2），控件填满各自 cell。注：内联 style 里 hono/jsx 会把子代组合器（大于号）转义成实体而失效，故本区
+     一律用**后代选择器**（空格；此处无嵌套 fieldset/label/button，语义等价、不误伤）。 */
+  form.setup-form { display: block; padding: 1.4rem 1.5rem; }          /* 覆盖 form.filters 的 flex（element+class 特指度）：让 fieldset 独占整宽 */
+  form.setup-form fieldset { display: grid; grid-template-columns: 1fr; gap: .9rem 1.15rem;
+    align-items: end; margin: 0; padding: 0; border: 0; min-width: 0; width: 100%; }
+  @media (min-width: 560px) { form.setup-form fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (min-width: 900px) { form.setup-form fieldset { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  .setup-form legend { grid-column: 1 / -1; float: none; width: 100%; padding: 0; margin: 0 0 .2rem; font-family: var(--font-display);
+    font-size: var(--fs-5); font-weight: 700; color: var(--ink); }
+  .setup-form label { min-width: 0; }
+  .setup-form label select, .setup-form label input { width: 100%; }
+  .setup-form fieldset button { align-self: end; }
+  .setup-form fieldset .chip { align-self: center; justify-self: start; }
+  .setup-hint { margin: .9rem 0 0; font-size: var(--fs-2); color: var(--muted); }  /* muted 6.8:1 */
+  /* 证据抽屉：比价表原样嵌入；summary 稍抬升为可辨识 affordance（≥24px 由 summary 基线保证） */
+  .evidence-drawer { margin: 0 0 2rem; background: var(--surface); border: 1px solid var(--ring);
+    border-radius: var(--r-2); box-shadow: var(--shadow-1); padding: .3rem 1rem; }
+  /* 用类名而非 evidence-drawer 直接子 summary 选择器：hono/jsx 会把内联 style 里的子代组合符转义使规则失效；
+     且抽屉内比价表含嵌套 details/summary 详情行，用后代选择器会误命中，故给抽屉自身 summary 挂类。 */
+  .evidence-summary { font-size: var(--fs-3); font-weight: 600; color: var(--ink); padding: .7rem .2rem; }
+  .evidence-body { padding: .2rem 0 .6rem; }
 `;
 
 /** 徽标：文字标签承载状态 + CSS 绘制记号（`::before`，纯装饰、不承载可及名，spec WCAG ③；无 emoji）。 */
-const AgeBadgeView: FC<{ badge: AgeBadge }> = ({ badge }) => {
+export const AgeBadgeView: FC<{ badge: AgeBadge }> = ({ badge }) => {
   const cls = badge.kind === 'today' ? 'age-today' : badge.kind === 'days' ? 'age-days' : 'age-unchecked';
   return <span class={`badge ${cls}`}>{badge.label}</span>;
 };
@@ -301,15 +459,16 @@ export const PageShell: FC<PropsWithChildren<{ title: string }>> = ({ title, chi
       <a class="skip-link" href="#main">
         跳到主内容
       </a>
-      <header>
-        <h1>Model Radar 比价 · Coding Plan</h1>
-        <p class="muted">
-          只读快照渲染。价格 / 兼容 / 额度为精确事实，逐格可溯源；新鲜度按各事实最近核对日呈现。
+      <header class="site-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1 class="brand-name">Model Radar</h1>
+          <span class="brand-sub">选型顾问</span>
+        </div>
+        <p class="brand-tagline">
+          给开发者的 AI 编程订阅比价与推荐 —— 先给答案，价格 / 兼容 / 额度逐格可溯源。
         </p>
       </header>
-      <nav aria-label="页面导航">
-        <a href="/model-radar">比价首页（清除筛选）</a>
-      </nav>
       <main id="main" tabindex={-1}>{children}</main>
     </body>
   </html>
@@ -409,7 +568,7 @@ export const FilterForm: FC<{ options: FacetOptions; query: WebQuery }> = ({ opt
       />
     </label>
     <label>
-      每轮 token 假设（估算用）
+      每轮 token（估算用）
       <select name="tokensPerRound">
         {TOKENS_PER_ROUND_OPTIONS.map((opt) => (
           <option value={String(opt.value)} selected={resolveTokensPerRound(query.tokensPerRound) === opt.value}>
@@ -431,7 +590,7 @@ export const FilterForm: FC<{ options: FacetOptions; query: WebQuery }> = ({ opt
  * source_url 链接——**全页唯一 `safeHref` 渲染点**（单一 XSS 闸，易审计）：
  * 经 scheme 闸过则渲可点 `<a>`，危险/畸形 scheme（javascript:/data: 等）降级纯文本（design D7）。
  */
-const SourceLink: FC<{ url: string }> = ({ url }) => {
+export const SourceLink: FC<{ url: string }> = ({ url }) => {
   const href = safeHref(url);
   return href ? (
     <a href={href} rel="noopener noreferrer">
@@ -747,6 +906,46 @@ const GroupTable: FC<{
     </div>
   );
 };
+
+/**
+ * 证据抽屉（answer-first 变更 3.1 / design D6）：把变更 A 的比价表 `GroupTable` **原样复用**包进默认折叠的
+ * 原生 `<details id="evidence">`（无 JS、`<summary>` 描述性点明内含全部方案对比与依据 → 答 Q1/Q2/Q4，2.4.6）。
+ * `#evidence` 为答案区/备选溢出的页内锚点目标。
+ *
+ * 契约（调用方 model-radar-page.tsx 必守）：传入的 `groups` MUST 只按**召回维度 `{category,model,tool,protocol}`**
+ * 查询得到（`queryModelRadarSnapshot`），**MUST NOT 传 `currency`/`maxMonthlyPrice`**——否则 `matchesFilters` 会
+ * 滤掉超预算/他币种 plan，使答案区 guidance 引用的落选候选在证据里不可见。表口径/结构/最划算/provenance/A 既有
+ * 标级一律不变；**MUST NOT 向 A 表注入 recommend 的 verdict/超预算/撞窗列**（此组件不接收、不渲染任何 verdict）。
+ * `query`（WebQuery）仅用于表内排序链接的参数保留（不参与快照过滤）。
+ */
+export const EvidenceDrawer: FC<{
+  groups: SnapshotPlanGroup[];
+  unknownInCategory: number;
+  query: WebQuery;
+  now: Date;
+  tokensPerRound: number;
+  sort?: FreshnessSort;
+}> = ({ groups, unknownInCategory, query, now, tokensPerRound, sort }) => (
+  <details id="evidence" class="evidence-drawer">
+    <summary class="evidence-summary">查看全部方案对比与依据（含模型 / 工具、新鲜度）</summary>
+    <div class="evidence-body">
+      {groups.length === 0 ? (
+        <p>无匹配 Coding Plan 套餐。可调整「描述你的配置」。</p>
+      ) : (
+        groups.map((g) => (
+          <GroupTable
+            group={g}
+            unknownInCategory={unknownInCategory}
+            query={query}
+            {...(sort ? { sort } : {})}
+            now={now}
+            tokensPerRound={tokensPerRound}
+          />
+        ))
+      )}
+    </div>
+  </details>
+);
 
 /** 比价页主体：筛选 + 已选 chip + 各组表（task 2.4）。 */
 export const ComparePage: FC<{
