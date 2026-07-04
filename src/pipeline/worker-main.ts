@@ -58,13 +58,60 @@ import {
   buildStalenessConnection,
 } from '../mr/freshness/staleness-queue.js';
 import {
+  createMrPriceCurationQueue,
+  scheduleMrPriceCuration,
+  createMrPriceCurationWorker,
+  buildCurationConnection,
+} from '../mr/curation/curation-queue.js';
+import type { CurationNotify } from '../mr/curation/propose.js';
+import { Bot } from 'grammy';
+import {
+  env,
   isAlertScanEnabled,
   isWeeklyReportEnabled,
   isMrEventReviewEnabled,
   isMrScrapeEnabled,
   isMrStalenessEnabled,
+  isMrPriceCurationEnabled,
+  isMrPriceCurationApprovalReady,
+  isFeishuEnabled,
 } from '../config/env.js';
+import { createFeishuSender } from '../push/feishu.js';
+import { withRetry } from '../collectors/types.js';
 import { assertProductZhColumns } from './product-digest.js';
+
+/**
+ * 装配 curation proposer 的出站发卡回调（design D4）——真实 Telegram/飞书 sender。
+ * **worker 镜像只 `api.sendMessage` 发卡，绝不 `bot.start()`**（长轮询单 getUpdates 消费者归 web 镜像；
+ * 多消费者会 409 flap）。Telegram 卡挂 inline-keyboard（reply_markup）；飞书**仅通知**（无写按钮、不含 token）。
+ * 出站有重试退避 + 错误日志（仓库不变量）。
+ */
+function buildCurationNotify(): CurationNotify {
+  // 仅用 bot.api 出站发送——不 start() 长轮询（web 镜像才收 callback）。
+  const api = new Bot(env.TELEGRAM_BOT_TOKEN).api;
+  const chatId = env.TELEGRAM_CHAT_ID;
+  const feishuSender = isFeishuEnabled() ? createFeishuSender() : undefined;
+
+  const notify: CurationNotify = {
+    async telegram(card): Promise<void> {
+      await withRetry(
+        () =>
+          api.sendMessage(chatId, card.text, {
+            parse_mode: card.parseMode,
+            reply_markup: card.replyMarkup,
+          }),
+        { maxAttempts: 3, baseDelayMs: 1000, label: 'mr-curation-telegram-card' },
+      );
+    },
+  };
+  if (feishuSender) {
+    // feishuSender.send 收 dispatcher 契约的 `JSON.stringify({ card })`；parseMode 被飞书忽略。
+    notify.feishu = async (card): Promise<void> => {
+      await feishuSender.send(JSON.stringify({ card }), 'MarkdownV2');
+    };
+  }
+  return notify;
+}
 
 /** 一条调度链的运行时句柄（worker + queue + 其复用的连接），供统一优雅关闭。 */
 interface ScheduledLane {
@@ -143,6 +190,22 @@ async function main(): Promise<void> {
     await scheduleStaleness(queue);
     const worker = createStalenessWorker({ connection });
     lanes.push({ name: 'mr-staleness', worker, queue, connection });
+  }
+
+  // ── 链 7：Model Radar 价格 curation proposer mr-price-curation（日级 cron，http-only 无 Playwright，主镜像可跑）。
+  //    **跨镜像 fail-closed**（design D4/D5）：除本侧总开关外，还须 `TELEGRAM_APPROVER_IDS` 就绪才注册——
+  //    否则「发卡而无人能批」（proposer 显式确认批准侧白名单存在，各查本侧 env 不足以防此）。
+  //    worker 只发卡（buildCurationNotify 的 api.sendMessage），**绝不 bot.start()**；接收长轮询归 web 镜像。
+  if (isMrPriceCurationApprovalReady()) {
+    const connection = buildCurationConnection();
+    const queue = createMrPriceCurationQueue(connection);
+    await scheduleMrPriceCuration(queue);
+    const worker = createMrPriceCurationWorker({ notify: buildCurationNotify(), connection });
+    lanes.push({ name: 'mr-price-curation', worker, queue, connection });
+  } else if (isMrPriceCurationEnabled()) {
+    console.error(
+      '[worker] mr-price-curation 门控开但 TELEGRAM_APPROVER_IDS 为空 → 不注册 lane（不发无人能批的卡）。',
+    );
   }
 
   console.error(

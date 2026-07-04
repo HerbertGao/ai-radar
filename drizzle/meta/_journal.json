@@ -71,6 +71,13 @@
       "when": 1782816000000,
       "tag": "0009_model_radar_price_state_and_periods",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1783145104539,
+      "tag": "0010_model_radar_price_curation_approval",
+      "breakpoints": true
     }
   ]
 }

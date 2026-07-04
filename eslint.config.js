@@ -178,4 +178,39 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // Model Radar（add-model-radar-price-curation-approval，D1）curation 写入口收窄：
+    // 「只人批准写事实」从散文保证降为 lint 错误。`src/mr/curation/**` 中**仅** `approve.ts`（批准落库核心）
+    // 允许 import `src/mr/ingest/` 事实 writer（`recordPriceChange`/`_recordPriceChangeTx`/`upsertPlan`/
+    // `setPlanAvailability`/`upsertPlanPeriodPrice`）——`propose.ts`/`extract.ts`/`price-review-store.ts` 等
+    // 一律禁 import（否则未来一笔 propose 直接调 writer 就绕过人批准）。__tests__ 豁免（可为集成测搭建注入 writer）。
+    files: ['src/mr/curation/**'],
+    ignores: ['src/mr/curation/approve.ts', 'src/mr/curation/__tests__/**'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/mr/ingest/*', '**/ingest/upsert*', '**/ingest/record-price-change*'],
+              message:
+                'curation/** 中仅 approve.ts 允许 import src/mr/ingest/ 事实 writer（recordPriceChange/_recordPriceChangeTx/upsertPlan/setPlanAvailability/upsertPlanPeriodPrice）——propose/extract 等禁 import，落库唯一走人批准路径。design D1。',
+            },
+            {
+              group: ['**/record-price-change*'],
+              importNames: ['recordPriceChange', '_recordPriceChangeTx'],
+              message:
+                'recordPriceChange 是事实写入口——curation/** 中仅 approve.ts 豁免，其余禁 import。design D1。',
+            },
+            {
+              group: ['**/ingest/upsert*'],
+              importNames: ['upsertPlan', 'setPlanAvailability', 'upsertPlanPeriodPrice'],
+              message:
+                'upsertPlan/setPlanAvailability/upsertPlanPeriodPrice 是授权写入口——curation/** 中仅 approve.ts 豁免，其余禁 import。design D1。',
+            },
+          ],
+        },
+      ],
+    },
+  },
 );
