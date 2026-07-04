@@ -86,6 +86,30 @@ export const mrReviewFlagTargetTypeSchema = z.enum(['plan', 'source', 'vendor'])
 export const mrClientTypeSchema = z.enum(['tool', 'protocol']);
 
 /**
+ * 价格 curation 待批记录状态（add-model-radar-price-curation-approval，design D2/D5）。
+ * **不含 `rejected`**——本期不实现拒绝写路径，忽略即不动、由 supersede/staleness 收敛。
+ */
+export const mrPriceReviewStatusSchema = z.enum([
+  'pending',
+  'approved',
+  'superseded',
+  'apply_failed',
+]);
+
+/**
+ * `mr_price_review` 写行校验闸 —— `openReview`/`supersede` 发 SQL 前必过（有限值集列合法性唯一防线）。
+ * 校验 `status`/`currency`/`source_confidence` 三有限值集列；金额/token/时间戳的形态校验留调用侧
+ * （token 由 randomBytes 生成、extracted_at 由 DB now()、金额贴 numeric(12,2)）。
+ * `currency` nullable（容 NULL 基线占位）；提供时必属 ISO 4217 大写枚举。
+ * 注：CAS 认领（`applyReview`/`markSuperseded`/`markApplyFailed`）只把 status 改为常量合法值，无需过本闸。
+ */
+export const mrPriceReviewWriteSchema = z.object({
+  status: mrPriceReviewStatusSchema,
+  currency: mrCurrencySchema.nullable(),
+  source_confidence: mrSourceConfidenceSchema,
+});
+
+/**
  * 价格金额校验（5c review）——贴合 numeric(12,2) 列：接受 `number | numeric-string`，但须
  * **有限（非 NaN/Infinity）、≥ 0、量级 < 1e10、小数位 ≤ 2**。无此闸时官方 provenance 的 `-1`/NaN/
  * 超 scale 价能落库并在比价 query 成 cheapest。仅校验、不 transform（保持调用方原值写 SQL）。

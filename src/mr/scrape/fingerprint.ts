@@ -21,6 +21,7 @@ import {
   compareAndUpdateFingerprint,
   type FingerprintUpdateOutcome,
 } from '../write/fingerprint-store.js';
+import { setReviewFlag } from '../write/flag.js';
 import {
   safeFetch,
   isAllowedByRobots,
@@ -68,6 +69,62 @@ export interface DetectChangeOptions {
         reason: string,
       ) => Promise<FingerprintUpdateOutcome>)
     | undefined;
+  /** 注入 blocked-page 给 source 打标（默认 setReviewFlag；测试桩免 DB）。 */
+  flagSourceFn?:
+    | ((
+        dbh: DbLike,
+        target: { targetType: string; targetId: string },
+        reason: string | null,
+      ) => Promise<void>)
+    | undefined;
+}
+
+/**
+ * blocked-page 标记（登录墙/验证码/滑块/人机校验/403/forbidden/robot 拦截页，design D8）。
+ * 命中即判该 200 页为「非真内容页」：**不更新指纹**（仿 truncated→skip 幂等语义，基线不被验证码页污染、
+ * 下轮不因「假内容 vs 真内容」误报「变了」）**且给 source 打 `target_type='source'` flag**（源被墙、去看）。
+ * ponytail: 朴素子串启发式，用短语级标记（非裸「登录」——每页导航都有登录链接，会误报每一页）；
+ *   漏报/误报由「打标=让人看一次」兜底。命中面不足时按源加 per-source 标记，此处只兜通用拦截页。
+ */
+const BLOCKED_MARKERS: readonly string[] = [
+  // 验证码 / 人机校验 / 滑块（中英）
+  '验证码',
+  '人机验证',
+  '人机校验',
+  '滑动验证',
+  '拖动滑块',
+  '安全验证',
+  'captcha',
+  'verify you are human',
+  'are you a robot',
+  "i'm not a robot",
+  'unusual traffic',
+  'checking your browser',
+  'cf-challenge',
+  'attention required',
+  // 登录墙（短语级，避开导航「登录」链接误报）
+  '请先登录',
+  '请登录后',
+  '登录后查看',
+  'please log in',
+  'please sign in',
+  'you must be logged in',
+  'login required',
+  // 403 / 拒绝访问（'forbidden' 不裸放——短语级 '403 forbidden' 已覆盖真拦截页，裸词会误伤正文含 forbidden 的合法页）
+  '403 forbidden',
+  'access denied',
+  '拒绝访问',
+  '访问被拒绝',
+];
+
+/** 页面文本是否命中 blocked-page 标记（登录墙/验证码/人机/403 拦截页，design D8）。 */
+export function isBlockedPage(body: string): boolean {
+  // 先剥 <script>/<style> 内容再匹配：否则 'captcha' 会命中合法页嵌入的 recaptcha 脚本 src 等资产，误判整页被墙。
+  const hay = body
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .toLowerCase();
+  return BLOCKED_MARKERS.some((m) => hay.includes(m));
 }
 
 /** sha256 hex 指纹。 */
@@ -93,7 +150,7 @@ export async function detectSourceChange(
   dbh: DbLike,
   source: ScrapeSource,
   options: DetectChangeOptions = {},
-): Promise<FingerprintUpdateOutcome | { outcome: 'skipped' }> {
+): Promise<FingerprintUpdateOutcome | { outcome: 'skipped' } | { outcome: 'blocked' }> {
   // manual 档：不发请求（design D7/合规）。
   if (source.fetchStrategy === 'manual') {
     fetchManual(); // 显式表达「不抓」，无副作用。
@@ -125,6 +182,19 @@ export async function detectSourceChange(
   }
 
   if (body == null) return { outcome: 'skipped' }; // 未抓到（robots 禁/manual）。
+
+  // blocked-page（200 登录墙/验证码/人机校验/403 等非真内容页，design D8）：
+  // **不更新指纹**（仿 truncated→skip，基线不被拦截页污染、下轮不误报「变了」）**且必须给 source 打标**
+  // （否则误判为 blocked 的真价页 / 长期被墙的源会静默退出变更检测而无人知）。
+  if (isBlockedPage(body)) {
+    const flagSource = options.flagSourceFn ?? setReviewFlag;
+    await flagSource(
+      dbh,
+      { targetType: 'source', targetId: source.id },
+      `抓取到疑似登录墙/验证码/人机校验拦截页（源 ${source.id}），未更新指纹，请检查源是否被墙`,
+    );
+    return { outcome: 'blocked' } as const;
+  }
 
   const region = extractor(body, source.sourceUrl);
   const fp = fingerprint(region);

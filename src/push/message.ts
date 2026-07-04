@@ -47,7 +47,7 @@ const MAX_URL_LENGTH = 2000;
 const ELLIPSIS = '…';
 
 /** 转义 Telegram MarkdownV2 保留字符（文本用），避免标题/要点里的特殊符号破坏渲染或发送失败。 */
-function escapeMarkdownV2(text: string): string {
+export function escapeMarkdownV2(text: string): string {
   return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, (ch) => `\\${ch}`);
 }
 
@@ -208,7 +208,7 @@ const FEISHU_MAX_BLOCKS = 50;
  * lark_md 解析 markdown 语法，故标题/要点里的 `[` `]` `(` `)` 需转义，避免误当链接语法；
  * URL 段不走此函数，改走 `escapeLarkMdUrl`（percent-encode、href 安全），二者机制不可互换。
  */
-function escapeLarkMdText(text: string): string {
+export function escapeLarkMdText(text: string): string {
   return text.replace(/[[\]()\\]/g, (ch) => `\\${ch}`);
 }
 

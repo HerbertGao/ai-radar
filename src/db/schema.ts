@@ -33,6 +33,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   varchar,
 } from 'drizzle-orm/pg-core';
 
@@ -738,6 +739,62 @@ export const mrReviewFlag = pgTable(
       table.targetType,
       table.targetId,
     ),
+  ],
+);
+
+/**
+ * 价格 curation 待批记录（add-model-radar-price-curation-approval，design D2）。
+ * 承载「一条冻结的候选事实 + 一次性能力令牌」跨「检测到 → 人批准」的异步间隙——不复用 mr_review_flag
+ * （后者是 UNIQUE(target_type,target_id) 单行塌缩标，不存值/币种/provenance/令牌，同 plan 两候选会互相覆盖）。
+ *
+ * 关键不变量：
+ * - `(plan_id) WHERE status='pending'` **偏唯一索引** = 每 plan 至多一条待批、发一次卡的闸
+ *   （普通 UNIQUE 会连已决/superseded/apply_failed 历史行一起唯一化——须用 partial index）。
+ * - `old_value`(开记录时 current_price 快照) / `candidate_value` / `currency` / provenance 在开记录时
+ *   **冻结在行上**；批准落库只用行上冻结值，绝不从批准入站数据取金额（design D3）。
+ *   金额 numeric(12,2) nullable、贴合 mr_plans.current_price 列型（escalate 无值/NULL 基线时为 NULL）。
+ * - `token` = CSPRNG randomBytes(16)（真 128-bit）hex、UNIQUE、单用（行本身 + CAS 即单用能力）。
+ * - `extracted_at` **由 DB now() 写入**（TTL 比较也用 DB now()，单一时钟，防应用时钟偏移改变有效期窗口）。
+ * - `status ∈ {pending,approved,superseded,apply_failed}`（**不含 rejected**——本期不实现拒绝写路径，
+ *   忽略即不动、由 supersede/staleness 收敛）。取值集合法性唯一防线 = mr-schema.zod（全仓零 pg-enum/零 CHECK）。
+ * - `plan_id` 裸 varchar(128) 引用，不建 FK（同其余 mr_* 表口径）。
+ */
+// ponytail: 无界增长天花板——已决行（approved/superseded/apply_failed）只累积不清理；无正确性/性能影响
+// （偏唯一索引仅覆盖 status='pending'，历史行不参与唯一化也不进热路径查询）。量真大了再加一条 prune lane。
+export const mrPriceReview = pgTable(
+  'mr_price_review',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    planId: varchar('plan_id', { length: 128 }).notNull(),
+    // 开记录时 current_price 快照（nullable：基线未定/登录墙占位时 NULL）+ 候选值（nullable：escalate 无值卡）。
+    // 贴合 mr_plans.current_price 列型 numeric(12,2)。
+    oldValue: numeric('old_value', { precision: 12, scale: 2 }),
+    candidateValue: numeric('candidate_value', { precision: 12, scale: 2 }),
+    // 冻结币种（同币种门后单列即够；nullable 容 NULL 基线占位）。
+    currency: varchar('currency', { length: 3 }),
+    sourceUrl: text('source_url').notNull(),
+    sourceConfidence: text('source_confidence').notNull(),
+    // 一次性能力令牌（randomBytes(16) hex）；UNIQUE，走 Telegram callback_data、绝不进飞书/URL/日志。
+    token: varchar('token', { length: 128 }).notNull(),
+    status: text('status').notNull().default('pending'),
+    // DB 单时钟：TTL 比较用 now() - extracted_at，防应用时钟偏移。
+    extractedAt: timestamp('extracted_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    decidedBy: text('decided_by'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_price_review_token_key').on(table.token),
+    // 偏唯一索引：每 plan 至多一条 pending（发一次卡的闸）；已决/superseded/apply_failed 历史行不参与唯一化。
+    uniqueIndex('mr_price_review_plan_id_pending_key')
+      .on(table.planId)
+      .where(sql`status = 'pending'`),
   ],
 );
 

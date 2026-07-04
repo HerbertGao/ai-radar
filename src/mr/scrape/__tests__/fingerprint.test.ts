@@ -97,6 +97,99 @@ describe('detectSourceChange 编排', () => {
     expect(compareFn).not.toHaveBeenCalled();
   });
 
+  it('200 登录墙/验证码页 → 不更新指纹 + 给 source 打标（blocked，不误报「变了」）', async () => {
+    const compareFn = vi.fn();
+    const flagSourceFn = vi.fn(async () => {});
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's-blocked', sourceUrl: 'https://openai.com/pricing', fetchStrategy: 'http' },
+      {
+        fetchHttp: async () =>
+          '<html><body>请完成安全验证：拖动滑块完成人机验证</body></html>',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(out).toEqual({ outcome: 'blocked' });
+    expect(compareFn).not.toHaveBeenCalled(); // 指纹链不跑 → content_fingerprint 不更新。
+    expect(flagSourceFn).toHaveBeenCalledWith(
+      fakeDb,
+      { targetType: 'source', targetId: 's-blocked' },
+      expect.any(String),
+    );
+  });
+
+  it('blocked 页下轮抓到真内容 → 正常比对（compare 被调）', async () => {
+    const compareFn = vi.fn(async () => ({ outcome: 'changed', flaggedPlans: 1 }) as const);
+    const flagSourceFn = vi.fn(async () => {});
+    // 上一轮：登录墙 → blocked，不比对。
+    await detectSourceChange(
+      fakeDb,
+      { id: 's6', sourceUrl: 'https://openai.com/p', fetchStrategy: 'http' },
+      {
+        fetchHttp: async () => 'captcha: verify you are human',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(compareFn).not.toHaveBeenCalled();
+    // 下一轮：真内容 → 正常比对。
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's6', sourceUrl: 'https://openai.com/p', fetchStrategy: 'http' },
+      {
+        fetchHttp: async () => '<html>Price $20/mo</html>',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(out).toEqual({ outcome: 'changed', flaggedPlans: 1 });
+    expect(compareFn).toHaveBeenCalledOnce();
+  });
+
+  it('普通价页含导航「登录」链接 → 不误判 blocked（calibration：短语级标记）', async () => {
+    const compareFn = vi.fn(async () => ({ outcome: 'unchanged' }) as const);
+    const flagSourceFn = vi.fn();
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's7', sourceUrl: 'https://openai.com/pricing', fetchStrategy: 'http' },
+      {
+        fetchHttp: async () =>
+          '<nav><a>登录</a><a>注册</a></nav><h1>Pricing</h1> $20/mo',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(out).toEqual({ outcome: 'unchanged' });
+    expect(compareFn).toHaveBeenCalledOnce();
+    expect(flagSourceFn).not.toHaveBeenCalled();
+  });
+
+  it('价页嵌 recaptcha 脚本 / 正文含 forbidden 字样 → 不误判 blocked（剥 script + 去裸 forbidden）', async () => {
+    const compareFn = vi.fn(async () => ({ outcome: 'unchanged' }) as const);
+    const flagSourceFn = vi.fn();
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's8', sourceUrl: 'https://openai.com/pricing', fetchStrategy: 'http' },
+      {
+        // recaptcha 只在 <script> 资产里（剥 script 后不命中 'captcha'）；正文 'forbidden' 是营销文案非拦截页。
+        fetchHttp: async () =>
+          '<script src="https://www.google.com/recaptcha/api.js"></script>' +
+          '<h1>Pricing</h1> $20/mo — no forbidden features',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(out).toEqual({ outcome: 'unchanged' });
+    expect(compareFn).toHaveBeenCalledOnce();
+    expect(flagSourceFn).not.toHaveBeenCalled();
+  });
+
   it('未知 fetchStrategy → fail-closed skipped，不发请求（纵深防御，非落 http）', async () => {
     const fetchHttp = vi.fn();
     const fetchBrowser = vi.fn();

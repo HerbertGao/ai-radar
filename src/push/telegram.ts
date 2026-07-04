@@ -9,6 +9,7 @@
  * 目标 chat 取 env.TELEGRAM_CHAT_ID。
  */
 import { Bot } from 'grammy';
+import type { InlineKeyboardMarkup } from 'grammy/types';
 import { env } from '../config/env.js';
 import type { MessageSender } from './dispatcher.js';
 
@@ -17,7 +18,8 @@ export interface BotApiLike {
   sendMessage(
     chatId: string | number,
     text: string,
-    other?: { parse_mode?: 'MarkdownV2' },
+    // reply_markup 可选：批准卡片挂 inline-keyboard，其余发送不传（向后兼容既有调用）。
+    other?: { parse_mode?: 'MarkdownV2'; reply_markup?: InlineKeyboardMarkup },
   ): Promise<unknown>;
 }
 

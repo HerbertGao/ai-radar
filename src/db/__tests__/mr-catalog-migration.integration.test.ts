@@ -124,9 +124,10 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     'mr_plan_sources',
     'mr_review_flag',
     'mr_catalog_version',
+    'mr_price_review',
   ];
 
-  it('逐一点名全部 12 张 mr_* 表存在', async () => {
+  it('逐一点名全部 13 张 mr_* 表存在', async () => {
     const { rows } = await pool!.query<{ table_name: string }>(
       `SELECT table_name FROM information_schema.tables WHERE table_name = ANY($1)`,
       [ALL_TABLES],
@@ -135,10 +136,10 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     for (const t of ALL_TABLES) {
       expect(present.has(t), `缺表 ${t}`).toBe(true);
     }
-    expect(present.size).toBe(12);
+    expect(present.size).toBe(13);
   });
 
-  it('全部命名唯一约束逐一就位且为精确集（恰 12 条、无多余、命名表级 *_key）', async () => {
+  it('全部命名唯一约束逐一就位且为精确集（恰 13 条、无多余、命名表级 *_key）', async () => {
     // 读所有 mr_* 表 UNIQUE 约束（含约束名 + 覆盖列集合，按列名排序聚合）。
     const { rows } = await pool!.query<{
       table_name: string;
@@ -172,11 +173,13 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       mr_plan_sources: 'plan_id,source_id',
       mr_review_flag: 'target_id,target_type',
       mr_catalog_version: 'version',
+      // mr_price_review：token UNIQUE 约束（偏唯一索引 plan_id WHERE pending 是 INDEX 非 CONSTRAINT，不入 table_constraints）。
+      mr_price_review: 'token',
     };
-    // 精确集：恰 11 条 mr_* UNIQUE 约束，多一条（第 12 条意外约束）即红。
+    // 精确集：恰 13 条 mr_* UNIQUE 约束，多一条（第 14 条意外约束）即红。
     expect(
       rows.length,
-      `mr_* UNIQUE 约束应恰 11 条；实际 ${rows.length}：${JSON.stringify(
+      `mr_* UNIQUE 约束应恰 13 条；实际 ${rows.length}：${JSON.stringify(
         rows.map((r) => `${r.table_name}.${r.constraint_name}(${r.columns})`),
       )}`,
     ).toBe(Object.keys(expected).length);
@@ -280,6 +283,14 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_catalog_version', 'version'],
       ['mr_catalog_version', 'built_at'],
       ['mr_catalog_version', 'created_at'],
+      // mr_price_review（old_value/candidate_value/currency/decided_at/decided_by 刻意可空）
+      ['mr_price_review', 'plan_id'],
+      ['mr_price_review', 'source_url'],
+      ['mr_price_review', 'source_confidence'],
+      ['mr_price_review', 'token'],
+      ['mr_price_review', 'status'],
+      ['mr_price_review', 'extracted_at'],
+      ['mr_price_review', 'created_at'],
     ];
     const { rows } = await pool!.query<{
       table_name: string;
@@ -312,6 +323,11 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_review_flag', 'resolved_at'],
       ['mr_source', 'last_checked'],
       ['mr_source', 'content_fingerprint'],
+      ['mr_price_review', 'old_value'],
+      ['mr_price_review', 'candidate_value'],
+      ['mr_price_review', 'currency'],
+      ['mr_price_review', 'decided_at'],
+      ['mr_price_review', 'decided_by'],
     ];
     const { rows } = await pool!.query<{
       table_name: string;
@@ -349,6 +365,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       ['mr_source', 'vendor_id'],
       ['mr_plan_sources', 'source_id'],
       ['mr_plan_sources', 'plan_id'],
+      ['mr_price_review', 'plan_id'],
     ];
     const { rows } = await pool!.query<{
       table_name: string;
@@ -387,7 +404,7 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       `SELECT table_name, column_name, data_type, numeric_precision, numeric_scale
        FROM information_schema.columns
        WHERE table_name LIKE 'mr_%'
-         AND column_name IN ('value', 'current_price', 'old_value', 'new_value', 'price')`,
+         AND column_name IN ('value', 'current_price', 'old_value', 'new_value', 'price', 'candidate_value')`,
     );
     const byKey = new Map(
       rows.map((r) => [`${r.table_name}.${r.column_name}`, r]),
@@ -402,6 +419,8 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       'mr_plan_prices.price',
       'mr_price_history.old_value',
       'mr_price_history.new_value',
+      'mr_price_review.old_value',
+      'mr_price_review.candidate_value',
     ]) {
       const col = byKey.get(key)!;
       expect(col.data_type, `${key} 应 numeric`).toBe('numeric');

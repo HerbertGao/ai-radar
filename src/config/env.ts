@@ -409,6 +409,45 @@ const envSchema = z.object({
   // 与既有 `MR_SNAPSHOT_TTL_MS`（5b 抓取文件快照 TTL，design D13）**无关**：那管 .mr-snapshots 临时证据文件保留期，
   // 此管 5c 进程内只读快照缓存的重建周期，二者除名字相近外无任何关系。默认 300000（5min，价改/陈旧可见延迟上界）。
   MR_SNAPSHOT_REBUILD_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
+
+  // ─── Model Radar 价格 curation 一键批准（add-model-radar-price-curation-approval，design D4/D5）───
+  // 总开关，默认 'false'（合并即门控关；仿 ALERT_SCAN_ENABLED / MR_SCRAPE_ENABLED）。
+  // 关闭时 proposer 不注册 curation lane、接收侧不 start bot。
+  MR_PRICE_CURATION_ENABLED: z.enum(['true', 'false']).default('false'),
+  // proposer BullMQ lane 日级 cron（错峰其余 MR 链：http 13:09 / browser 周一 09:17 / staleness 09:43）。
+  MR_PRICE_CURATION_CRON: z.string().min(1).default('53 9 * * *'),
+  // Telegram 一键批准白名单：逗号分隔的**数值** user id 清单，解析为 number[]（callback 鉴权按
+  // `from.id` 数值比较、**非** chat.id，design D4/D5）。默认空 = 无人可批 → 跨镜像 fail-closed：
+  // proposer 须 MR_PRICE_CURATION_ENABLED 且本清单非空才注册 lane（否则发卡无人能批），
+  // 接收侧缺清单即不 start bot（各由后续 group 门控）。非正整数条目启动即报错（守 env 不变量）。
+  TELEGRAM_APPROVER_IDS: z
+    .string()
+    .default('')
+    .transform((raw, ctx) => {
+      const ids: number[] = [];
+      for (const part of raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)) {
+        const n = Number(part);
+        if (!Number.isInteger(n) || n <= 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              'TELEGRAM_APPROVER_IDS 条目「' +
+              part +
+              '」不是正整数 Telegram user id（逗号分隔的数值 id 清单，按 from.id 数值鉴权）。',
+          });
+          continue;
+        }
+        ids.push(n);
+      }
+      return ids;
+    }),
+  // 待批记录有效期（小时）：批准 CAS 谓词含 `extracted_at > now()-make_interval(hours => <此值>)`，
+  // 闭合"泄漏令牌长期可用"窗口。**必须是正整数**——下游 approve 用它拼 make_interval（校验过的整数、
+  // 非字面拼接），非法值（NaN/负/0/小数）启动即报错。默认 72（3 天，够人工批一次）。
+  MR_PRICE_REVIEW_TTL_HOURS: z.coerce.number().int().positive().default(72),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
@@ -523,4 +562,25 @@ export function isMrScrapeEnabled(e: Env = env): boolean {
 }
 export function isMrStalenessEnabled(e: Env = env): boolean {
   return e.MR_STALENESS_ENABLED === 'true';
+}
+
+/**
+ * Model Radar 价格 curation 一键批准是否启用（默认禁用）。
+ *
+ * 仅本侧开关。**跨镜像 fail-closed 由调用方组合判定**（design D4/D5）：
+ * - proposer（worker）须 `isMrPriceCurationEnabled() && env.TELEGRAM_APPROVER_IDS.length > 0`
+ *   才注册 lane——单查本侧开关不足以防"发卡而无人能批"，故还须显式确认批准白名单就绪。
+ * - 接收侧（web）须 `env.TELEGRAM_APPROVER_IDS.length > 0` 才 `bot.start()`。
+ * lane / bot 注册由后续 group 接线，此处只提供开关与已解析的 `TELEGRAM_APPROVER_IDS`。
+ */
+export function isMrPriceCurationEnabled(e: Env = env): boolean {
+  return e.MR_PRICE_CURATION_ENABLED === 'true';
+}
+
+/**
+ * 价格 curation 一键批准是否「就绪」：本侧开关开 **且** 批准白名单非空（否则发卡无人能批）。
+ * proposer（worker）与接收侧（web）的跨镜像 fail-closed 门控复用此判定（design D4/D5）。
+ */
+export function isMrPriceCurationApprovalReady(e: Env = env): boolean {
+  return isMrPriceCurationEnabled(e) && e.TELEGRAM_APPROVER_IDS.length > 0;
 }
