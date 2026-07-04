@@ -408,8 +408,21 @@ export const SEED_VENDORS: SeedVendor[] = [
         name: '千帆 Coding Plan',
         category: 'coding_plan',
         availability: 'on_sale',
-        // 5d-C 人在环已核：真月付标准价 ¥40/月。
+        // 5d-C 人在环已核：真月付标准价 ¥40/月（Lite 档）。2026-07 官方文档复核仍 ¥40（≈1.8 万次/月）。
         currentPrice: 40,
+        currency: 'CNY',
+        sourceUrl: 'https://cloud.baidu.com/doc/qianfan/s/imlg0beiu',
+        sourceConfidence: 'official_pricing',
+        limits: [{ limitType: 'credit', value: null, window: 'month' }],
+        models: [{ family: 'ernie', version: '' }],
+        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+      },
+      {
+        name: '千帆 Coding Plan Pro',
+        category: 'coding_plan',
+        availability: 'on_sale',
+        // 2026-07 官方文档核（cloud.baidu.com/doc/qianfan/s/imlg0beiu）：Pro 档 ¥200/月（≈9 万次/月）。
+        currentPrice: 200,
         currency: 'CNY',
         sourceUrl: 'https://cloud.baidu.com/doc/qianfan/s/imlg0beiu',
         sourceConfidence: 'official_pricing',
