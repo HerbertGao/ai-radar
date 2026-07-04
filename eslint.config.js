@@ -192,7 +192,9 @@ export default tseslint.config(
         {
           patterns: [
             {
-              group: ['**/mr/ingest/*', '**/ingest/upsert*', '**/ingest/record-price-change*'],
+              // `**/ingest/*` 匹配相对 `../ingest/…` import 文本，兜住未来新命名 writer（curation 不需任何 ingest import，
+              // 除 approve.ts 的豁免 writer——故整目录 ban 全 ingest 安全，不像 scrape/freshness 会 import seed-data）。
+              group: ['**/ingest/*', '**/mr/ingest/*', '**/ingest/upsert*', '**/ingest/record-price-change*'],
               message:
                 'curation/** 中仅 approve.ts 允许 import src/mr/ingest/ 事实 writer（recordPriceChange/_recordPriceChangeTx/upsertPlan/setPlanAvailability/upsertPlanPeriodPrice）——propose/extract 等禁 import，落库唯一走人批准路径。design D1。',
             },

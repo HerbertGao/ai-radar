@@ -110,17 +110,20 @@ const BLOCKED_MARKERS: readonly string[] = [
   'please sign in',
   'you must be logged in',
   'login required',
-  // 403 / forbidden / 拒绝访问
+  // 403 / 拒绝访问（'forbidden' 不裸放——短语级 '403 forbidden' 已覆盖真拦截页，裸词会误伤正文含 forbidden 的合法页）
   '403 forbidden',
   'access denied',
   '拒绝访问',
   '访问被拒绝',
-  'forbidden',
 ];
 
 /** 页面文本是否命中 blocked-page 标记（登录墙/验证码/人机/403 拦截页，design D8）。 */
 export function isBlockedPage(body: string): boolean {
-  const hay = body.toLowerCase();
+  // 先剥 <script>/<style> 内容再匹配：否则 'captcha' 会命中合法页嵌入的 recaptcha 脚本 src 等资产，误判整页被墙。
+  const hay = body
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .toLowerCase();
   return BLOCKED_MARKERS.some((m) => hay.includes(m));
 }
 

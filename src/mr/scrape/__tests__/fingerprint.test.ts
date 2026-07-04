@@ -169,6 +169,27 @@ describe('detectSourceChange 编排', () => {
     expect(flagSourceFn).not.toHaveBeenCalled();
   });
 
+  it('价页嵌 recaptcha 脚本 / 正文含 forbidden 字样 → 不误判 blocked（剥 script + 去裸 forbidden）', async () => {
+    const compareFn = vi.fn(async () => ({ outcome: 'unchanged' }) as const);
+    const flagSourceFn = vi.fn();
+    const out = await detectSourceChange(
+      fakeDb,
+      { id: 's8', sourceUrl: 'https://openai.com/pricing', fetchStrategy: 'http' },
+      {
+        // recaptcha 只在 <script> 资产里（剥 script 后不命中 'captcha'）；正文 'forbidden' 是营销文案非拦截页。
+        fetchHttp: async () =>
+          '<script src="https://www.google.com/recaptcha/api.js"></script>' +
+          '<h1>Pricing</h1> $20/mo — no forbidden features',
+        compareFn,
+        flagSourceFn,
+        writeSnapshotFile: false,
+      },
+    );
+    expect(out).toEqual({ outcome: 'unchanged' });
+    expect(compareFn).toHaveBeenCalledOnce();
+    expect(flagSourceFn).not.toHaveBeenCalled();
+  });
+
   it('未知 fetchStrategy → fail-closed skipped，不发请求（纵深防御，非落 http）', async () => {
     const fetchHttp = vi.fn();
     const fetchBrowser = vi.fn();

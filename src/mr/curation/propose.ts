@@ -202,9 +202,17 @@ async function proposeForSource(
     );
   } catch (err) {
     // Telegram 发卡失败（重试耗尽）：刚开的未过期 pending 会令下轮 cron「同候选未过期」no-op → 72h 无卡。
-    // 置该 review superseded（顶层 db；系统触发无审批人 → decidedBy=null）令下轮重新开卡，再上抛交
-    // per-source 隔离计为 error（非静默 carded）。飞书通知在此路径不发（本源本轮已判失败）。
-    await markSuperseded(opened.reviewId, null, dbh);
+    // 置该 review superseded（顶层 db；系统触发无审批人 → decidedBy=null）令下轮重新开卡，再上抛原始
+    // Telegram 错误交 per-source 隔离计为 error（非静默 carded）。飞书通知在此路径不发（本源本轮已判失败）。
+    // 补偿 supersede 自身失败须单独 catch+log，绝不掩盖原始 Telegram 错误（否则原因丢失 + review 仍 pending）。
+    try {
+      await markSuperseded(opened.reviewId, null, dbh);
+    } catch (supersedeErr) {
+      console.error(
+        `[mr-curation] 发卡失败后补偿 supersede 也失败（review 仍 pending，待下轮/TTL 兜底）review=${opened.reviewId}`,
+        supersedeErr instanceof Error ? supersedeErr.message : String(supersedeErr),
+      );
+    }
     throw err;
   }
   // 飞书通知-only：其失败绝不改源结果 / 不动 money 路径——本地兜底记日志后仍 carded。

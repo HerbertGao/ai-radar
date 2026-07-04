@@ -31,7 +31,7 @@ const PROMO_MARKERS = [
 /** 登录墙/验证码/封禁标记（抓到即无候选，design D6 场景「登录墙不给数」）。 */
 const BLOCKED_MARKERS = [
   '登录', '登陆', '验证码', '滑块', '人机验证', '请先登录',
-  'sign in', 'log in', 'login', 'captcha', 'are you a robot', 'forbidden', 'access denied', '403',
+  'sign in', 'log in', 'login', 'captcha', 'are you a robot', 'forbidden', 'access denied',
 ];
 
 /** 月付单位标记（无月付单位 = 非月价页，不预填）。 */

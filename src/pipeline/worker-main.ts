@@ -88,7 +88,8 @@ import { assertProductZhColumns } from './product-digest.js';
  */
 function buildCurationNotify(): CurationNotify {
   // 仅用 bot.api 出站发送——不 start() 长轮询（web 镜像才收 callback）。
-  const api = new Bot(env.TELEGRAM_BOT_TOKEN).api;
+  // 显式 30s 客户端超时：grammY 默认 500s，Telegram 卡顿时 3 次重试会长时间占用 worker（此 bot 无长轮询，短超时安全）。
+  const api = new Bot(env.TELEGRAM_BOT_TOKEN, { client: { timeoutSeconds: 30 } }).api;
   const chatId = env.TELEGRAM_CHAT_ID;
   const feishuSender = isFeishuEnabled() ? createFeishuSender() : undefined;
 

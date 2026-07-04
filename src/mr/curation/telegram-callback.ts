@@ -221,10 +221,16 @@ export function startApprovalBot(
   bot.catch((err) => logRedacted('[mr-curation] 批准 bot 轮询/处理错误', err.error ?? err));
 
   // 不 await start()（长轮询常驻，promise 直到 stop() 才 resolve，design D4）。
-  void bot.start({
-    onStart: () =>
-      console.error('[mr-curation] 批准 bot 长轮询已启动（web 单副本，单 getUpdates 消费者）'),
-  });
+  // 但 grammY 会 rethrow 致命 getUpdates 错误（401 无效 token / 409 第二消费者）令该 promise reject——
+  // 必须 .catch 兜底（脱敏记日志），否则 unhandledRejection 会拖垮 web 进程。
+  void bot
+    .start({
+      onStart: () =>
+        console.error('[mr-curation] 批准 bot 长轮询已启动（web 单副本，单 getUpdates 消费者）'),
+    })
+    .catch((err) =>
+      logRedacted('[mr-curation] 批准 bot 长轮询致命错误（已停止，web 进程未崩溃）', err),
+    );
 
   return { stop: () => bot.stop() };
 }
