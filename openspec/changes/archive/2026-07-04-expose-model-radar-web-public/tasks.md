@@ -2,9 +2,9 @@
 
 ## 1. Cloudflare 侧 provision（一次性，用户在 CF 控制台 / API；记入文档、凭据不入库）
 
-- [ ] 1.1 `cloudflared tunnel create <name>` 建 **locally-managed** named tunnel → 得**凭据 JSON 文件**（含隧道 UUID + secret；**非 token 模式**）；选定一个**全新**公开 hostname
-- [ ] 1.2 DNS 加 **CNAME**（proxied，橙云）把 hostname 指向 `<tunnel-id>.cfargotunnel.com`；**MUST NOT 加任何 A/AAAA 指向 origin/家宽 IP**；审计该 hostname（及 apex）**CT 日志 / passive-DNS 历史**无历史家宽 A 记录（有则换 hostname）
-- [ ] 1.3 配 WAF 托管规则 + 对 `/model-radar` 的速率限制：**把选定的具体阈值记进配置/文档**（起点 60/IP/min·action=block·duration=10min；**不留占位 `N`**）、规则 **匹配所有方法、按 path 计（忽略 querystring）**——这 + 资源上限是洪泛真正兜底；配 cache rule：`/model-radar` **30–60s micro-cache，custom cache key 仅纳入已识别参全集 `API_QUERY_KEYS`+`sort`+`usageProfile`+`tokensPerRound`（丢弃未知参）**（漏 `usageProfile`/`tokensPerRound` 会同 key 服务不同用户的错误推荐）、**显式标 HTML 可缓 + Edge-TTL=override + 只缓 200 响应**（origin 无 `Cache-Control`，否则直穿 DYNAMIC；只缓 200 防冷启 503/400 被边缘缓存延长故障窗一个 TTL）、`/model-radar/assets/*.woff2` 长 TTL；**不启用 Always-Online**
+- [x] 1.1 `cloudflared tunnel create <name>` 建 **locally-managed** named tunnel → 得**凭据 JSON 文件**（含隧道 UUID + secret；**非 token 模式**）；选定一个**全新**公开 hostname
+- [x] 1.2 DNS 加 **CNAME**（proxied，橙云）把 hostname 指向 `<tunnel-id>.cfargotunnel.com`；**MUST NOT 加任何 A/AAAA 指向 origin/家宽 IP**；审计该 hostname（及 apex）**CT 日志 / passive-DNS 历史**无历史家宽 A 记录（有则换 hostname）
+- [x] 1.3 配 WAF 托管规则 + 对 `/model-radar` 的速率限制：**把选定的具体阈值记进配置/文档**（起点 60/IP/min·action=block·duration=10min；**不留占位 `N`**）、规则 **匹配所有方法、按 path 计（忽略 querystring）**——这 + 资源上限是洪泛真正兜底；配 cache rule：`/model-radar` **30–60s micro-cache，custom cache key 仅纳入已识别参全集 `API_QUERY_KEYS`+`sort`+`usageProfile`+`tokensPerRound`（丢弃未知参）**（漏 `usageProfile`/`tokensPerRound` 会同 key 服务不同用户的错误推荐）、**显式标 HTML 可缓 + Edge-TTL=override + 只缓 200 响应**（origin 无 `Cache-Control`，否则直穿 DYNAMIC；只缓 200 防冷启 503/400 被边缘缓存延长故障窗一个 TTL）、`/model-radar/assets/*.woff2` 长 TTL；**不启用 Always-Online**
 
 ## 2. compose 集成 `cloudflared` 服务（`app` profile，locally-managed）
 
@@ -21,11 +21,11 @@
 
 ## 4. 部署验证（mac-mini 上，spec 场景对账）
 
-- [ ] 4.1 `compose --profile app up -d cloudflared` 起隧道；`https://<host>/model-radar` 返回 200 SSR 页、TLS 有效（spec R1「公网 HTTPS 可达」）
-- [ ] 4.2 字体经隧道可加载、公网域名下 CSP `font-src 'self'` 自洽、无混合内容 / 无 CSP 拦（spec R2「静态字体经隧道可加载」）
-- [ ] 4.3 **ingress 作用域按名核对**：公网请求 `/model-radar/snapshot`、`/model-radar/plans`、`/health` 均 **404**；编码穿越走**页与 assets 两条分支**（`/model-radar/..%2fsnapshot`、**`/model-radar/assets/..%2f..%2fsnapshot`**、`//model-radar/snapshot`）、大小写变体、伪 Host 均落 catch-all 404；仅页 `/model-radar`（含 querystring）与 `.woff2` 字体可达（spec R2「比价 JSON API 与 /health 经隧道 404」「含编码/伪 Host 变体不绕过」）
+- [x] 4.1 `compose --profile app up -d cloudflared` 起隧道；`https://<host>/model-radar` 返回 200 SSR 页、TLS 有效（spec R1「公网 HTTPS 可达」）
+- [x] 4.2 字体经隧道可加载、公网域名下 CSP `font-src 'self'` 自洽、无混合内容 / 无 CSP 拦（spec R2「静态字体经隧道可加载」）
+- [x] 4.3 **ingress 作用域按名核对**：公网请求 `/model-radar/snapshot`、`/model-radar/plans`、`/health` 均 **404**；编码穿越走**页与 assets 两条分支**（`/model-radar/..%2fsnapshot`、**`/model-radar/assets/..%2f..%2fsnapshot`**、`//model-radar/snapshot`）、大小写变体、伪 Host 均落 catch-all 404；仅页 `/model-radar`（含 querystring）与 `.woff2` 字体可达（spec R2「比价 JSON API 与 /health 经隧道 404」「含编码/伪 Host 变体不绕过」）
 - [ ] 4.4 **origin 不暴露核对**：家宽 **IPv4+IPv6** 端口探测无 web/DB/Redis 开放、宿主 `:3000` 非公网/LAN 第二 ingress；hostname 无 A/AAAA 指 origin、CT/passive-DNS 无历史家宽记录（spec R1「origin 不直接暴露（含 DNS 残留与双栈）」）
 - [ ] 4.5 **凭据 / 失败语义核对**：缺 / 空 / **畸形非空（坏 JSON / 缺字段）** / 无效 凭据起 `cloudflared` → 公网无任何路由被服务（缺/空/畸形 → 预检或原生 parse 非零退出拒起、无效 → 边缘 CF 1033）（spec R3「缺/空凭据 fail-closed」+ 畸形经原生 parse）；停 `web` 时边缘如实 502 而非 Always-Online 陈旧（spec R4「origin 不可达时诚实报错」）
 - [ ] 4.6 **防护 / 缓存核对**：对 `/model-radar` 高频洪泛触发具体阈值限流；`CF-Cache-Status` 命中（非长期 DYNAMIC 直穿——证 HTML 可缓 + Edge-TTL override 生效）；**cache key 正确性**：仅差未知参（`?_=1` vs `?_=2`）→ 同一缓存页（坍缩），但**仅差已识别参**（`?usageProfile=light` vs `heavy`、或 `?tokensPerRound=…`）→ **不同页**（证识别参全集入 key、不串用户推荐）；且**变参洪泛（`?_=<rand>`）仍被限流/资源上限兜底**（证不靠 cache 挡洪泛）；确认页**不发 `Set-Cookie`/个性化头**（stateless SSR，缓存正确性前提）；同机 Postgres/Redis/ingestion worker 不被饿死（spec R4「请求洪泛被限流 + micro-cache、同机管线不被饿死」）
-- [ ] 4.7 **网络分段核对（双向）**：负向——从 `cloudflared` 容器内**无法解析 / 触达 Postgres·Redis**（仅 `web` 可达）；正向——`web` **仍能达 Postgres·Redis**（容器内 `/health` 报 db+redis OK、或改价后快照 age 前进），证加专用网未把 `web` 掉出数据网（spec R1「网络分段」）
+- [x] 4.7 **网络分段核对（双向）**：负向——从 `cloudflared` 容器内**无法解析 / 触达 Postgres·Redis**（仅 `web` 可达）；正向——`web` **仍能达 Postgres·Redis**（容器内 `/health` 报 db+redis OK、或改价后快照 age 前进），证加专用网未把 `web` 掉出数据网（spec R1「网络分段」）
 - [ ] 4.8 确认 ingestion 从不把 `source_url` 填成内部 / tailnet URL（provenance 公开无碍，仅确认无内部主机名泄漏）
