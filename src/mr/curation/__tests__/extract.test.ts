@@ -122,6 +122,14 @@ describe('extract() fail-closed 抽样（design D6）', () => {
     expect(r).toEqual({ kind: 'escalate', reason: 'login-wall' });
   });
 
+  it('价区正文含裸 login/forbidden（非登录墙）→ 不误判 login-wall，正常抽取候选', () => {
+    const r = extract({
+      body: '<nav><a>login</a></nav> Pro plan ¥46/月 — no forbidden features',
+      sourceUrl: 'https://x.com/pricing',
+    });
+    expect(r).toEqual({ kind: 'candidate', value: 46, currency: 'CNY' });
+  });
+
   it('无月付单位 → escalate', () => {
     const r = extract({ body: '一次性 ¥46', sourceUrl: 'https://x.com' });
     expect(r).toEqual({ kind: 'escalate', reason: 'no-period-unit' });

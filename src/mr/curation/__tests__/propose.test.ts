@@ -117,6 +117,7 @@ const officialPlan = (currentPrice: string) => [
     currentPrice,
     currency: 'CNY',
     sourceConfidence: 'official_pricing',
+    sourceUrl: 'https://example.com/pricing',
   },
 ];
 
@@ -163,7 +164,8 @@ describe('runPriceCuration', () => {
     // 监视 update：openReviewOrSupersede 此例 existing=[] 不 update，故 update 命中 = markSuperseded 重开。
     const updateSpy = vi.spyOn(db as unknown as { update: () => unknown }, 'update');
     const notify = makeNotify();
-    notify.telegram.mockRejectedValue(new Error('telegram down'));
+    const telegramErr = new Error('telegram down');
+    notify.telegram.mockRejectedValue(telegramErr);
     const fetchFn = vi.fn(async () => ({
       status: 200,
       finalUrl: 'https://example.com/pricing',
@@ -171,12 +173,20 @@ describe('runPriceCuration', () => {
       truncated: false,
     }));
 
+    // 捕获 per-source 隔离日志（验证上抛的是原始 Telegram 错误、非 supersede 补偿错误）。
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const res = await runPriceCuration({ notify, dbh: db as never, fetchFn });
 
     expect(res.carded).toBe(0);
     expect(res.errors).toBe(1);
     expect(updateSpy).toHaveBeenCalledTimes(1); // markSuperseded 置刚开的 review superseded → 下轮重开卡
     expect(notify.feishu).not.toHaveBeenCalled(); // 失败路径不发飞书通知
+    // 上抛的是原始 Telegram 错误（非 supersede 补偿错误）——per-source 日志记 telegram 错误消息。
+    const loggedMsg = errSpy.mock.calls.find(
+      (c) => typeof c[0] === 'string' && c[0].includes('源处理失败'),
+    );
+    expect(loggedMsg?.[1]).toBe('telegram down');
+    errSpy.mockRestore();
   });
 
   it('飞书通知失败 → 仍 carded（通知-only，不改源结果 / 不影响 money 路径）', async () => {
@@ -286,5 +296,41 @@ describe('runPriceCuration', () => {
 
     expect(res.skipped).toBe(1);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('源 URL ≠ plan canonical sourceUrl → escalated（provenance 不可信，不重抓/不抽取/不开卡）', async () => {
+    const db = makeDb({
+      flags: oneFlag,
+      source: [
+        { id: 'src-1', sourceUrl: 'https://aggregator.com/pricing', fetchStrategy: 'http' },
+      ],
+      planSources: [{ planId: 'plan-1' }],
+      plan: [
+        {
+          name: 'Coding Plan Pro',
+          currentPrice: '40.00',
+          currency: 'CNY',
+          sourceConfidence: 'official_pricing',
+          sourceUrl: 'https://example.com/pricing', // canonical ≠ 重抓源
+        },
+      ],
+    });
+    const notify = makeNotify();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchFn = vi.fn(async () => {
+      throw new Error('不该重抓非 canonical 源');
+    });
+
+    const res = await runPriceCuration({ notify, dbh: db as never, fetchFn });
+
+    expect(res.escalated).toBe(1);
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(notify.telegram).not.toHaveBeenCalled();
+    expect(
+      errSpy.mock.calls.some(
+        (c) => typeof c[0] === 'string' && c[0].includes('源 URL 与 plan canonical 源不一致'),
+      ),
+    ).toBe(true);
+    errSpy.mockRestore();
   });
 });

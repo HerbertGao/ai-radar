@@ -101,7 +101,16 @@ function buildCurationNotify(): CurationNotify {
             parse_mode: card.parseMode,
             reply_markup: card.replyMarkup,
           }),
-        { maxAttempts: 3, baseDelayMs: 1000, label: 'mr-curation-telegram-card' },
+        {
+          maxAttempts: 3,
+          baseDelayMs: 1000,
+          label: 'mr-curation-telegram-card',
+          // 镜像接收侧 logRedacted 纪律：只落 err.message，不落含 reply_markup/callback_data 的 error 对象。
+          logError: (msg, err) =>
+            console.error(
+              `[mr-curation] ${msg}: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+        },
       );
     },
   };

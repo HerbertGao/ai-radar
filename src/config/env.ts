@@ -578,9 +578,14 @@ export function isMrPriceCurationEnabled(e: Env = env): boolean {
 }
 
 /**
- * 价格 curation 一键批准是否「就绪」：本侧开关开 **且** 批准白名单非空（否则发卡无人能批）。
+ * 价格 curation 一键批准是否「就绪」：本侧开关开 **且** 批准白名单非空 **且** TELEGRAM_CHAT_ID 数值化
+ * （否则 worker 发卡 string chatId 可达但 web 端 Number()→NaN 令 bot 静默不 start → 发卡无人能批）。
  * proposer（worker）与接收侧（web）的跨镜像 fail-closed 门控复用此判定（design D4/D5）。
  */
 export function isMrPriceCurationApprovalReady(e: Env = env): boolean {
-  return isMrPriceCurationEnabled(e) && e.TELEGRAM_APPROVER_IDS.length > 0;
+  return (
+    isMrPriceCurationEnabled(e) &&
+    e.TELEGRAM_APPROVER_IDS.length > 0 &&
+    Number.isFinite(Number(e.TELEGRAM_CHAT_ID))
+  );
 }

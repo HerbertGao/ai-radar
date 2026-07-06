@@ -212,6 +212,8 @@ describe('applyReview 落库失败', () => {
 
     expect(out.kind).toBe('failed');
     expect((out as { reviewId: string }).reviewId).toBe('r-1');
+    // writer 被调（确认代码未跳过 writer 直接返回 failed）
+    expect(mocks.recordPriceChangeTx).toHaveBeenCalledTimes(1);
     expect(mocks.markApplyFailed).toHaveBeenCalledWith('r-1', 'approver-1', db);
     expect(mocks.markSuperseded).not.toHaveBeenCalled();
     // flag 不 resolve：approve.ts 结构上不 import resolveFlag/markChecked，无从塌缩整页 flag。
@@ -252,5 +254,15 @@ describe('applyReview 落库失败', () => {
     expect(out.kind).toBe('failed');
     expect(mocks.markApplyFailed).toHaveBeenCalledWith('r-1', 'approver-1', db);
     expect(mocks.markSuperseded).not.toHaveBeenCalled();
+  });
+
+  it('冻结行 candidateValue 为 null → apply_failed，未调 writer', async () => {
+    // gate=prefill 保证非 null，此 guard 是显式运行时兜底（移除 `as string` 谎言）。
+    mocks.claimReview.mockResolvedValue({ ...FROZEN, candidateValue: null });
+    const db = makeDb(PLAN_AT_BASELINE); // 基线匹配（currency 非 null）→ 过漂移校验 → 命中 null guard
+    const out = await applyReview('tok-live', 'approver-1', db as never);
+    expect(out.kind).toBe('failed');
+    expect(mocks.recordPriceChangeTx).not.toHaveBeenCalled(); // guard 在 writer 前抛出
+    expect(mocks.markApplyFailed).toHaveBeenCalledWith('r-1', 'approver-1', db);
   });
 });

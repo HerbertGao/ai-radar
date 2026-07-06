@@ -31,6 +31,7 @@ import {
 } from './http-tier.js';
 import { fetchManual } from './manual-tier.js';
 import { writeSnapshot } from './snapshot.js';
+import { BLOCKED_MARKERS } from './blocked-markers.js';
 
 type DbLike = typeof defaultDb;
 
@@ -78,44 +79,6 @@ export interface DetectChangeOptions {
       ) => Promise<void>)
     | undefined;
 }
-
-/**
- * blocked-page 标记（登录墙/验证码/滑块/人机校验/403/forbidden/robot 拦截页，design D8）。
- * 命中即判该 200 页为「非真内容页」：**不更新指纹**（仿 truncated→skip 幂等语义，基线不被验证码页污染、
- * 下轮不因「假内容 vs 真内容」误报「变了」）**且给 source 打 `target_type='source'` flag**（源被墙、去看）。
- * ponytail: 朴素子串启发式，用短语级标记（非裸「登录」——每页导航都有登录链接，会误报每一页）；
- *   漏报/误报由「打标=让人看一次」兜底。命中面不足时按源加 per-source 标记，此处只兜通用拦截页。
- */
-const BLOCKED_MARKERS: readonly string[] = [
-  // 验证码 / 人机校验 / 滑块（中英）
-  '验证码',
-  '人机验证',
-  '人机校验',
-  '滑动验证',
-  '拖动滑块',
-  '安全验证',
-  'captcha',
-  'verify you are human',
-  'are you a robot',
-  "i'm not a robot",
-  'unusual traffic',
-  'checking your browser',
-  'cf-challenge',
-  'attention required',
-  // 登录墙（短语级，避开导航「登录」链接误报）
-  '请先登录',
-  '请登录后',
-  '登录后查看',
-  'please log in',
-  'please sign in',
-  'you must be logged in',
-  'login required',
-  // 403 / 拒绝访问（'forbidden' 不裸放——短语级 '403 forbidden' 已覆盖真拦截页，裸词会误伤正文含 forbidden 的合法页）
-  '403 forbidden',
-  'access denied',
-  '拒绝访问',
-  '访问被拒绝',
-];
 
 /** 页面文本是否命中 blocked-page 标记（登录墙/验证码/人机/403 拦截页，design D8）。 */
 export function isBlockedPage(body: string): boolean {

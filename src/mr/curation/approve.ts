@@ -109,11 +109,18 @@ export async function applyReview(
         throw new BaselineDriftError(claimed.id); // 基线漂移：ratio-gate 前提失效 → 回滚 → superseded。
       }
 
-      // ③ 同事务落库（传**冻结**候选/provenance；currency/candidate 为 null 时 writer 内 Zod 抛错 → apply_failed 兜底）。
+      // ③ 同事务落库（传**冻结**候选/provenance）。candidateValue/currency 为 nullable DB 列——gate=prefill
+      // 保证非 null，但显式运行时校验移除 `as string` 谎言：null 则 apply_failed（与 writer Zod 抛错同路径）。
+      if (claimed.candidateValue == null || claimed.currency == null) {
+        throw new ApplyFailedError(
+          claimed.id,
+          `冻结行 candidateValue/currency 为 null（review=${claimed.id}）`,
+        );
+      }
       const outcome = await _recordPriceChangeTx(tx, {
         planId: claimed.planId,
-        newValue: claimed.candidateValue as string,
-        currency: claimed.currency as string,
+        newValue: claimed.candidateValue,
+        currency: claimed.currency,
         provenance: {
           sourceUrl: claimed.sourceUrl,
           sourceConfidence: claimed.sourceConfidence,
