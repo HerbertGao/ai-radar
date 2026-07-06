@@ -24,5 +24,5 @@
 
 ## 5. 收尾
 
-- [ ] 5.1 归档：`/opsx:archive` 把 2 条修改需求同步进 `openspec/specs/model-radar-price-curation/spec.md`
+- [x] 5.1 归档：`/opsx:archive` 把 2 条修改需求同步进 `openspec/specs/model-radar-price-curation/spec.md`
 - [ ] 5.2 （既有 follow-up，不属本变更）prod 启用前补 DB 集成测试 / `BOT_TOKEN` 轮换
