@@ -53,4 +53,28 @@ describe('5.4 curation 写入口收窄：仅 approve.ts 可 import 事实 writer
     );
     expect(n).toBeGreaterThan(0);
   }, ESLINT_TIMEOUT_MS);
+
+  it('curation/card.ts import recordPriceChange → eslint 报错', async () => {
+    const code = `import { recordPriceChange } from '../ingest/record-price-change.js';\nexport { recordPriceChange };\n`;
+    const n = await restrictedImportErrors(code, 'src/mr/curation/card.ts');
+    expect(n).toBeGreaterThan(0);
+  }, ESLINT_TIMEOUT_MS);
+
+  it('curation/curation-queue.ts import recordPriceChange → eslint 报错', async () => {
+    const code = `import { recordPriceChange } from '../ingest/record-price-change.js';\nexport { recordPriceChange };\n`;
+    const n = await restrictedImportErrors(code, 'src/mr/curation/curation-queue.ts');
+    expect(n).toBeGreaterThan(0);
+  }, ESLINT_TIMEOUT_MS);
+
+  it('curation/money.ts import recordPriceChange → eslint 报错', async () => {
+    const code = `import { recordPriceChange } from '../ingest/record-price-change.js';\nexport { recordPriceChange };\n`;
+    const n = await restrictedImportErrors(code, 'src/mr/curation/money.ts');
+    expect(n).toBeGreaterThan(0);
+  }, ESLINT_TIMEOUT_MS);
+
+  it('curation/telegram-callback.ts import recordPriceChange → eslint 报错', async () => {
+    const code = `import { recordPriceChange } from '../ingest/record-price-change.js';\nexport { recordPriceChange };\n`;
+    const n = await restrictedImportErrors(code, 'src/mr/curation/telegram-callback.ts');
+    expect(n).toBeGreaterThan(0);
+  }, ESLINT_TIMEOUT_MS);
 });

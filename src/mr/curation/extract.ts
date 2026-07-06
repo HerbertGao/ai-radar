@@ -16,6 +16,7 @@ import {
   type PriceRegionExtractor,
 } from '../scrape/http-tier.js';
 import { isOfficialConfidence, mrCurrencySchema } from '../../db/mr-schema.zod.js';
+import { BLOCKED_MARKERS } from '../scrape/blocked-markers.js';
 
 export type MrCurrency = z.infer<typeof mrCurrencySchema>;
 
@@ -26,12 +27,6 @@ const MAX_MONTHLY_PRICE = 100_000;
 const PROMO_MARKERS = [
   '折', '优惠', '限时', '立减', '首月', '券后', '秒杀', '特惠',
   'discount', 'sale', 'promo', 'coupon', '% off', 'save ', 'off)', 'off ', 'deal',
-];
-
-/** 登录墙/验证码/封禁标记（抓到即无候选，design D6 场景「登录墙不给数」）。 */
-const BLOCKED_MARKERS = [
-  '登录', '登陆', '验证码', '滑块', '人机验证', '请先登录',
-  'sign in', 'log in', 'login', 'captcha', 'are you a robot', 'forbidden', 'access denied',
 ];
 
 /** 月付单位标记（无月付单位 = 非月价页，不预填）。 */

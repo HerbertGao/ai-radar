@@ -139,8 +139,10 @@ async function proposeForSource(
   if (planRows.length !== 1) return 'escalated';
   const planId = planRows[0]!.planId;
 
-  // 载入 plan 事实快照（现价/币种/置信度）。sourceConfidence 取自 plan 行（服务端注册表派生的
-  // provenance，**非页面内容**）——gate 用它判官方源，防篡改页抬高置信度。
+  // 载入 plan 事实快照（现价/币种/置信度/sourceUrl）。sourceConfidence 取自 plan 行（服务端注册表派生的
+  // provenance，**非页面内容**）——gate 用它判官方源，防篡改页抬高置信度。sourceUrl 用于校验重抓源与
+  // plan 注册的 canonical 源一致——若源经 mr_plan_sources 关联但 URL 不同于 plan 的 canonical 源，
+  // 候选的 provenance 无法信任地继承 plan 的官方置信度 → escalate（不开卡、不写 price_history）。
   const plan = (
     await dbh
       .select({
@@ -148,11 +150,24 @@ async function proposeForSource(
         currentPrice: mrPlans.currentPrice,
         currency: mrPlans.currency,
         sourceConfidence: mrPlans.sourceConfidence,
+        sourceUrl: mrPlans.sourceUrl,
       })
       .from(mrPlans)
       .where(eq(mrPlans.id, planId))
   )[0];
   if (!plan) return 'skipped';
+
+  // provenance 一致性哨兵：重抓源 URL 必须等于 plan 注册的 canonical 源 URL。一个 plan 可能经
+  // mr_plan_sources 关联多个源（含非官方聚合源）——若候选来自非 canonical 源，其置信度不能继承
+  // plan.sourceConfidence（否则非官方源抽取的候选会带着官方置信度写进 mr_price_history）。
+  if (source.sourceUrl !== plan.sourceUrl) {
+    // 显式诊断：URL 漂移会令该源永久 escalate（与 no-candidate/gate-escalate 在计数器上无法区分）。
+    console.error(
+      `[mr-curation] 源 URL 与 plan canonical 源不一致 → escalate（provenance 不可继承官方置信度）` +
+        `source=${sourceId} sourceUrl=${source.sourceUrl} planUrl=${plan.sourceUrl}`,
+    );
+    return 'escalated';
+  }
 
   // 重抓（复用 scrape SSRF chokepoint + 裸请求）。truncated/空体/非 2xx → skip（不据坏体抽值）。
   const res = await fetchFn(source.sourceUrl);
