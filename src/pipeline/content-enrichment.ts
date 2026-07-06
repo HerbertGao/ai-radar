@@ -120,6 +120,15 @@ function isDeniedIpv6(ip: string): boolean {
   if (lower === '::1' || lower === '::') return true;
   const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
   if (mapped) return isDeniedIpv4(mapped[1]!);
+  // IPv4-mapped **十六进制**形态：Node WHATWG URL 把 `[::ffff:127.0.0.1]` 归一为 `::ffff:7f00:1`
+  // （压缩 hex，非点分十进制）——仅匹配点分会漏放内网/环回/元数据（如 ::ffff:a9fe:a9fe=169.254.169.254）。
+  // 取末 32 位两组 hex → 还原 4 字节 IPv4 → 复用 isDeniedIpv4。
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1]!, 16);
+    const lo = parseInt(mappedHex[2]!, 16);
+    return isDeniedIpv4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
+  }
   if (/^f[cd][0-9a-f]{2}(:|$)/.test(lower)) return true; // fc00::/7
   if (/^fe[89ab][0-9a-f](:|$)/.test(lower)) return true; // fe80::/10
   return false;
