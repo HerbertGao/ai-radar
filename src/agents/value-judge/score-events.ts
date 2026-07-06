@@ -6,7 +6,7 @@
  *
  * 关键不变量（spec「Agent 输出落库往返」/ design D1/D8，逐条照抄到此守住）：
  * - 写分必须 `UPDATE ai_news_events ... WHERE event_id = ?`，`set` 中**仅含**
- *   *_score 与 should_push 列；禁止 `INSERT ... ON CONFLICT` 模板，禁止在 set 带
+ *   *_score / should_push / is_ai_related 列；禁止 `INSERT ... ON CONFLICT` 模板，禁止在 set 带
  *   event_id / representative_raw_item_id / representative_title / first_seen_at /
  *   published_at——否则覆盖塌缩首建的身份/排序列致 Top N 静默退化
  *   （P0 已删的 persistEventScores 全列覆盖式 set 是反面模板）。
@@ -20,7 +20,7 @@
  */
 import { and, eq, isNull, or, lt, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
-import { aiNewsEvents } from '../../db/schema.js';
+import { aiNewsEvents, rawItems } from '../../db/schema.js';
 import { env } from '../../config/env.js';
 import { mapOutputToEventScores } from './mapping.js';
 import {
@@ -32,10 +32,16 @@ import {
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
 
-/** 一条待评分事件的最小视图（judge 的 prompt 输入由代表标题构成）。 */
+/**
+ * 一条待评分事件的最小视图。judge 的 prompt 输入由代表标题 + 补全后正文 + 来源构成
+ * （content/source 经 representative_raw_item_id left join raw_items 载入，供 grounding；
+ * 补全失败 content 仍空时如实回退仅标题，见 value-judge-agent「须以正文与来源 grounding」）。
+ */
 interface UnscoredEvent {
   eventId: string;
   representativeTitle: string | null;
+  content: string | null;
+  source: string | null;
 }
 
 /** 批量评分结果（供编排组做阶段熔断：分母 = scored + degraded = 本轮**实际送判**数）。 */
@@ -174,8 +180,16 @@ export async function scoreUnscoredEvents(
     .select({
       eventId: aiNewsEvents.eventId,
       representativeTitle: aiNewsEvents.representativeTitle,
+      // 补全后正文 + 来源（left join，经 representative_raw_item_id）：judge 以此 grounding。
+      // left join 而非 inner——representative_raw_item_id 可空或 raw_item 缺失时仍保留事件（content 回退 null）。
+      content: rawItems.content,
+      source: rawItems.source,
     })
     .from(aiNewsEvents)
+    .leftJoin(
+      rawItems,
+      eq(aiNewsEvents.representativeRawItemId, rawItems.id),
+    )
     // P3 tombstone 排除（合并核心闭环）：候选 SELECT 加 `merged_into IS NULL`——被吞 tombstone（评分
     // 前 importance_score 为 NULL）若不排除会被 value-judge 重新选中评分「复活」、进而被 Top N 选中独立
     // 推送，使合并比不合并更糟（spec「tombstone 对所有下游消费者不可见」）。claim/评分写 CAS 另各自加。
@@ -203,13 +217,16 @@ export async function scoreUnscoredEvents(
         {
           // 代表标题为塌缩首建写入的原始 title（NOT NULL 期望，但列可空，兜底空串）。
           title: event.representativeTitle ?? '',
+          // 补全后正文 + 来源（补全失败 content 仍空时如实回退仅标题——buildPrompt 只在非空时拼入）。
+          content: event.content,
+          source: event.source,
         },
         options.judge,
       );
 
       const scoreColumns = mapOutputToEventScores(output);
 
-      // 关键不变量：UPDATE ... WHERE event_id = ?，set 仅含 *_score 与 should_push。
+      // 关键不变量：UPDATE ... WHERE event_id = ?，set 仅含 *_score / should_push / is_ai_related。
       // 绝不带身份/代表/排序列，绝不用 INSERT ON CONFLICT。
       // P3 tombstone 排除（合并核心闭环）：评分写 CAS 自身 WHERE 加 `merged_into IS NULL`——claim 成功
       // 后、评分写前仍存在链内二次 TOCTOU（日报合并可在此间隙把已 claim 的事件置 tombstone）。谓词落
@@ -222,6 +239,8 @@ export async function scoreUnscoredEvents(
           developerRelevanceScore: scoreColumns.developerRelevanceScore,
           hypeRiskScore: scoreColumns.hypeRiskScore,
           shouldPush: scoreColumns.shouldPush,
+          // is_ai_related 落库（不再丢弃）：要闻段 selectTopN 据此 fail-closed 闸门过滤。
+          isAiRelated: scoreColumns.isAiRelated,
         })
         .where(and(eq(aiNewsEvents.eventId, event.eventId), isNull(aiNewsEvents.mergedInto)))
         .returning({ eventId: aiNewsEvents.eventId });

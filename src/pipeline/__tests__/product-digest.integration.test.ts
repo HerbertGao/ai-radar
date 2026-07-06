@@ -39,7 +39,13 @@ const db = pool ? drizzle(pool, { schema }) : null;
 const PREFIX = `pd-itest-${process.pid}-`;
 const PUSH_DATE_1 = '2099-03-01';
 
-/** 插一条 ai_products，返回 product_id（用前缀 + 显式 product_id 隔离）。 */
+/**
+ * 插一条 ai_products，返回 product_id（用前缀 + 显式 product_id 隔离）。
+ *
+ * `isAiRelated` 默认 `true`：本套件多数用例只验证候选查询的链接/跨天/冲突口径，须让产品通过
+ * AI 闸门（`selectProductCandidates` 默认 applyAiGate=true 加 `is_ai_related = true` 谓词）才可见；
+ * 专测闸门的用例显式传 false / null。
+ */
 async function seedProduct(args: {
   suffix: string;
   name?: string;
@@ -47,12 +53,13 @@ async function seedProduct(args: {
   githubRepo?: string | null;
   productHuntSlug?: string | null;
   metadata?: Record<string, unknown> | null;
+  isAiRelated?: boolean | null;
 }): Promise<string> {
   const productId = `${PREFIX}${args.suffix}`;
   await pool!.query(
     `INSERT INTO ai_products
-       (product_id, name, canonical_domain, github_repo, product_hunt_slug, last_seen_at, metadata)
-     VALUES ($1, $2, $3, $4, $5, now(), $6::jsonb)`,
+       (product_id, name, canonical_domain, github_repo, product_hunt_slug, last_seen_at, metadata, is_ai_related)
+     VALUES ($1, $2, $3, $4, $5, now(), $6::jsonb, $7)`,
     [
       productId,
       args.name ?? `${PREFIX}${args.suffix}-name`,
@@ -60,6 +67,7 @@ async function seedProduct(args: {
       args.githubRepo ?? null,
       args.productHuntSlug ?? null,
       args.metadata ? JSON.stringify(args.metadata) : null,
+      args.isAiRelated === undefined ? true : args.isAiRelated,
     ],
   );
   return productId;
@@ -206,5 +214,33 @@ describe.skipIf(!canRun)('selectProductCandidates 候选查询（productDiscover
     // 产品候选不被 event 的 success 抑制（target_type 不同各自独立命名空间）。
     const candidates = await selectProductCandidates('telegram', db!);
     expect(candidates.map((c) => c.eventId)).toContain(sharedId);
+  });
+
+  // AI 相关闸门（fail-closed，design D5/D6，tasks 6.4/6.6）：applyAiGate=true（默认）时仅
+  // is_ai_related=true 入推送候选，false/NULL 排除；applyAiGate=false（判定工作集）时不施加闸门。
+  it('非 AI 产品（is_ai_related=false）被推送候选排除、不进新品段', async () => {
+    const pid = await seedProduct({ suffix: 'gate-false', isAiRelated: false });
+    // 其余候选谓词（merge_conflict IS NULL / 从未 success）全 TRUE，is_ai_related 为唯一区分量。
+    const candidates = await selectProductCandidates('telegram', db!);
+    expect(candidates.map((c) => c.eventId)).not.toContain(pid);
+    // 无闸门候选集（applyAiGate=false）则纳入（证明排除只由闸门造成、非其它谓词）。
+    const ungated = await selectProductCandidates('telegram', db!, undefined, false);
+    expect(ungated.map((c) => c.eventId)).toContain(pid);
+  });
+
+  it('未判定产品（is_ai_related=NULL）被推送候选 fail-closed 排除，但无闸门候选集含它', async () => {
+    const pid = await seedProduct({ suffix: 'gate-null', isAiRelated: null });
+    // applyAiGate=true：eq(is_ai_related,true) 谓词把 NULL 排除（fail-closed，非 IS NOT FALSE 漏放）。
+    const gated = await selectProductCandidates('telegram', db!);
+    expect(gated.map((c) => c.eventId)).not.toContain(pid);
+    // applyAiGate=false：判定工作集取无闸门候选，NULL 产品在其中 → 后续可被判定步骤选中（不死锁）。
+    const ungated = await selectProductCandidates('telegram', db!, undefined, false);
+    expect(ungated.map((c) => c.eventId)).toContain(pid);
+  });
+
+  it('AI 产品（is_ai_related=true）正常入推送候选', async () => {
+    const pid = await seedProduct({ suffix: 'gate-true', isAiRelated: true });
+    const candidates = await selectProductCandidates('telegram', db!);
+    expect(candidates.map((c) => c.eventId)).toContain(pid);
   });
 });

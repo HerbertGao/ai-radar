@@ -138,7 +138,9 @@ describe.skipIf(!databaseUrl)('查询链仅 DATABASE_URL 可加载（N2 / 子进
     // execFileAsync 在非 0 退出时 reject（带 stdout/stderr）——能到这里即 exit 0。
     expect(stderr).not.toContain('IMPORT_THREW');
     void stdout;
-  });
+    // 子进程 `npx tsx` 冷启动 + import 全量工具图可 >5s（子进程自身 60s 预算），it 默认 5s 超时过紧。
+    // 外层 it 给 70s：比子进程 60s 预算多 10s 冗余，容 spawn/IPC/teardown 开销（否则子进程用满 60s 即误红）。
+  }, 70_000);
 
   it('剪裁 env（仅 DATABASE_URL）实跑 env-clean build.ts getter：首次调用不触 parseEnv 崩溃', async () => {
     // 装载期测（上面 import tools/index.ts）只注册 handler、不执行其运行期 `await import('build.js')`，
@@ -175,5 +177,7 @@ describe.skipIf(!databaseUrl)('查询链仅 DATABASE_URL 可加载（N2 / 子进
     // execFileAsync 非 0 退出即 reject（带 stderr）——能到这里即 exit 0、build 真正取到快照。
     expect(stderr).not.toContain('GETTER_THREW');
     expect(stderr).not.toContain('BAD_SNAPSHOT');
-  });
+    // 子进程 `npx tsx` 冷启动 + import + 实跑可 >5s（子进程自身 60s 预算），it 默认 5s 超时过紧。
+    // 外层 it 给 70s：比子进程 60s 预算多 10s 冗余，容 spawn/IPC/teardown 开销（否则子进程用满 60s 即误红）。
+  }, 70_000);
 });

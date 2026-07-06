@@ -45,12 +45,13 @@ async function seedEvent(args: {
   shouldPush?: boolean;
   mergedInto?: string | null;
   representativeRawItemId?: bigint | null;
+  isAiRelated?: boolean | null;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
     `INSERT INTO ai_news_events
        (dedup_key, representative_title, first_seen_at, last_seen_at, published_at,
-        importance_score, should_push, merged_into, representative_raw_item_id, source_count)
-     VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,1)
+        importance_score, should_push, merged_into, representative_raw_item_id, is_ai_related, source_count)
+     VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,1)
      RETURNING event_id`,
     [
       args.dedupKey,
@@ -61,6 +62,9 @@ async function seedEvent(args: {
       args.shouldPush ?? false,
       args.mergedInto ?? null,
       args.representativeRawItemId ?? null,
+      // is_ai_related 闸门（selectTopN 新增 eq(is_ai_related,true)）：默认 true 保既有用例入选口径，
+      // tombstone 仍由 merged_into 排除、与本列无关。
+      args.isAiRelated ?? true,
     ],
   );
   return rows[0]!.event_id;

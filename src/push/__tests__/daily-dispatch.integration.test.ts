@@ -73,16 +73,19 @@ async function seedProduct(args: {
   suffix: string;
   canonicalDomain?: string | null;
   metadata?: Record<string, unknown> | null;
+  isAiRelated?: boolean | null;
 }): Promise<string> {
   const productId = `${PREFIX}p-${args.suffix}`;
   await pool!.query(
-    `INSERT INTO ai_products (product_id, name, canonical_domain, last_seen_at, metadata)
-     VALUES ($1, $2, $3, now(), $4::jsonb)`,
+    `INSERT INTO ai_products (product_id, name, canonical_domain, last_seen_at, metadata, is_ai_related)
+     VALUES ($1, $2, $3, now(), $4::jsonb, $5)`,
     [
       productId,
       `${PREFIX}${args.suffix}-name`,
       args.canonicalDomain ?? null,
       args.metadata ? JSON.stringify(args.metadata) : null,
+      // is_ai_related 闸门（selectProductCandidates 新增 eq(is_ai_related,true)）：默认 true 保既有候选口径。
+      args.isAiRelated ?? true,
     ],
   );
   return productId;

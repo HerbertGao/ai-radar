@@ -31,6 +31,7 @@ beforeAll(async () => {
   process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
   process.env.TELEGRAM_BOT_TOKEN ||= 'test-bot-token';
   process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
+  process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
   const idx = await import('../index.js');
   summarizeProduct = idx.summarizeProduct;
   ProductDigestFailureError = idx.ProductDigestFailureError;
@@ -42,6 +43,7 @@ beforeAll(async () => {
 const VALID_OUTPUT = {
   name_zh: '某编码助手',
   tagline_zh: '一款面向开发者的开源编码助手，支持多文件编辑与命令行集成。',
+  is_ai_related: true,
 };
 
 // 上游双重编码乱码样本（U+0080–U+00BF 续字节成片出现，命中 mojibake 判据）。
@@ -86,6 +88,7 @@ describe('productDigestOutputSchema', () => {
       productDigestOutputSchema.safeParse({
         name_zh: '字'.repeat(NAME_ZH_MAX),
         tagline_zh: VALID_OUTPUT.tagline_zh,
+        is_ai_related: true,
       }).success,
     ).toBe(true);
   });
@@ -133,6 +136,7 @@ describe('productDigestOutputSchema', () => {
       productDigestOutputSchema.safeParse({
         name_zh: VALID_OUTPUT.name_zh,
         tagline_zh: '字'.repeat(PRODUCT_TAGLINE_MAX),
+        is_ai_related: true,
       }).success,
     ).toBe(true);
   });
@@ -142,7 +146,30 @@ describe('productDigestOutputSchema', () => {
       productDigestOutputSchema.safeParse({
         name_zh: VALID_OUTPUT.name_zh,
         tagline_zh: MOJIBAKE,
+        is_ai_related: true,
       }).success,
+    ).toBe(false);
+  });
+
+  // is_ai_related（必填布尔，design D5）：与 name_zh/tagline_zh 同调用产出、经 Zod 校验。
+  it('接受 is_ai_related=false 的合法输出（非 AI 产品，仍须落库判定）', () => {
+    expect(
+      productDigestOutputSchema.safeParse({ ...VALID_OUTPUT, is_ai_related: false }).success,
+    ).toBe(true);
+  });
+
+  it('拒绝缺 is_ai_related 字段（缺则视同未产出 → 重试/降级）', () => {
+    expect(
+      productDigestOutputSchema.safeParse({
+        name_zh: VALID_OUTPUT.name_zh,
+        tagline_zh: VALID_OUTPUT.tagline_zh,
+      }).success,
+    ).toBe(false);
+  });
+
+  it('拒绝非布尔 is_ai_related（如字符串 "true"）', () => {
+    expect(
+      productDigestOutputSchema.safeParse({ ...VALID_OUTPUT, is_ai_related: 'true' }).success,
     ).toBe(false);
   });
 });
@@ -248,7 +275,7 @@ describe('summarizeProduct（mock generateObject）', () => {
   });
 });
 
-describe('updateProductZh：UPDATE set 仅含中文列（mock db）', () => {
+describe('updateProductZh：UPDATE set 仅含中文列 + is_ai_related（mock db）', () => {
   /** 制造一个最小 db stub，记录 update().set().where() 调用参数。 */
   function makeDbStub() {
     const setSpy = vi.fn();
@@ -262,16 +289,25 @@ describe('updateProductZh：UPDATE set 仅含中文列（mock db）', () => {
     return { dbStub: { update } as never, setSpy, whereSpy, update };
   }
 
-  it('落库 UPDATE：set 仅含 nameZh + taglineZh，绝不触碰塌缩/合并/状态列', async () => {
+  it('落库 UPDATE：set 仅含 nameZh + taglineZh + isAiRelated，绝不触碰塌缩/合并/状态列', async () => {
     const { dbStub, setSpy, update } = makeDbStub();
-    await updateProductZh(dbStub, 'prod-1', VALID_OUTPUT.name_zh, VALID_OUTPUT.tagline_zh);
+    await updateProductZh(dbStub, 'prod-1', VALID_OUTPUT.name_zh, VALID_OUTPUT.tagline_zh, true);
     expect(update).toHaveBeenCalledTimes(1);
-    // set 仅含 nameZh + taglineZh，绝不含 name / canonical_domain / metadata / merge_conflict 等。
-    expect(setSpy).toHaveBeenCalledWith({
-      nameZh: VALID_OUTPUT.name_zh,
-      taglineZh: VALID_OUTPUT.tagline_zh,
-    });
     const setArg = setSpy.mock.calls[0]![0] as Record<string, unknown>;
-    expect(Object.keys(setArg).sort()).toEqual(['nameZh', 'taglineZh']);
+    // set 仅含这三列，绝不含 name / canonical_domain / metadata / merge_conflict 等。
+    expect(Object.keys(setArg).sort()).toEqual(['isAiRelated', 'nameZh', 'taglineZh']);
+    // is_ai_related 直接写入判定布尔（本轮首次落库）。
+    expect(setArg.isAiRelated).toBe(true);
+    // nameZh / taglineZh 用 COALESCE(既有, 新值) SQL 表达式（补判不覆盖既有译名，design D5 陷阱二），
+    // 故为 drizzle SQL 对象而非裸字符串——落库真实 COALESCE 语义由集成测连真库验证。
+    expect(typeof setArg.nameZh).not.toBe('string');
+    expect(typeof setArg.taglineZh).not.toBe('string');
+  });
+
+  it('落库 UPDATE：透传 is_ai_related=false（非 AI 产品判定同样落库、不丢弃）', async () => {
+    const { dbStub, setSpy } = makeDbStub();
+    await updateProductZh(dbStub, 'prod-2', VALID_OUTPUT.name_zh, VALID_OUTPUT.tagline_zh, false);
+    const setArg = setSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(setArg.isAiRelated).toBe(false);
   });
 });

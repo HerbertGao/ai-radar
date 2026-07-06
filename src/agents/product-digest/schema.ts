@@ -59,6 +59,13 @@ export const productDigestOutputSchema = z.object({
       (v) => !looksLikeMojibake(v),
       'tagline_zh 检出 mojibake（上游双重编码乱码）：必须触发重试/降级，绝不落库乱码',
     ),
+  /**
+   * AI 相关性判定（必填布尔，design D5）：与 name_zh/tagline_zh **同一次 LLM 调用产出**（禁止
+   * 新增独立判分调用）。落 `ai_products.is_ai_related`，供新品段 fail-closed 闸门（`= true` 才入选）。
+   * 必填：缺字段/非布尔视同未产出 → Zod 校验不过 → 触发重试/降级（回退保持 is_ai_related NULL、
+   * 本轮 fail-closed 排除）。与 value-judge `is_ai_related` 同规格（plain `z.boolean()`）。
+   */
+  is_ai_related: z.boolean(),
 });
 
 /** 经校验的产品中文化输出类型。 */

@@ -73,20 +73,33 @@ export interface SummarizeProductOptions {
 const DEFAULT_MAX_ATTEMPTS = 3;
 
 function buildPrompt(input: SummarizeProductInput): string {
+  // 当前日期无条件注入：使模型以「现在」为准、不以训练截止时点判定新旧（design D5，与新闻对称）。
+  const today = new Date().toISOString().slice(0, 10);
+  // 产品为名判：content 仅为采集器已存正文（若有），无 enrichment 补抓；纯空白视同无描述。
+  const hasContent = Boolean(input.content?.trim());
   const parts = [
     '你是 AI 工具/产品分析师。请用简体中文为下面这个产品生成结构化输出。',
+    `当前日期：${today}（以此为「现在」，勿以你的训练知识截止时点为准）。`,
     '要求：只陈述事实与对开发者的价值，不夸张、不堆砌营销词；只返回结构化 JSON。',
     `产品名：${input.name}`,
   ];
-  if (input.content) {
+  if (hasContent) {
     parts.push(`产品描述：${input.content}`);
   } else {
     // content 缺失（如 Show HN 恒 null）：仅凭产品名产中文，不编造未知功能。
-    parts.push('（无产品描述，仅凭产品名翻译/概括，不要编造未提及的功能。）');
+    parts.push('（无产品描述，仅凭产品名翻译/概括。）');
   }
+  // 防幻觉护栏（design D5，与新闻摘要 buildPrompt 对称）：产品按名判定，一律禁止据训练知识补事实。
+  parts.push(
+    '注意：禁止编造产品名（及描述，若有）中未出现的具体事实（版本号、参数指标、发布时间、价格、功能清单等）；' +
+      '禁止基于你的训练知识断言该产品是否存在或是否已发布；' +
+      'is_ai_related 只依据产品名（及描述，若有）所述客观判定，训练知识存在时效滞后，不据其否认或质疑。',
+  );
   parts.push(
     `字段：name_zh（中文译名，≤${NAME_ZH_MAX} 字；若已是中文或为专有名词可保留原名）；` +
-      `tagline_zh（一句话中文简介，含产品定位+对开发者的价值，≤${PRODUCT_TAGLINE_MAX} 字）。`,
+      `tagline_zh（一句话中文简介，含产品定位+对开发者的价值，≤${PRODUCT_TAGLINE_MAX} 字）；` +
+      `is_ai_related（布尔：该产品是否与 AI/机器学习直接相关——如 AI 编程工具、LLM 应用、` +
+      `ML 框架/模型为 true；扫雷游戏、通用日志库等与 AI 无关的产品为 false）。`,
   );
   return parts.join('\n');
 }

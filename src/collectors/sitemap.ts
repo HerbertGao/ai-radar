@@ -77,7 +77,7 @@ const SOURCE_ITEM_ID_MAX_LEN = 255;
  * ② 防 ReDoS——配合下方正则加界，挡住把超大 body 喂进 `[\s\S]*?` 类回溯正则二次方卡死
  *    （实测 0.5MB 未闭合标签 → 8s）。content-length 可能缺失/撒谎，故读后再按 text.length 复判。
  */
-const MAX_BODY_BYTES = 5 * 1024 * 1024;
+export const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
 /** og: meta content 内容字符上界（正则加界，同上防回溯）；真 og 内容 ~数百字符，10k 远够。 */
 const MAX_OG_CONTENT_CHARS = 10_000;
@@ -304,7 +304,7 @@ export function parseSitemap(xml: string): SitemapEntry[] {
  * `[\s\S]*?` 捕获被限制在单标签内、绝不会跨越前一个 meta（如 `<meta property="og:type" content="article" />`）
  * 回溯误匹配出 `article" />…<meta content="` 一类跨标签垃圾（原双正则 content-first 分支的 bug）。
  */
-function extractOgTag(html: string, property: string): string | null {
+export function extractOgTag(html: string, property: string): string | null {
   const prop = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // 转义 og:title 里的特殊字符（无，但稳妥）。
   const propRe = new RegExp(`\\bproperty\\s*=\\s*["']${prop}["']`, 'i');
   // `[\s\S]{0,MAX_OG_CONTENT_CHARS}?` 加界（非裸 `[\s\S]*?`）：防回溯；在单标签串内提取，输入小、有界。

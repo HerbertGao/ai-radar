@@ -47,13 +47,19 @@ async function seedEvent(args: {
   shouldPush?: boolean;
   firstSeenAt?: Date;
   publishedAt?: Date | null;
+  /**
+   * AI 相关闸门列（selectTopN 新增 `is_ai_related = true` fail-closed 谓词）。默认 `true`
+   * 使所有既有用例的种子事件仍可入选（否则 NULL 会被新闸门排除、破坏无关用例）；AI 闸门用例
+   * 显式传 `false` / `null` 验证被排除。
+   */
+  isAiRelated?: boolean | null;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
     `INSERT INTO ai_news_events
        (dedup_key, representative_title, summary_zh, should_push,
         importance_score, novelty_score, developer_relevance_score, hype_risk_score,
-        first_seen_at, published_at, source_count)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1)
+        first_seen_at, published_at, is_ai_related, source_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1)
      RETURNING event_id`,
     [
       `${PREFIX}${args.key}`,
@@ -70,6 +76,8 @@ async function seedEvent(args: {
       args.publishedAt === undefined
         ? new Date('2099-02-01T00:00:00Z')
         : args.publishedAt,
+      // 默认 true：既有用例不被新 AI 闸门误排除。undefined→true；null→NULL（fail-closed 被排除）。
+      args.isAiRelated === undefined ? true : args.isAiRelated,
     ],
   );
   return rows[0]!.event_id;
@@ -169,6 +177,24 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
     const ids = top.map((e) => e.eventId);
     expect(ids).not.toContain(delivered); // 两通道都投递完毕 → 移出
     expect(ids).toContain(fresh);
+  });
+
+  it('AI 闸门：is_ai_related=false 与 NULL 被排除、true 正常入选（is_ai_related 为唯一区分量）', async () => {
+    // 三条种子除 is_ai_related 外其余候选谓词全 TRUE（should_push=true 默认、published_at 窗口内
+    // 默认、importance≥floor、merged_into IS NULL 默认、未投递任何通道）——使 is_ai_related 成唯一
+    // 区分量。否则被别的谓词排除也绿、测不到闸门缺失（fail-closed 谓词回归失守将不可见）。
+    const related = await seedEvent({ key: 'gate-true', importance: 90, isAiRelated: true });
+    const notRelated = await seedEvent({ key: 'gate-false', importance: 95, isAiRelated: false });
+    const unjudged = await seedEvent({ key: 'gate-null', importance: 92, isAiRelated: null });
+
+    const top = await selectTopN(
+      { now: NOW, topN: 100, importanceFloor: 60, windowDays: 3 },
+      db!,
+    );
+    const ids = top.map((e) => e.eventId);
+    expect(ids).toContain(related); // is_ai_related=true → 入选。
+    expect(ids).not.toContain(notRelated); // false → fail-closed 排除（即便 importance 更高）。
+    expect(ids).not.toContain(unjudged); // NULL → fail-closed 排除（未判/历史/迁移前已评分）。
   });
 
   it('should_push=false 的事件不入候选', async () => {

@@ -336,6 +336,8 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         // add-tier1-ai-sources：两新源同理注入空桩，避免漏桩落真实 HF JSON API / sitemap 污染断言。
         hfPapers: async () => [],
         sitemap: async () => [],
+        // blogger 空桩：漏桩会回退真实 collectBlogger 拉 YouTube 字幕网络 → 5s 超时污染断言。
+        blogger: async () => [],
       },
     });
     expect(result.items.map((i) => i.sourceItemId).sort()).toEqual(['h1', 'r1']);
@@ -366,6 +368,8 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         // add-tier1-ai-sources：两新源也注入桩，避免漏桩落真实 HF JSON API / sitemap 网络。
         hfPapers: fail,
         sitemap: fail,
+        // blogger 也注入失败桩：漏桩会回退真实 collectBlogger 拉 YouTube → 有 items 使「items 为空」断言失败。
+        blogger: fail,
       },
     });
     expect(result.items).toHaveLength(0);
@@ -416,6 +420,8 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
         showHn: slow('f'),
         hfPapers: slow('g'),
         sitemap: slow('h'),
+        // blogger 慢桩：漏桩会回退真实 collectBlogger 拉 YouTube 网络 → 5s 超时。
+        blogger: slow('i'),
       },
     });
     // 并发执行 → 同时在跑的源数 > 1（若串行则恒为 1）。

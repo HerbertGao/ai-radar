@@ -29,7 +29,7 @@
  */
 import { and, eq, inArray, isNull, ne, notExists, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
-import { aiProducts, pushRecords, rawItems } from '../db/schema.js';
+import { aiNewsEvents, aiProducts, pushRecords, rawItems } from '../db/schema.js';
 import { env } from '../config/env.js';
 import {
   collapseUncollapsedProductRawItems,
@@ -72,8 +72,13 @@ const defaultAlert: AlertSink = (message, detail) =>
  * 新品段每日静默全空（CI 连已迁移库永远绿、生产漏迁移则空段 = 典型假绿）。本自检**不依赖**
  * selectProductsForChannelSafe 的静默吞，而是在启动期把「列不存在」显式暴露为明确错误。
  *
- * 探针用 `SELECT name_zh, tagline_zh FROM ai_products LIMIT 0`：只校验列存在（规划期即报缺列），
+ * 探针用 `SELECT name_zh, tagline_zh, is_ai_related FROM ai_products LIMIT 0` +
+ * `SELECT is_ai_related FROM ai_news_events LIMIT 0`：只校验列存在（规划期即报缺列），
  * 不取任何行、零数据扫描、对空库亦成立。
+ *
+ * **扩断言 is_ai_related（design D5/D6）**：0011 迁移新增 `ai_products.is_ai_related` 与
+ * `ai_news_events.is_ai_related`。若代码先于迁移部署、产品闸门读缺列的异常会被静默吞进
+ * `selectProductsForChannelSafe` → 新品段静默变空（假绿）；故启动期一并 fail-fast 暴露缺列。
  *
  * @param dbh 可注入 db 或事务句柄（默认全局 db）。
  * @throws 列不存在或探针失败时抛出明确错误（提示迁移必先于代码发布）。
@@ -81,13 +86,19 @@ const defaultAlert: AlertSink = (message, detail) =>
 export async function assertProductZhColumns(dbh: DbLike = defaultDb): Promise<void> {
   try {
     await dbh.execute(
-      sql`SELECT ${aiProducts.nameZh}, ${aiProducts.taglineZh} FROM ${aiProducts} LIMIT 0`,
+      sql`SELECT ${aiProducts.nameZh}, ${aiProducts.taglineZh}, ${aiProducts.isAiRelated} FROM ${aiProducts} LIMIT 0`,
+    );
+    // is_ai_related 闸门横跨要闻（ai_news_events）与新品（ai_products）两段：一并断言，
+    // 防新闻侧缺列在 selectTopN 崩溃、产品侧缺列在被静默吞的候选查询里变空段（响声不一致）。
+    await dbh.execute(
+      sql`SELECT ${aiNewsEvents.isAiRelated} FROM ${aiNewsEvents} LIMIT 0`,
     );
   } catch (e) {
     throw new Error(
-      'ai_products 缺少中文展示列 name_zh / tagline_zh（或探针失败），日报 worker 拒绝启动。' +
-        '部署不变量：数据库迁移（drizzle/0005_*）必先于读取这两列的代码发布。' +
-        '请先执行 npm run migrate 再启动 worker。',
+      'ai_products 缺少中文展示列 name_zh / tagline_zh 或 AI 闸门列 is_ai_related' +
+        '（或 ai_news_events.is_ai_related 缺失 / 探针失败），日报 worker 拒绝启动。' +
+        '部署不变量：数据库迁移（name_zh/tagline_zh 见 drizzle/0005_*，is_ai_related 见 drizzle/0011_*）' +
+        '必先于读取这些列的代码发布。请先执行 npm run migrate 再启动 worker。',
       { cause: e },
     );
   }
@@ -110,14 +121,22 @@ export async function assertProductZhColumns(dbh: DbLike = defaultDb): Promise<v
  * 「同日不重复」由 dispatcher 的待发集合「今日该 channel success 排除」+ UNIQUE 四元组兜底，
  * 本查询只管「跨天从未 success」与「排除冲突」。名单由程序定、不交 LLM。
  *
- * @param channel 目标分发通道（候选「从未以该 channel success」按 channel 分别判定）。
- * @param dbh     可注入 db 或事务句柄（默认全局 db）。
- * @param limit   取前 N 条（默认 env.TOP_N，与日报同口径）；按 last_seen_at DESC 优先近期上榜。
+ * **AI 相关闸门（fail-closed，design D5/D6）**：`applyAiGate=true`（默认，最终推送候选）在既有谓词
+ * 之上追加 `is_ai_related = true`——false/NULL 一律排除（宁可漏也不推非 AI）。判定工作集须以
+ * `applyAiGate=false` 调用取**无闸门**候选集：否则 `is_ai_related IS NULL` 产品永进不了工作集、
+ * 永不判分、永久 NULL → 死锁（design D5 陷阱一）。谓词用 `eq(isAiRelated, true)`（NULL 与 false
+ * 均排除），**绝不** `IS NOT FALSE`/`ne(col,false)`（会漏放 NULL）。
+ *
+ * @param channel     目标分发通道（候选「从未以该 channel success」按 channel 分别判定）。
+ * @param dbh         可注入 db 或事务句柄（默认全局 db；集成测依赖此注入位，applyAiGate 加在其后）。
+ * @param limit       取前 N 条（默认 env.TOP_N，与日报同口径）；按 last_seen_at DESC 优先近期上榜。
+ * @param applyAiGate 是否施加 AI 相关闸门（默认 true）；判定工作集须传 false 取无闸门候选集（防死锁）。
  */
 export async function selectProductCandidates(
   channel: Channel,
   dbh: DbLike = defaultDb,
   limit: number = env.TOP_N,
+  applyAiGate: boolean = true,
 ): Promise<SelectedEvent[]> {
   // 「从未以该 channel success」相关子查询（跨天/跨次不重推）；target_type='product'、
   // target_id=product_id（product_id 与 push_records.target_id 同为 VARCHAR(128)，类型相容）。
@@ -157,6 +176,9 @@ export async function selectProductCandidates(
         // product-collapse 用 `metadata || {merge_conflict:{...}}` 标记，故以 JSON 路径判存在。
         isNull(sql`${aiProducts.metadata} -> 'merge_conflict'`),
         neverSuccessfullyPushed,
+        // AI 相关闸门（fail-closed）：仅 is_ai_related=true 入推送候选，false/NULL 排除。
+        // applyAiGate=false（判定工作集）时跳过——`and` 忽略 undefined。绝不 IS NOT FALSE/ne。
+        applyAiGate ? eq(aiProducts.isAiRelated, true) : undefined,
       ),
     )
     // 近期上榜优先（确定性 tiebreaker：product_id ASC），取前 limit 条。
@@ -250,17 +272,19 @@ const PRODUCT_DIGEST_FAILURE_COUNT_THRESHOLD = 3;
  * （Zod / 重试 / ProductDigestFailureError 降级信号），**不照搬 events digest 的非业务异常
  * rethrow + 降级率熔断**。
  *
- * 候选 = **各 channel 正式推送候选的精确并集**（消除 channel-blind 单窗 + LIMIT 的覆盖边缘、
- * 零「下次幂等补」依赖）：对每个 channel 调用一次 `selectProductCandidates`（复用既有查询路径
- * 而非重写 SQL UNION / NOT EXISTS 谓词，杜绝谓词漂移、dedup 免费）、在应用层用
- * `Set<product_id>` 去重并集；`channels` 为空 → 并集空 → **直接 return、不下发查询**。
+ * 候选 = **各 channel 无闸门候选集的精确并集**（design D5 陷阱一：以 `applyAiGate=false` 取无闸门
+ * 候选，否则 is_ai_related IS NULL 产品被闸门排除、永不判分、死锁；消除 channel-blind 单窗 + LIMIT
+ * 的覆盖边缘、零「下次幂等补」依赖）：对每个 channel 调用一次 `selectProductCandidates(...,false)`
+ * （复用既有查询路径而非重写 SQL，杜绝谓词漂移、dedup 免费）、在应用层用 `Set<product_id>` 去重
+ * 并集；`channels` 为空 → 并集空 → **直接 return、不下发查询**。
  *
- * 对并集 product_id 中 `name_zh IS NULL`（幂等：已中文化跳过）且 `name !== UNNAMED_PRODUCT_NAME`
- * （排除塌缩兜底占位名，零信息输入会诱发 LLM 幻觉译名、反比回退英文更糟；占位字面与
- * product-collapse 单一来源共享常量、防字面漂移）的产品，`LEFT JOIN raw_items ON
- * representative_raw_item_id = raw_items.id`（LEFT 非 INNER：representative_raw_item_id 为
- * NULL / 悬空的产品仍保留、content=NULL 仅凭 name 产中文）取 content，逐个
- * `summarizeProduct({name,content})` → `updateProductZh`。
+ * 对并集 product_id 中 `is_ai_related IS NULL`（design D5 陷阱二，待判谓词——**非 name_zh IS NULL**，
+ * 否则迁移前已中文化产品死锁；幂等：已判定跳过）且 `name !== UNNAMED_PRODUCT_NAME`（排除塌缩兜底
+ * 占位名，零信息输入会诱发 LLM 幻觉译名、反比回退英文更糟；占位字面与 product-collapse 单一来源
+ * 共享常量、防字面漂移）的产品，`LEFT JOIN raw_items ON representative_raw_item_id = raw_items.id`
+ * （LEFT 非 INNER：representative_raw_item_id 为 NULL / 悬空的产品仍保留、content=NULL 仅凭 name
+ * 判定）取 content，逐个 `summarizeProduct({name,content})`（同一次调用产出 name_zh/tagline_zh/
+ * is_ai_related）→ `updateProductZh`（落 is_ai_related、COALESCE 保留既有译名）。
  *
  * **前置约束**：依赖调用方持 `daily-digest:{push_date}` 全局单例锁（与 collapseProductsOnce 同）；
  * 须在产品塌缩之后、per-channel 候选之前调用（中文化 UPDATE 后续候选才读到中文列）。
@@ -280,11 +304,13 @@ export async function digestPendingProducts(
   if (channels.length === 0) return;
 
   // 候选并集：复用 selectProductCandidates（每 channel 一次），应用层 Set 去重 product_id。
+  // **applyAiGate=false（design D5 陷阱一）**：判定工作集取**无闸门**候选集——否则 is_ai_related
+  // IS NULL 产品被闸门排除、永进不了工作集、永不判分、永久 NULL → 死锁。仅最终推送候选加闸门。
   // 整个并集收集阶段亦不向上抛——任一 channel 候选查询失败只告警 + 跳过该 channel（永不拖垮新闻）。
   const candidateIds = new Set<string>();
   for (const channel of channels) {
     try {
-      const candidates = await selectProductCandidates(channel, dbh);
+      const candidates = await selectProductCandidates(channel, dbh, env.TOP_N, false);
       for (const c of candidates) candidateIds.add(c.eventId);
     } catch (e) {
       console.error(
@@ -296,8 +322,13 @@ export async function digestPendingProducts(
   }
   if (candidateIds.size === 0) return;
 
-  // 取并集中「未中文化（name_zh IS NULL）且非占位名」的产品 + LEFT JOIN content。
-  // LEFT JOIN：representative_raw_item_id 为 NULL / 悬空时 content=NULL，产品仍保留、仅凭 name 中文化。
+  // 取并集中「未判定（is_ai_related IS NULL）且非占位名」的产品 + LEFT JOIN content。
+  // **待判谓词 = is_ai_related IS NULL（design D5 陷阱二）**，非 name_zh IS NULL：否则迁移前已
+  // 中文化（name_zh 非空、is_ai_related NULL）产品永不补判、永久 NULL 死锁。**替换而非与 name_zh
+  // IS NULL 取 AND**。判定与中文化同一次 summarizeProduct 调用产出；补判已中文化产品由
+  // updateProductZh 的 COALESCE 保留既有译名。占位名（UNNAMED_PRODUCT_NAME）永久排除、永久 NULL
+  // → 永久 fail-closed 排除（design D5 记录的接受例外，非本闸门新增死锁）。
+  // LEFT JOIN：representative_raw_item_id 为 NULL / 悬空时 content=NULL，产品仍保留、仅凭 name 判定。
   let pending: Array<{ productId: string; name: string; content: string | null }>;
   try {
     pending = await dbh
@@ -311,7 +342,7 @@ export async function digestPendingProducts(
       .where(
         and(
           inArray(aiProducts.productId, [...candidateIds]),
-          isNull(aiProducts.nameZh),
+          isNull(aiProducts.isAiRelated),
           ne(aiProducts.name, UNNAMED_PRODUCT_NAME),
         ),
       );
@@ -328,11 +359,13 @@ export async function digestPendingProducts(
   let failed = 0;
   for (const p of pending) {
     try {
-      const { name_zh, tagline_zh } = await summarizeProduct(
+      const { name_zh, tagline_zh, is_ai_related } = await summarizeProduct(
         { name: p.name, content: p.content },
         summarizeOptions,
       );
-      await updateProductZh(dbh, p.productId, name_zh, tagline_zh);
+      // 落库不丢弃（design D5）：is_ai_related 与译名同一次调用产出、经 updateProductZh 写入
+      // ai_products.is_ai_related（供闸门读取）；COALESCE 保留补判产品的既有译名。
+      await updateProductZh(dbh, p.productId, name_zh, tagline_zh, is_ai_related);
     } catch (e) {
       failed += 1;
       if (e instanceof ProductDigestFailureError) {

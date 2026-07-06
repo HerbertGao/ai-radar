@@ -11,6 +11,7 @@
  * | developer_relevance  | developer_relevance_score  |
  * | hype_risk            | hype_risk_score            |
  * | should_push          | should_push（同名直写）     |
+ * | is_ai_related        | is_ai_related（同名直写，布尔）|
  */
 import type { ValueJudgeOutput } from './schema.js';
 
@@ -24,6 +25,8 @@ export interface AiNewsEventScoreColumns {
   developerRelevanceScore: string;
   hypeRiskScore: string;
   shouldPush: boolean;
+  /** AI 相关判定（要闻段 fail-closed 闸门据此过滤，绝不再丢弃）。 */
+  isAiRelated: boolean;
 }
 
 /**
@@ -35,6 +38,7 @@ export interface AiNewsEventScoreColumns {
  *   developer_relevance → developer_relevance_score
  *   hype_risk           → hype_risk_score
  *   should_push         → should_push（同名）
+ *   is_ai_related       → is_ai_related（同名，布尔，不再丢弃）
  *
  * 数值列转成字符串交给 Drizzle 的 numeric 列，保证精度（NUMERIC(5,2)）。
  */
@@ -47,5 +51,6 @@ export function mapOutputToEventScores(
     developerRelevanceScore: String(output.developer_relevance),
     hypeRiskScore: String(output.hype_risk),
     shouldPush: output.should_push,
+    isAiRelated: output.is_ai_related,
   };
 }

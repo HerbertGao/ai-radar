@@ -78,6 +78,13 @@
       "when": 1783145104539,
       "tag": "0010_model_radar_price_curation_approval",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1783321532577,
+      "tag": "0011_harden_daily_push_is_ai_related",
+      "breakpoints": true
     }
   ]
 }

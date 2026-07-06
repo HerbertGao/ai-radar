@@ -153,6 +153,10 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   }),
   hypeRiskScore: numeric('hype_risk_score', { precision: 5, scale: 2 }),
   shouldPush: boolean('should_push').default(false),
+  // AI 相关闸门（可空布尔，forward-only 迁移 0011，design D2/D6）：Value Judge 已产出但曾被
+  // mapping.ts 丢弃，现落库供要闻段 fail-closed 过滤（`is_ai_related = true` 才入选，false/NULL
+  // 一律排除）。不回填历史，NULL 即预期的 fail-closed 排除。
+  isAiRelated: boolean('is_ai_related'),
   // 并发评分原子 claim（design D6 / spec「judge_claimed_at」）：日报链与实时告警高频链
   // 可能并发对同一未评分事件评分。送 LLM 前 `UPDATE ... SET judge_claimed_at WHERE
   // *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now()-interval 'T')
@@ -235,6 +239,10 @@ export const aiProducts = pgTable(
     // 仅产展示文本，绝不参与塌缩/合并/推送幂等等确定性状态判定。
     nameZh: varchar('name_zh', { length: 255 }),
     taglineZh: text('tagline_zh'),
+    // AI 相关闸门（可空布尔，forward-only 迁移 0011，design D5/D6）：产品按名判定（复用既有中文化
+    // LLM 调用），落库供新品段 fail-closed 过滤（`is_ai_related = true` 才入选，false/NULL 排除）。
+    // 判定工作集以 `is_ai_related IS NULL` 前向自愈补判，不回填脚本。
+    isAiRelated: boolean('is_ai_related'),
     // 硬规则合并冲突键（各自 UNIQUE，作 ON CONFLICT 目标）；NULL 不参与约束。
     canonicalDomain: varchar('canonical_domain', { length: 255 }),
     githubRepo: varchar('github_repo', { length: 255 }),

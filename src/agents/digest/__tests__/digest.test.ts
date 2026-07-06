@@ -211,6 +211,64 @@ describe('summarizeEvent（mock generateObject）', () => {
   });
 });
 
+describe('buildPrompt 防幻觉护栏（断言注入桩收到的 prompt 文本）', () => {
+  /** 捕获传给 generateObjectFn 的 prompt（buildPrompt 输出），成功返回不触发降级。 */
+  async function capturePrompt(
+    input: Parameters<typeof summarizeEvent>[0],
+  ): Promise<string> {
+    let captured = '';
+    const generateObjectFn = vi.fn(async ({ prompt }: { prompt: string }) => {
+      captured = prompt;
+      return { object: VALID_OUTPUT };
+    });
+    await summarizeEvent(input, { generateObjectFn, logError: () => {} });
+    return captured;
+  }
+
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  it('无条件注入当前日期（有正文亦然）', async () => {
+    const prompt = await capturePrompt({
+      title: '某模型发布',
+      content: '正文：某公司发布新模型。',
+    });
+    expect(prompt).toContain(today());
+  });
+
+  it('有正文分支：prompt 含正文内容', async () => {
+    const prompt = await capturePrompt({
+      title: 'Leanstral 1.5',
+      content: '某公司发布 Leanstral 1.5，上下文窗口 128k token，benchmark 领先。',
+    });
+    expect(prompt).toContain(
+      '某公司发布 Leanstral 1.5，上下文窗口 128k token，benchmark 领先。',
+    );
+  });
+
+  it('无正文分支：prompt 含当前日期 + 只据标题 + 禁止编造具体参数约束', async () => {
+    const prompt = await capturePrompt({ title: 'Leanstral 1.5' });
+    expect(prompt).toContain(today());
+    expect(prompt).toContain('只依据标题');
+    expect(prompt).toContain('禁止编造');
+  });
+
+  it('无正文分支：prompt 含禁止据训练知识断言存在/否认真实发布约束', async () => {
+    const prompt = await capturePrompt({ title: 'Claude Sonnet 5' });
+    expect(prompt).toContain('训练知识');
+    expect(prompt).toContain('是否存在或是否已发布');
+    expect(prompt).toContain('禁止否定或质疑标题所声称的发布事实');
+  });
+
+  it('纯空白 content 视同无正文：触发护栏且不注入空正文', async () => {
+    const prompt = await capturePrompt({
+      title: 'Claude Sonnet 5',
+      content: '   \t\n',
+    });
+    expect(prompt).toContain('训练知识');
+    expect(prompt).not.toContain('正文：');
+  });
+});
+
 describe('digestEvent 降级不污染推送（mock generateObject + mock db）', () => {
   /** 制造一个最小 db stub，记录 update().set().where() 是否被调用。 */
   function makeDbStub() {
