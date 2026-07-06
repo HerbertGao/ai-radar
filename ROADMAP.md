@@ -96,6 +96,7 @@
 
 > **诚实红线（程序+DB 保障）**：价格/兼容/额度 = DB 精确事实、规则不离谱；撞窗 = ⚠ 估算、不进哈希；未核价/待核标 `insufficient_data` 不冤判「不推荐」（沿用比价页「数据不足」诚实）；不跨桶/跨币 FX（锁请求币种组、剔他币种已知价）；解释层 v1 无 LLM、`evidence?` 槽留 v2。
 > **5e v2（未结，后续）**：把模板解释层换为 RAG 证据（接知识库 + 变更流）+ LLM 解释，召回/候选 schema 不动（`ExplanationInput→Promise` 接口已留缝）。
+> **RAG 检索路径选型（建 5e v2 证据层 / P6 「规则召回 → RAG」时读）**：读路径**尚未建**——`src/kb` 只写入（embedding 已存、按 `long_term_value≥70` 精选），全仓无相似度检索 / rerank / 语义查询。评估过 [SAG](https://github.com/Zleap-AI/SAG)（pgvector 之上的轻量实体-事件索引 `chunk→event`/`chunk→entities`，用 SQL 做多跳召回；栈与本仓 **1:1** = TS + PG + pgvector + MCP SDK，MIT）。**定序：① 先上最朴素 pgvector 余弦检索精选 KB 作 baseline → ② 量哪些查询败在跨文档实体串联（多跳）→ ③ 真有多跳瓶颈再引 SAG**。理由：**(a)** 同栈 = 延后零锁定、无需趁早接（这是可放心推迟的理由，不是趁早接的理由）；**(b)** SAG 优势（多跳*散文*召回）碰不到 Model Radar 钱路——价 / 额度 / 兼容是 `mr_*` 结构化精确事实、走 SQL 非检索，那里的「多跳」本就是表 JOIN；**(c)** 当前证据 RAG 语料小且多为单跳。真引时**只偷侧表思路（`chunk→event/entity`）不整包搬** SAG 的 Fastify + React workbench（与现有 Hono / worker 重叠）；`ai_news_events` 已有 `main_entities` + 事件模型，是**自然嫁接点、非重写**。
 
 ## P1 退出标准达成
 
