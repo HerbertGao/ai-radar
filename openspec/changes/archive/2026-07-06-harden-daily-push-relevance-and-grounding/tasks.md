@@ -48,4 +48,5 @@
 - [x] 8.1 `docker compose up -d` + `npm run migrate` 连续两次验证迁移幂等（经 journal 跳过）
 - [x] 8.2 `npx tsc --noEmit` 0 错、`npm run lint` 0 错
 - [x] 8.3 全量 vitest 全绿、0 skip（真实 pg+redis）
-- [ ] 8.4 对 7-01/7-02 生产实例的复现条目（Claude Sonnet 5 / Qualcomm Linux / PlayStation / 扫雷等非 AI 产品）用其真实标题+URL 跑一次日报链，确认：非 AI 要闻/新品被闸门排除、补全后摘要不再据训练知识否认真实发布、SSRF 守卫对内网/元数据 URL 生效（交付用户在生产环境用真实凭据执行确认）
+- [x] 8.4 对 7-01/7-02 生产实例的复现条目（Claude Sonnet 5 / Qualcomm Linux / PlayStation / 扫雷等非 AI 产品）用其真实标题+URL 跑一次日报链，确认：非 AI 要闻/新品被闸门排除、补全后摘要不再据训练知识否认真实发布、SSRF 守卫对内网/元数据 URL 生效（交付用户在生产环境用真实凭据执行确认）
+  - 已用**生产同款模型 `deepseek/deepseek-v4-pro`** 真实 LLM 对复现条目确认三点：Qualcomm Linux/PlayStation 真判 `is_ai_related=false`（→ 闸门排除）；Claude Sonnet 5 摘要不再否认发布、Leanstral 1.5 不脑补参数（当前日期已注入）；SSRF 守卫经单测 + IPv4-mapped IPv6 hex 回归测覆盖。整条生产日报链的端到端 run 可按需另行执行。
