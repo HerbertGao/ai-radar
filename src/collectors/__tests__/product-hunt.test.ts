@@ -300,6 +300,8 @@ describe('PH 注册进 registry（单源失败隔离）', () => {
         // 污染 items 断言且违反「测试不触网」（test-no-prod-sends）。
         hfPapers: async () => [],
         sitemap: async () => [],
+        // blogger 空桩：漏桩会回退真实 collectBlogger 拉 YouTube 字幕网络 → 5s 超时污染断言。
+        blogger: async () => [],
       },
     });
     // PH 失败被隔离。

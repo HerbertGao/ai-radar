@@ -19,15 +19,36 @@ import { Redis } from 'ioredis';
 import * as schema from '../../db/schema.js';
 import type { CollectedItem } from '../../collectors/types.js';
 import type { MessageSender } from '../../push/dispatcher.js';
+import type { EnrichContentOptions } from '../content-enrichment.js';
+import type { RunDailyWorkflowOptions } from '../run-daily-workflow.js';
 
 process.env.TELEGRAM_BOT_TOKEN ||= 'test-token';
 process.env.TELEGRAM_CHAT_ID ||= 'test-chat';
 process.env.LLM_API_KEY ||= 'test-key';
 process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 
-const { runDailyWorkflow, WorkflowAbortError } = await import(
+const { runDailyWorkflow: runDailyWorkflowRaw, WorkflowAbortError } = await import(
   '../run-daily-workflow.js'
 );
+
+/**
+ * 不触网的默认补全桩（组 G 2.4）：既有用例不关心正文补全，但补全阶段对「空 content + 可抓 URL」
+ * 的 fixture（item() 恒 content=null + 带 URL）默认会走真实 fetch 外发请求。故给**所有**用例默认注入：
+ * resolve 返回公网占位（不真解析 DNS）、fetchImpl 直接抛错（视为抓取失败 → content 保持空 →
+ * 判分/摘要退化仅标题，行为与补全前一致）。关心补全的用例显式传 `enrich` 覆盖（spread 顺序保证覆盖）。
+ */
+const NO_NETWORK_ENRICH: EnrichContentOptions = {
+  resolve: async () => ['93.184.216.34'],
+  fetchImpl: async () => {
+    throw new Error('enrich fetch disabled in test');
+  },
+  logError: () => {},
+};
+
+/** 包一层默认注入不触网补全桩；测试自带 enrich 时覆盖默认。 */
+function runDailyWorkflow(options: RunDailyWorkflowOptions = {}) {
+  return runDailyWorkflowRaw({ enrich: NO_NETWORK_ENRICH, ...options });
+}
 // 产品段零件模块（供 vi.spyOn 注入塌缩/候选桩，验证日报产品段编排：塌缩只调一次、候选失败降级等）。
 const productDigestModule = await import('../product-digest.js');
 // 已校验 env（可变对象，非 frozen）：6.1 off-switch 用例临时改 SEMANTIC_DEDUP_ENABLED 后还原。
@@ -240,6 +261,9 @@ function collectorsArxivPaperOnly(papers: CollectedItem[]) {
     showHn: async () => [],
     hfPapers: async () => [],
     sitemap: async () => [],
+    // blogger 空桩：collectors registry 对缺失 key 回退真实 collectBlogger（落真实 BLOGGER_FEEDS /
+    // YouTube 字幕网络 → 本用例 5s 超时 + collectedCount 被真实条目污染）。与 collectorsReturning 同口径显式空桩。
+    blogger: async () => [],
   };
 }
 
@@ -360,8 +384,8 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       `INSERT INTO ai_news_events
          (dedup_key, representative_title, representative_raw_item_id, should_push,
           importance_score, novelty_score, developer_relevance_score, hype_risk_score,
-          first_seen_at, source_count)
-       VALUES ($1,$2,NULL,true,90,80,80,10,$3,1) RETURNING event_id`,
+          first_seen_at, is_ai_related, source_count)
+       VALUES ($1,$2,NULL,true,90,80,80,10,$3,true,1) RETURNING event_id`,
       // first_seen_at 用真实 now()，落在候选窗口 now − N 天内（与塌缩事件口径一致）。
       [dedupKey, `${TITLE_MARKER} Evergreen scored event`, new Date()],
     );
@@ -660,6 +684,172 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
     expect(result.alerted).toBe(true); // 新闻真空告警照常触发，不被 paper 掩盖。
     expect(alert).toHaveBeenCalled();
     expect(sender.calls).toBe(0); // 无新闻候选 → 不推。
+  });
+});
+
+/**
+ * runDailyWorkflow 正文补全阶段编排集成测试（harden-daily-push-relevance-and-grounding 组 G，
+ * tasks 2.4/5.2/7.1，spec source-content-enrichment / daily-intel-pipeline）。
+ *
+ * 补全阶段在语义合并之后、Value Judge 之前运行，对「空 content + 可抓 URL」代表 raw_item 补抓
+ * og:description 写回。全用例注入不触网 fetch/resolve 桩。断言：
+ * - 2.4 补全在判分前富化空 content 代表 raw_item（og:description 原子写回 raw_items.content）。
+ * - 5.2 补全后正文经 representative_raw_item_id 加载并透传摘要 prompt（非「改签名不接加载」静默空转）。
+ * - 2.4 补全失败永不拖垮流水线、不进熔断分母（fetch 抛错 → content 保持空 → 退化仅标题照常推）。
+ * - 2.4/7.1 SSRF 守卫拒绝内网/元数据 URL：不写回、fetchImpl 不被调用、计入失败数（含被守卫拒绝数）。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 正文补全阶段（组 G 2.4/5.2/7.1）', () => {
+  /** 200 HTML 响应桩（供补全 fetchImpl 注入）：content-type html、带指定 body。 */
+  function okHtmlResponse(html: string) {
+    return {
+      status: 200,
+      ok: true,
+      headers: {
+        get: (name: string): string | null =>
+          name.toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null,
+      },
+      text: async () => html,
+    };
+  }
+
+  /** 公网解析桩（不触真实 DNS）。 */
+  const resolvePublic = async () => ['93.184.216.34'];
+
+  it('2.4 补全阶段在判分前富化空 content 代表 raw_item：og:description 原子写回 raw_items.content', async () => {
+    const enrichedBody = 'ENRICHED_OG_BODY_ALPHA';
+    const html = `<html><head><meta property="og:description" content="${enrichedBody}"></head><body></body></html>`;
+    const items = [
+      item({ id: 'enr-a', url: 'https://article.example.com/a', title: 'Empty content link post' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      // 补全桩：resolve 公网、fetchImpl 返回带 og:description 的 HTML（不触网）。
+      enrich: { resolve: resolvePublic, fetchImpl: async () => okHtmlResponse(html), logError: () => {} },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 补全命中一条（enrichResult 暴露在 result.enrichment，供可观测/断言）。
+    expect(result.enrichment).toBeDefined();
+    expect(result.enrichment!.hit).toBe(1);
+    expect(result.enrichment!.fail).toBe(0);
+    expect(result.outcome).toBe('pushed');
+
+    // 代表 raw_item 的 content 已被 og:description 写回（判分前富化）。
+    const { rows } = await pool!.query<{ content: string | null }>(
+      `SELECT content FROM raw_items WHERE content IS NOT NULL`,
+    );
+    expect(rows.some((r) => r.content === enrichedBody)).toBe(true);
+  });
+
+  it('5.2 补全后正文经 representative_raw_item_id 加载并透传摘要 prompt（非静默空转）', async () => {
+    const enrichedBody = 'ENRICHED_OG_BODY_BRAVO';
+    const html = `<html><head><meta property="og:description" content="${enrichedBody}"></head></html>`;
+    const items = [
+      item({ id: 'enr-b', url: 'https://article.example.com/b', title: 'Grounded summary post' }),
+    ];
+    // 捕获摘要 prompt：断言补全后 content 确实进了摘要 prompt（loadRepresentativeFields 已接线；
+    // 若只改 forDigest 签名不接加载则 content 恒空、prompt 不含正文 = 静默空转）。
+    const digestPrompts: string[] = [];
+    const digestCapture = async (args: { prompt: string }) => {
+      digestPrompts.push(args.prompt);
+      return { object: { summary_zh: '这是一段中文摘要。', headline_zh: '一句话要点。' } };
+    };
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      enrich: { resolve: resolvePublic, fetchImpl: async () => okHtmlResponse(html), logError: () => {} },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestCapture, maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    expect(result.enrichment!.hit).toBe(1);
+    expect(result.outcome).toBe('pushed');
+    // 摘要 prompt 含补全正文（证明加载侧已透传 content；否则 forDigest content 恒空 → 静默空转）。
+    expect(digestPrompts.some((p) => p.includes(enrichedBody))).toBe(true);
+  });
+
+  it('2.4 补全失败永不拖垮流水线、不进熔断分母（fetch 抛错 → content 保持空 → 退化仅标题照常推）', async () => {
+    const items = [
+      item({ id: 'enr-c', url: 'https://article.example.com/c', title: 'Enrich fails but pushes' }),
+    ];
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      // 补全 fetch 抛错 → 该条失败、content 保持空。
+      enrich: {
+        resolve: resolvePublic,
+        fetchImpl: async () => {
+          throw new Error('enrich boom');
+        },
+        logError: () => {},
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 补全失败一条、不抛断；熔断分母只含 judge/digest、不受补全影响。
+    expect(result.enrichment!.hit).toBe(0);
+    expect(result.enrichment!.fail).toBe(1);
+    expect(result.judge).toEqual({ processed: 1, degraded: 0 });
+    expect(result.digest.degraded).toBe(0);
+    expect(result.outcome).toBe('pushed'); // 退化仅标题照常推。
+    expect(sender.calls).toBe(1);
+    // content 保持空（补全失败绝不写回）。
+    const { rows } = await pool!.query<{ n: string }>(
+      `SELECT count(*) AS n FROM raw_items WHERE content IS NOT NULL`,
+    );
+    expect(Number(rows[0]!.n)).toBe(0);
+  });
+
+  it('2.4/7.1 SSRF 守卫拒绝内网/元数据 URL：不写回、fetchImpl 不被调用、计入失败数', async () => {
+    // 代表 raw_item 的 URL 指向云元数据地址 → assertHostAllowed 直接拒（IP 字面量、无需 resolve）。
+    const items = [
+      item({ id: 'enr-ssrf', url: 'http://169.254.169.254/latest/meta-data/', title: 'SSRF metadata url' }),
+    ];
+    const sender = okSender();
+    // fetchImpl 断言绝不被调用（守卫在发起前拒绝）。
+    const fetchSpy = vi.fn(async () => okHtmlResponse('<html></html>'));
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      enrich: { resolve: resolvePublic, fetchImpl: fetchSpy, logError: () => {} },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+
+    // 被 SSRF 守卫拒绝 → 计入失败数、fetchImpl 未被调用、content 未写回。
+    expect(result.enrichment!.hit).toBe(0);
+    expect(result.enrichment!.fail).toBe(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const { rows } = await pool!.query<{ n: string }>(
+      `SELECT count(*) AS n FROM raw_items WHERE content IS NOT NULL`,
+    );
+    expect(Number(rows[0]!.n)).toBe(0);
   });
 });
 
@@ -1224,11 +1414,12 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品段编排（7.3）', () => {
  * 验证编排不变量：
  * - 中文化在塌缩（collapseProductsOnce）之后、per-channel 候选（selectProductsForChannelSafe）之前
  *   （调用顺序断言）。
- * - 中文化失败**不中止流水线、不进熔断分母、要闻段不受影响、产品回退英文照常推**：seed 一个真实
- *   未中文化产品候选，让真实 digestPendingProducts 运行 —— 其内部 summarizeProduct 走 buildModel +
+ * - 中文化失败**不中止流水线、不进熔断分母、要闻段不受影响、产品本轮 fail-closed 排除**：seed 一个真实
+ *   未判定产品候选，让真实 digestPendingProducts 运行 —— 其内部 summarizeProduct 走 buildModel +
  *   defaultGenerateObject，**VITEST 守卫使真实 LLM 路径抛错**（不真调 LLM），逐次重试耗尽 →
- *   ProductDigestFailureError → digestPendingProducts 永不向上抛吞掉 → 产品保持 name_zh NULL →
- *   候选映射回退英文名 → 照常推送；要闻段 judge/digest 统计不受影响。
+ *   ProductDigestFailureError → digestPendingProducts 永不向上抛吞掉 → 产品保持 name_zh + is_ai_related
+ *   NULL → 新品段 fail-closed 闸门（is_ai_related=true 才入选）本轮排除该产品、不推（design D5：判定失败
+ *   回退 NULL、本轮排除、下轮工作集 is_ai_related IS NULL 再补判自愈）；要闻段照推、judge/digest 统计不受影响。
  *
  * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
  * ai_products 不在 cleanup 的 TRUNCATE 内，故 seed 的产品用唯一前缀、本块 finally 显式清理。
@@ -1283,9 +1474,9 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，
     }
   });
 
-  it('中文化失败（VITEST 守卫模拟 LLM 不可用）不中止流水线、不进熔断分母、要闻照常、产品回退英文推', async () => {
+  it('中文化失败（VITEST 守卫模拟 LLM 不可用）不中止流水线、不进熔断分母、要闻照常、产品因判定失败 fail-closed 排除', async () => {
     await cleanupProducts();
-    // seed 一个真实未中文化产品候选（name_zh NULL、无 merge_conflict、从未 success）。
+    // seed 一个真实未判定产品候选（name_zh + is_ai_related NULL、无 merge_conflict、从未 success）。
     const pid = `${PROD_PREFIX}fallback`;
     await pool!.query(
       `INSERT INTO ai_products (product_id, name, canonical_domain, last_seen_at)
@@ -1313,24 +1504,27 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，
         lock: LOCK_OPTS,
         alert,
       });
-      // 中文化失败不中止流水线：照常 pushed（要闻 + 新品两段都推）。
+      // 中文化失败不中止流水线：照常 pushed（要闻段照推；产品因判定失败本轮 fail-closed 排除，不阻断流水线）。
       expect(result.outcome).toBe('pushed');
       expect(sender.calls).toBe(1);
       // 要闻段不受产品中文化失败影响：judge / digest 统计与无产品时一致（产品失败不进熔断分母）。
       expect(result.judge).toEqual({ processed: 1, degraded: 0 });
       expect(result.digest.degraded).toBe(0);
       // 产品保持 name_zh NULL（中文化失败、不写库）。
-      const { rows: prodRows } = await pool!.query<{ name_zh: string | null }>(
-        `SELECT name_zh FROM ai_products WHERE product_id = $1`,
+      const { rows: prodRows } = await pool!.query<{ name_zh: string | null; is_ai_related: boolean | null }>(
+        `SELECT name_zh, is_ai_related FROM ai_products WHERE product_id = $1`,
         [pid],
       );
       expect(prodRows[0]!.name_zh).toBeNull();
-      // 产品仍被推送（回退英文名）：push_records 出该 product 的 success 行。
+      // design D5：判定失败 → is_ai_related 回退 NULL（不写库），本轮新品段 fail-closed 闸门排除该产品。
+      expect(prodRows[0]!.is_ai_related).toBeNull();
+      // 产品本轮 fail-closed 排除、不推（旧行为是「回退英文名照常推」；is_ai_related NULL 即本轮排除，
+      // 下轮工作集 is_ai_related IS NULL 再补判自愈）：无该 product 的 push_record。
       const { rows: pushRows } = await pool!.query<{ status: string }>(
         `SELECT status FROM push_records WHERE target_type='product' AND target_id=$1`,
         [pid],
       );
-      expect(pushRows[0]?.status).toBe('success');
+      expect(pushRows).toHaveLength(0);
     } finally {
       collapseSpy.mockRestore();
       await cleanupProducts();
@@ -1652,21 +1846,29 @@ describe.skipIf(!canRun)('runDailyWorkflow 语义去重 + 知识库接线（组 
 describe.skipIf(!canRun)('runDailyWorkflow 跨段去重抑制（组 C，2.4/2.5）', () => {
   const PROD_PREFIX = `rdw-xseg-${process.pid}-`;
 
-  /** seed 一条 ai_products（直插，绕过塌缩）；canonical_domain/github_repo 任填。 */
+  /**
+   * seed 一条 ai_products（直插，绕过塌缩）；canonical_domain/github_repo 任填。
+   * is_ai_related 默认 true：本组测「要闻↔新品互斥抑制」，产品须过新品段 fail-closed AI 闸门
+   * （applyAiGate → is_ai_related=true 才入候选）方能触发跨段抑制；同时 is_ai_related 非 NULL 使
+   * digestPendingProducts 的待判谓词（is_ai_related IS NULL）跳过该产品——不走真实中文化（VITEST 下
+   * 会抛错），不改测量意图。需测「未判定被排除」的用例可显式传 isAiRelated:false/未定制。
+   */
   async function seedProduct(args: {
     suffix: string;
     canonicalDomain?: string | null;
     githubRepo?: string | null;
+    isAiRelated?: boolean;
   }): Promise<string> {
     const productId = `${PROD_PREFIX}${args.suffix}`;
     await pool!.query(
-      `INSERT INTO ai_products (product_id, name, canonical_domain, github_repo, last_seen_at)
-       VALUES ($1, $2, $3, $4, now())`,
+      `INSERT INTO ai_products (product_id, name, canonical_domain, github_repo, is_ai_related, last_seen_at)
+       VALUES ($1, $2, $3, $4, $5, now())`,
       [
         productId,
         `${PROD_PREFIX}${args.suffix}-name`,
         args.canonicalDomain ?? null,
         args.githubRepo ?? null,
+        args.isAiRelated ?? true,
       ],
     );
     return productId;

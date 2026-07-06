@@ -69,13 +69,27 @@ export interface SummarizeOptions {
 const DEFAULT_MAX_ATTEMPTS = 3;
 
 function buildPrompt(input: SummarizeEventInput): string {
+  // 当前日期无条件注入：使模型以「现在」为准、不以训练截止时点判定新旧（design D4）。
+  const today = new Date().toISOString().slice(0, 10);
+  // 纯空白正文视同无正文（与 value-judge 的 content !~ '\S' 同口径），触发防幻觉护栏。
+  const hasContent = Boolean(input.content?.trim());
   const parts = [
     '你是 AI 行业情报分析师。请用简体中文为下面这条事件生成结构化输出。',
+    `当前日期：${today}（以此为「现在」，勿以你的训练知识截止时点为准）。`,
     '要求：只陈述事实与对开发者的影响，不夸张、不堆砌营销词；摘要控制在约 1000 字以内；只返回结构化 JSON。',
     `标题：${input.title}`,
   ];
-  if (input.content) parts.push(`正文：${input.content}`);
+  if (hasContent) parts.push(`正文：${input.content}`);
   if (input.source) parts.push(`来源：${input.source}`);
+  if (!hasContent) {
+    // 无正文防幻觉护栏（design D4 / spec「无正文时不编造具体参数 / 不否认真实发布」）。
+    parts.push(
+      '注意：本条无正文，只有标题。请只依据标题客观概括，' +
+        '禁止编造标题中未出现的具体事实（版本号、参数指标如上下文窗口大小/benchmark 分数、发布时间、价格、功能清单等）；' +
+        '禁止基于你的训练知识断言该产品/模型是否存在或是否已发布，' +
+        '也禁止否定或质疑标题所声称的发布事实——训练知识存在时效滞后，一律以标题所述为准客观转述。',
+    );
+  }
   parts.push(
     '字段：summary_zh（中文摘要正文）；' +
       `headline_zh（一句话要点，含主体+动作+影响，≤${HEADLINE_MAX} 字）。`,

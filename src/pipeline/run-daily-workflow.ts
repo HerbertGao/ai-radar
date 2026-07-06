@@ -24,9 +24,10 @@
  *
  * 边界：本模块只编排，调用各组已导出函数，不重写其内部逻辑、不改 schema。
  */
-import { and, inArray, isNull } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, lte, ne, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
-import { aiNewsEvents, rawItems } from '../db/schema.js';
+import { aiNewsEvents, aiProducts, rawItems } from '../db/schema.js';
+import { UNNAMED_PRODUCT_NAME } from '../collectors/product-collapse.js';
 import { env } from '../config/env.js';
 import {
   collectAndStore,
@@ -39,6 +40,11 @@ import {
   type SemanticMergeOptions,
   type SemanticMergeResult,
 } from '../dedup/semantic-merge.js';
+import {
+  enrichCandidateContent,
+  type EnrichContentOptions,
+  type EnrichContentResult,
+} from './content-enrichment.js';
 import {
   runKbIngestion,
   type RunKbIngestionOptions,
@@ -95,7 +101,7 @@ import {
   acquireDigestLock,
   type AcquireLockOptions,
 } from '../push/lock.js';
-import { getPushDate } from '../push/push-date.js';
+import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import {
   classifySystemFailure,
   stageDegradeRate,
@@ -146,6 +152,11 @@ export interface RunDailyWorkflowOptions {
   dbh?: DbLike;
   /** 采集层选项（注入 mock collector / RSS 源等）。 */
   collect?: CollectAllOptions;
+  /**
+   * 正文补全阶段选项（source-content-enrichment，组 G 2.4）。注入 `fetchImpl`/`resolve` 桩使
+   * 集成测在补全阶段**不触网**（对空 content + 可抓 URL 的候选，默认真实 fetch 会外发请求）。
+   */
+  enrich?: EnrichContentOptions;
   /** Value Judge 阶段选项（注入 mock generateObject 等）。 */
   judge?: ScoreEventsOptions;
   /** 中文摘要阶段选项（注入 mock generateObject 等）。 */
@@ -243,6 +254,12 @@ export interface RunDailyWorkflowResult {
    */
   publishedAtBackfill?: BackfillPublishedAtResult;
   /**
+   * 正文补全阶段统计（**仅可观测**，绝不影响 outcome / 熔断；组 G 2.4）。
+   * `hit`=成功抓 og:description 并原子写回数，`fail`=失败数（含被 SSRF 守卫拒绝数）。
+   * 整阶段 try/catch、永不向上抛、不进熔断分母。未执行（如未抢到锁提前返回）时为 undefined。
+   */
+  enrichment?: EnrichContentResult;
+  /**
    * 语义去重阶段统计（**仅可观测**，绝不影响 outcome / 熔断；P3 语义层，6.1）。
    * 语义降级（embedding/检索/LLM judge/合并冲突）一律「不合并」、不抛断、不计入 judge/digest
    * 熔断分母（语义层独立）。`SEMANTIC_DEDUP_ENABLED=off` 或阶段未执行（如未抢到锁提前返回）时为 undefined。
@@ -267,14 +284,28 @@ export interface RunDailyWorkflowResult {
   experienceKb?: ExperienceKbIngestionResult;
 }
 
-/** 把 Top N 选中事件补齐 canonical_url（供摘要降级回退到 URL）。 */
-async function loadCanonicalUrls(
+/** 代表 raw_item 的摘要相关字段：canonical_url（摘要降级回退）+ 补全后 content/source（摘要 grounding）。 */
+interface RepresentativeFields {
+  canonicalUrl: string | null;
+  content: string | null;
+  source: string | null;
+}
+
+/**
+ * 把 Top N 选中事件补齐代表 raw_item 的 canonical_url + 补全后 content + source（组 G 5.2）。
+ *
+ * - canonical_url 供摘要降级回退到 URL（原有职责）。
+ * - content/source 经 `representative_raw_item_id` 载入 source-content-enrichment 补全后的正文与来源，
+ *   透传 `EventForDigest`（digestEvent 已把二者拼进 prompt）——**只改 forDigest 签名不接此加载即静默
+ *   空转**（EventForDigest content/source 恒 undefined、摘要退化仅标题），故加载在此一并取回。
+ */
+async function loadRepresentativeFields(
   dbh: DbLike,
   eventIds: readonly string[],
-): Promise<Map<string, string | null>> {
-  const map = new Map<string, string | null>();
+): Promise<Map<string, RepresentativeFields>> {
+  const map = new Map<string, RepresentativeFields>();
   if (eventIds.length === 0) return map;
-  // 经 representative_raw_item_id 回指代表 raw_item 的 canonical_url。
+  // 经 representative_raw_item_id 回指代表 raw_item。
   const events = await dbh
     .select({
       eventId: aiNewsEvents.eventId,
@@ -286,21 +317,78 @@ async function loadCanonicalUrls(
   const repIds = events
     .map((e) => e.repId)
     .filter((x): x is bigint => x !== null);
-  const urlByRawId = new Map<string, string | null>();
+  const fieldsByRawId = new Map<string, RepresentativeFields>();
   if (repIds.length > 0) {
     const raws = await dbh
-      .select({ id: rawItems.id, canonicalUrl: rawItems.canonicalUrl })
+      .select({
+        id: rawItems.id,
+        canonicalUrl: rawItems.canonicalUrl,
+        content: rawItems.content,
+        source: rawItems.source,
+      })
       .from(rawItems)
       .where(inArray(rawItems.id, repIds));
-    for (const r of raws) urlByRawId.set(r.id.toString(), r.canonicalUrl);
+    for (const r of raws) {
+      fieldsByRawId.set(r.id.toString(), {
+        canonicalUrl: r.canonicalUrl,
+        content: r.content,
+        source: r.source,
+      });
+    }
   }
   for (const e of events) {
-    map.set(
-      e.eventId,
-      e.repId !== null ? (urlByRawId.get(e.repId.toString()) ?? null) : null,
-    );
+    const fields =
+      e.repId !== null ? fieldsByRawId.get(e.repId.toString()) : undefined;
+    map.set(e.eventId, {
+      canonicalUrl: fields?.canonicalUrl ?? null,
+      content: fields?.content ?? null,
+      source: fields?.source ?? null,
+    });
   }
   return map;
+}
+
+/**
+ * best-effort 诊断（组 G 7.1，可观测）：统计被 `is_ai_related` fail-closed 闸门（非 true = false
+ * 或 NULL）排除的要闻/新品数。**仅日志、绝不影响 outcome/熔断**——调用方须 try/catch 包裹。
+ *
+ * 口径为**粗粒度近似**（非精确复刻 selectTopN / selectProductCandidates 全部谓词，避免谓词漂移
+ * 维护陷阱）：
+ * - 要闻：候选窗口内（should_push + published_at 闭区间 + importance≥下限 + 非 tombstone）但
+ *   `is_ai_related IS NOT TRUE` 者——「其余谓词满足、仅因 AI 闸门被排除」的近似量（不含 per-channel
+ *   投递态，略偏宽，作调参信号足够）。
+ * - 新品：非 merge_conflict、非占位名、但 `is_ai_related IS NOT TRUE` 的产品（近似候选池被闸门排除量，
+ *   不含 per-channel「从未 success」判定）。
+ */
+async function countAiGatedOut(
+  dbh: DbLike,
+  now: Date,
+): Promise<{ events: number; products: number }> {
+  const lowerBound = startOfDayInTimeZone(now, env.FIRST_SEEN_WINDOW_DAYS - 1);
+  const [ev] = await dbh
+    .select({ n: sql<number>`count(*)::int` })
+    .from(aiNewsEvents)
+    .where(
+      and(
+        eq(aiNewsEvents.shouldPush, true),
+        gte(aiNewsEvents.publishedAt, lowerBound),
+        lte(aiNewsEvents.publishedAt, now),
+        gte(aiNewsEvents.importanceScore, String(env.IMPORTANCE_FLOOR)),
+        isNull(aiNewsEvents.mergedInto),
+        sql`${aiNewsEvents.isAiRelated} IS NOT TRUE`,
+      ),
+    );
+  const [pr] = await dbh
+    .select({ n: sql<number>`count(*)::int` })
+    .from(aiProducts)
+    .where(
+      and(
+        isNull(sql`${aiProducts.metadata} -> 'merge_conflict'`),
+        ne(aiProducts.name, UNNAMED_PRODUCT_NAME),
+        sql`${aiProducts.isAiRelated} IS NOT TRUE`,
+      ),
+    );
+  return { events: ev?.n ?? 0, products: pr?.n ?? 0 };
 }
 
 /**
@@ -443,6 +531,31 @@ export async function runDailyWorkflow(
       console.error('[pipeline] 语义去重: SEMANTIC_DEDUP_ENABLED=off，跳过语义层（退回纯硬去重）');
     }
 
+    // ── 阶段 2.6：正文补全（source-content-enrichment，spec / design D1）——链序钉死
+    //    「塌缩 → 语义合并 → 补全 → 判分」：**语义合并之后**（只富化存活代表、不对随即 tombstone 者
+    //    浪费抓取；语义合并判维持仅标题、有意取舍见 design D1）、**Value Judge 之前**（judge 与摘要都
+    //    需正文 grounding，补全先行才能一次 grounding 两者）。工作集与 scoreUnscoredEvents 判分集同口径
+    //    （importance_score IS NULL AND merged_into IS NULL，空 content + 可抓 URL）。
+    //    **补全默认串行 best-effort**：每条以 COLLECTOR_FETCH_TIMEOUT_MS 为上限、逐条 try/catch 隔离
+    //    （enrichCandidateContent 内部实现），量级数十条可接受；整体在 digest 锁内、watchdog 续租使延迟
+    //    有界非致命。**整阶段 try/catch 永不向上抛、不进熔断分母**（沿用回填/产品/KB 失败不进熔断的既有
+    //    先例；熔断分母仍只含 judge + digest 两阶段）；补全失败 content 仍空时判分/摘要按各自仅标题回退。
+    let enrichResult: EnrichContentResult | undefined;
+    try {
+      enrichResult = await enrichCandidateContent(dbh, options.enrich);
+      console.error(
+        `[pipeline] 正文补全: 命中 ${enrichResult.hit} 条, 失败 ${enrichResult.fail} 条` +
+          `（失败含被 SSRF 守卫拒绝数；best-effort、逐条隔离、不计入熔断）`,
+      );
+    } catch (error) {
+      // 防御性兜底：enrichCandidateContent 内部已逐条 try/catch、整阶段不抛；此处再兜一层（如工作集
+      // SELECT 异常），任何异常仅记日志、不抛断、不进熔断分母、不影响判分/摘要 outcome。
+      console.error(
+        `[pipeline] 正文补全阶段异常（已隔离，不影响判分/摘要 outcome、不进熔断分母）`,
+        error,
+      );
+    }
+
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。
     const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
     const judgeStage: StageDegrade = {
@@ -506,7 +619,7 @@ export async function runDailyWorkflow(
     );
 
     // ── 阶段 5：中文摘要逐条。分母 = Top N。单条降级回退/剔除（G5 内已处理），绝不推半截。
-    const canonicalUrls = await loadCanonicalUrls(
+    const repFields = await loadRepresentativeFields(
       dbh,
       topN.map((e) => e.eventId),
     );
@@ -528,7 +641,7 @@ export async function runDailyWorkflow(
           summaryZh: ev.summaryZh,
           // 已缓存分支：headline 来自 selectTopN（库内 headline_zh，旧事件为 null 走渲染回退）。
           headlineZh: ev.headlineZh,
-          canonicalUrl: canonicalUrls.get(ev.eventId) ?? null,
+          canonicalUrl: repFields.get(ev.eventId)?.canonicalUrl ?? null,
           publishedAt: ev.publishedAt,
           rankScore: ev.rankScore,
         });
@@ -539,10 +652,15 @@ export async function runDailyWorkflow(
       console.error(
         `[digest] 摘要 ${digestStep}/${toSummarizeCount}（event=${ev.eventId.slice(0, 8)}）`,
       );
+      const fields = repFields.get(ev.eventId);
       const forDigest: EventForDigest = {
         eventId: ev.eventId,
         representativeTitle: ev.representativeTitle,
-        canonicalUrl: canonicalUrls.get(ev.eventId) ?? null,
+        canonicalUrl: fields?.canonicalUrl ?? null,
+        // 补全后正文 + 来源（组 G 5.2 grounding）：digestEvent 拼进 prompt；补全失败仍空时
+        // buildPrompt 只在非空时拼入、触发无正文防幻觉护栏（组 D）。
+        content: fields?.content ?? null,
+        source: fields?.source ?? null,
       };
       const outcome = await digestEvent(forDigest, options.digest, dbh);
       if (outcome.degraded) digestDegraded += 1;
@@ -569,7 +687,7 @@ export async function runDailyWorkflow(
         representativeTitle,
         summaryZh: summaryZh ?? ev.summaryZh,
         headlineZh,
-        canonicalUrl: canonicalUrls.get(ev.eventId) ?? null,
+        canonicalUrl: repFields.get(ev.eventId)?.canonicalUrl ?? null,
         publishedAt: ev.publishedAt,
         rankScore: ev.rankScore,
       });
@@ -634,18 +752,31 @@ export async function runDailyWorkflow(
         .join(', ')}`,
     );
 
+    // ── 可观测（组 G 7.1）：AI 闸门过滤计数（best-effort、仅日志、绝不影响 outcome/熔断）。
+    //    暴露被 is_ai_related（false 或 NULL）fail-closed 排除的要闻/新品数，供闸门过/欠触发调参。
+    //    整块 try/catch，任何异常仅记日志、不抛断。
+    try {
+      const gated = await countAiGatedOut(dbh, now);
+      console.error(
+        `[pipeline] AI 闸门过滤（is_ai_related 非 true 被 fail-closed 排除，仅可观测）：` +
+          `要闻约 ${gated.events} 条、新品约 ${gated.products} 条`,
+      );
+    } catch (error) {
+      console.error('[pipeline] AI 闸门过滤计数失败（已隔离，不影响 outcome）', error);
+    }
+
     // ── 阶段 5.6：要闻段↔新品段跨段去重抑制（确定性兜底，design D3/D4）。
     //    位置：productsByChannel 之后、早退判断之前。同一项目既在要闻段又在新品段时，从要闻段
     //    剔除该事件、保留新品段（Show HN/Launch HN 等本质是产品，新品段是其正确归属、带官网链接与
     //    中文简介）。对齐键 = 产品归一三键组（canonical_domain/github_repo/product_hunt_slug），复用
     //    extractProductMergeKeys 两侧一致提取——纯程序确定性键，绝不经 LLM。
     //
-    //    (a) 事件侧键**现提取**：对每个 pushable 事件用 canonicalUrls.get(eventId) 调
+    //    (a) 事件侧键**现提取**：对每个 pushable 事件用 repFields.get(eventId)?.canonicalUrl 调
     //        extractProductMergeKeys({url}) 提三键（事件侧只传 url，product_hunt_slug 分支不触发，
     //        github.com 域被该函数置 null、改由 github_repo 精确对齐）。事件侧键**不做 PLATFORM_HOSTS
     //        擦洗**（原样输出，安全性来自下方产品域集排平台 host，见 daily-intel spec）。
     const eventsWithKeys: EventWithKeys[] = pushable.map((event) => {
-      const url = canonicalUrls.get(event.eventId) ?? null;
+      const url = repFields.get(event.eventId)?.canonicalUrl ?? null;
       const keys = extractProductMergeKeys({ url });
       return { event, keys };
     });
@@ -757,6 +888,7 @@ export async function runDailyWorkflow(
         topNCount: topN.length,
         alerted,
         publishedAtBackfill: backfillStats,
+        ...(enrichResult ? { enrichment: enrichResult } : {}),
         ...(semanticResult ? { semantic: semanticResult } : {}),
         experienceMining: experienceMiningResult,
         experienceKb: experienceKbResult,
@@ -889,6 +1021,7 @@ export async function runDailyWorkflow(
       topNCount: topN.length,
       alerted,
       publishedAtBackfill: backfillStats,
+      ...(enrichResult ? { enrichment: enrichResult } : {}),
       ...(semanticResult ? { semantic: semanticResult } : {}),
       ...(kbResult ? { kb: kbResult } : {}),
       experienceMining: experienceMiningResult,

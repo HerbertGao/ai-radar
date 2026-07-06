@@ -263,6 +263,10 @@ export async function selectTopN(
         // P3 tombstone 排除（合并核心闭环）：被吞 tombstone 绝不入选推送——否则与存活者重复推送同一
         // 现实事件，使合并比不合并更糟（spec「tombstone 对所有下游消费者不可见」）。
         isNull(aiNewsEvents.mergedInto),
+        // AI 相关闸门（fail-closed，spec「要闻候选须 AI 相关」/ design D2）：只放 is_ai_related=true。
+        // 必须 eq(col,true)——false 与 NULL（未判/历史/迁移前已评分）一律排除；禁 isNotFalse/ne(col,false)
+        // （二者会漏放 NULL）。是否推送仍由程序据此已落库布尔过滤，LLM 只产语义判定。
+        eq(aiNewsEvents.isAiRelated, true),
         notDeliveredToAllChannels,
       ),
     );
