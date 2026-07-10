@@ -108,6 +108,11 @@ import {
   stageShouldAbort,
   type StageDegrade,
 } from './circuit-breaker.js';
+import {
+  detectStaleSources,
+  type DetectStaleSourcesParams,
+  type StaleSource,
+} from './source-staleness.js';
 import type { BackfillPublishedAtResult } from '../agents/published-at-inference/backfill.js';
 
 type DbLike = typeof defaultDb;
@@ -181,6 +186,15 @@ export interface RunDailyWorkflowOptions {
   lock?: AcquireLockOptions;
   /** 告警 sink（默认 console.error）。 */
   alert?: AlertSink;
+  /**
+   * 按源陈旧度检测注入（add-per-source-staleness-alert，组 B）。默认真实 detectStaleSources。
+   * best-effort 阶段的唯一测试缝：注入桩确定性控制返回陈旧源 / 抛错（验证隔离），或返回空
+   * 以在既有用例里静默本阶段（避免部分源无产出误触发陈旧告警干扰无关断言）。
+   */
+  staleness?: (
+    params: DetectStaleSourcesParams,
+    dbh: DbLike,
+  ) => Promise<StaleSource[]>;
   /** 熔断阈值（默认 env.DEGRADE_ABORT_RATIO）。 */
   abortRatio?: number;
   /**
@@ -475,6 +489,45 @@ export async function runDailyWorkflow(
         newsProcessableCount,
       });
       alerted = true;
+    }
+
+    // ── 阶段 2.4（best-effort、可观测）：按源陈旧度检测（add-per-source-staleness-alert，design D1/D4）。
+    //    **位置钉死**：紧接系统级故障告警块之后、judge/digest 熔断 throw **之前**——保证熔断日 / 无候选
+    //    早退日照常检测（陈旧度与今日有无新闻正交，design 理由②）。此刻本轮采集已完成：健康源的
+    //    max(fetched_at) 已刷新为本次运行、死源仍停在旧值——同时抓「抛错静默死」与「返回 0 静默死」。
+    //    **只借 countAiGatedOut 的 try/catch 隔离范式、不借其位置**（它在两个 throw 之后、约 line 759，
+    //    放那儿熔断日不检测）。注入工作流 now（与 push_date 同源，定「now − 阈值天数」边界）+ dbh（复用
+    //    锁内单实例）；发现 ≥1 陈旧源 → 调一次 alert 列出每源 source + lastFetched（或「从未产出」）+ 已零
+    //    新增天数，无陈旧源不调（不发「一切正常」噪音，design D4）。
+    //    **best-effort 隔离**：任何异常仅记日志、绝不向上抛、不进 judge/digest 熔断分母、不影响 outcome/推送
+    //    （与既有 enrichment/countAiGatedOut/KB best-effort 阶段同纪律）。
+    const detectStale = options.staleness ?? detectStaleSources;
+    try {
+      const staleSources = await detectStale({ now }, dbh);
+      if (staleSources.length > 0) {
+        const lines = staleSources
+          .map((s) =>
+            s.lastFetched === null
+              ? `- ${s.source}：从未产出`
+              : `- ${s.source}：最近入库 ${s.lastFetched.toISOString()}，已零新增 ${s.staleDays} 天`,
+          )
+          .join('\n');
+        console.error(
+          `[pipeline] 告警: 检测到 ${staleSources.length} 个陈旧源（长期零新增）`,
+        );
+        alert(
+          `按源陈旧度告警：${staleSources.length} 个源长期零新增\n${lines}`,
+          { staleSources },
+        );
+      } else {
+        console.error('[pipeline] 陈旧度: 全部待监控源新鲜，无陈旧告警');
+      }
+    } catch (error) {
+      // 防御性隔离：陈旧度检测任何异常（查询 / 判定）仅记日志，绝不向上抛、不进熔断分母、不影响 outcome。
+      console.error(
+        '[pipeline] 陈旧度检测阶段异常（已隔离，不影响 outcome/推送、不进熔断分母）',
+        error,
+      );
     }
 
     // ── 阶段 2.5：语义去重（P3 第三/四层 + 确定性合并，spec「语义去重仅作用于日报链新闻事件」/ design D3）。
