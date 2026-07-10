@@ -34,7 +34,7 @@ import {
   type CollectedItem,
   type LogError,
 } from './types.js';
-import type { ParsedRssFeed, RssFeedItem } from './rss.js';
+import { rssGuidToString, type ParsedRssFeed, type RssFeedItem } from './rss.js';
 
 /** 抓取 + 解析单个 feed 的依赖契约（默认 rss-parser；可注入 mock）。 */
 export type FetchFeedFn = (feedUrl: string) => Promise<ParsedRssFeed>;
@@ -146,7 +146,8 @@ export function mapBloggerItem(
 
   // fallback 链：命名空间化 guid → canonical_url → sha256(title‖content)。
   // 分隔符为 NUL 字节（feed_url ‖ '\0' ‖ guid），与 RSS 同口径，杜绝拼接歧义。
-  const guid = item.guid?.trim();
+  // guid 归一（见 rssGuidToString）：Atom/YouTube feed 常把 guid/id 解析成对象，绝不对非字符串 .trim()。
+  const guid = rssGuidToString(item.guid)?.trim();
   const namespacedGuid =
     guid && guid.length > 0 ? sha256Hex(`${feedUrl}\0${guid}`) : null;
   const sourceItemId =
@@ -254,7 +255,13 @@ export async function collectBlogger(
           transcriptTimeoutMs,
         );
       }
-      items.push(mapBloggerItem(raw, feed.url, feed.vendor, contentOverride));
+      // 逐条 try/catch 隔离（与 rss 同口径）：某条目字段类型异常只跳过该条，
+      // 不得拖垮同 feed 其余条目、更不得拖垮整源全部 feed（模块头承诺的隔离在此兑现）。
+      try {
+        items.push(mapBloggerItem(raw, feed.url, feed.vendor, contentOverride));
+      } catch (error) {
+        logError(`blogger 条目映射失败（已跳过该条）：${feed.url}`, error);
+      }
     }
   }
   return items;

@@ -122,6 +122,55 @@ describe('RSS source_item_id fallback 链 + vendor provenance（命名空间化 
     expect(items[0]!.metadata).toEqual({ vendor: 'openai', feed_url: FEED });
     expect(items[0]!.sourceItemId).toBe(normMod.sha256Hex(`${FEED}\0g-1`));
   });
+
+  it('对象形态 guid（rss-parser 带属性节点 { _: value }）取 `_` 命名空间化，不抛', () => {
+    // rss-parser 对 <guid isPermaLink="false"> 会返回 { _: value, $: {...} }；直接 .trim() 会抛。
+    const out = rssMod.mapRssItem(
+      { guid: { _: 'g-obj', $: { isPermaLink: 'false' } } as never, title: 'T', link: 'https://o/x' },
+      FEED,
+      'openai',
+    );
+    expect(out.sourceItemId).toBe(normMod.sha256Hex(`${FEED}\0g-obj`));
+  });
+
+  it('guid 为对象且无字符串 `_` → 回退 canonical_url，不抛', () => {
+    const out = rssMod.mapRssItem(
+      { guid: { $: { isPermaLink: 'false' } } as never, title: 'T', link: 'https://o/y?utm_source=a' },
+      FEED,
+      null,
+    );
+    expect(out.sourceItemId).toBe('https://o/y');
+  });
+
+  it('guid 为 { _: "" }（空内层字符串）→ 回退 canonical_url，不产生退化命名空间 id', () => {
+    // 空内层 guid 经 length>0 闸门落到 canonical_url，绝不生成 sha256(feed‖NUL‖"") 退化 id。
+    const out = rssMod.mapRssItem(
+      { guid: { _: '' } as never, title: 'T', link: 'https://o/z?utm_source=a' },
+      FEED,
+      null,
+    );
+    expect(out.sourceItemId).toBe('https://o/z');
+  });
+
+  it('collectRss：单条目在 mapRssItem 内抛错被逐条隔离，其余条目照常发射', async () => {
+    // 回归：坏条目曾使整个 collectRss 抛出、丢弃全部 feed 全部条目（prod RSS 静默死约一月）。
+    // 坏条目须真的在 mapRssItem 内抛错才覆盖 try/catch —— title 是对象 → (title).trim() 抛。
+    const fetchFeed = async () => ({
+      items: [
+        { title: {} as never, link: 'https://o/bad' },
+        { guid: 'ok', title: '好条目', link: 'https://o/ok' },
+      ],
+    });
+    const items = await rssMod.collectRss({
+      feeds: [{ url: FEED, vendor: 'openai' }],
+      fetchFeed,
+      logError: () => {},
+      maxAttempts: 1,
+    });
+    // 坏条目被跳过、好条目仍发射（若移除 try/catch 则整源抛出、本断言失败）。
+    expect(items).toHaveLength(1);
+    expect(items[0]!.title).toBe('好条目');
+  });
 });
 
 describe('Hacker News 映射', () => {
