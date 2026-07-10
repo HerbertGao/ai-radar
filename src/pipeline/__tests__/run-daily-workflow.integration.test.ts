@@ -542,6 +542,9 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
       },
       judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
       digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 静默按源陈旧度阶段：本用例只种 rss 源，默认监控集里其余源无产出会被判陈旧误触发
+      // alert，干扰本处「系统级告警不误触发」断言。陈旧度契约由本文件末尾专属用例覆盖。
+      staleness: async () => [],
       sender,
       channels: ['telegram'],
       lock: LOCK_OPTS,
@@ -684,6 +687,111 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
     expect(result.alerted).toBe(true); // 新闻真空告警照常触发，不被 paper 掩盖。
     expect(alert).toHaveBeenCalled();
     expect(sender.calls).toBe(0); // 无新闻候选 → 不推。
+  });
+});
+
+/**
+ * runDailyWorkflow 按源陈旧度告警阶段编排集成测试（add-per-source-staleness-alert 组 B，
+ * tasks 3.1/3.2/3.3 + 4.4/4.5）。陈旧度检测在系统级告警之后、judge/digest 熔断 throw 之前的
+ * best-effort 阶段运行；注入 `staleness` 桩确定性控制返回陈旧源 / 抛错，断言：
+ * - 4.4 检测抛错被隔离：outcome/推送不受影响、judge/digest 熔断分母不含本阶段（3.3）。
+ * - 4.5 AlertSink 契约：≥1 陈旧源 → 恰好调用一次、消息含每源 source + lastFetched/staleDays（3.2）；
+ *   全部新鲜 → 零调用。
+ *
+ * 用「采集 > 0 且可处理 > 0」的健康 fixture（item() 走 rss），使系统级/熔断告警都不触发——如此
+ * alert 的调用次数纯由陈旧度阶段决定，可精确断言「恰好一次 / 零次」。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 按源陈旧度告警阶段（组 B 4.4/4.5）', () => {
+  it('4.4 检测抛错被隔离：outcome=pushed、推送照常、不进 judge/digest 熔断分母', async () => {
+    const items = [
+      item({ id: 'stl-err', url: 'https://ex.com/stl-err', title: 'Staleness isolate' }),
+    ];
+    const sender = okSender();
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 陈旧度检测桩抛错 → best-effort 阶段须捕获、不向上抛、不影响后续阶段。
+      staleness: async () => {
+        throw new Error('staleness boom');
+      },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+
+    // 抛错被隔离：流水线照常走完并推送。
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+    // 熔断分母（judge/digest）不含陈旧度阶段——健康 fixture 下二者一如既往。
+    expect(result.judge).toEqual({ processed: 1, degraded: 0 });
+    expect(result.digest.degraded).toBe(0);
+    // 采集 > 0、可处理 > 0 → 无系统级/熔断告警；抛错的陈旧度阶段也不发告警 → alert 零调用。
+    expect(alert).not.toHaveBeenCalled();
+  });
+
+  it('4.5 有 ≥1 陈旧源：AlertSink 恰好调用一次，消息含每源 source + lastFetched/staleDays', async () => {
+    const items = [
+      item({ id: 'stl-alert', url: 'https://ex.com/stl-alert', title: 'Staleness alert' }),
+    ];
+    const sender = okSender();
+    const alert = vi.fn();
+    const staleDate = new Date('1999-12-01T00:00:00.000Z');
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      // 两个陈旧源：一个带 lastFetched + staleDays，一个从未产出（lastFetched=null）。
+      staleness: async () => [
+        { source: 'github', lastFetched: staleDate, staleDays: 31 },
+        { source: 'blogger', lastFetched: null, staleDays: null },
+      ],
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+
+    expect(result.outcome).toBe('pushed');
+    // 系统级/熔断均不触发（健康 fixture）→ alert 的唯一来源是陈旧度阶段 → 恰好一次。
+    expect(alert).toHaveBeenCalledTimes(1);
+    const msg = String(alert.mock.calls[0]![0]);
+    // 消息含每个陈旧源的 source + 陈旧信息（lastFetched / staleDays / 从未产出）。
+    expect(msg).toContain('github');
+    expect(msg).toContain(staleDate.toISOString()); // lastFetched
+    expect(msg).toContain('31'); // staleDays
+    expect(msg).toContain('blogger');
+    expect(msg).toContain('从未产出'); // lastFetched=null 源
+  });
+
+  it('4.5 全部待监控源新鲜：AlertSink 零调用', async () => {
+    const items = [
+      item({ id: 'stl-fresh', url: 'https://ex.com/stl-fresh', title: 'Staleness fresh' }),
+    ];
+    const sender = okSender();
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [], // 全部新鲜 → 无陈旧告警。
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+
+    expect(result.outcome).toBe('pushed');
+    // 无陈旧源、无系统级/熔断告警 → alert 零调用。
+    expect(alert).not.toHaveBeenCalled();
   });
 });
 

@@ -3,6 +3,9 @@
 // 本地 `cp .env.example .env` 填好后 `npm run dev` 等脚本即可读到（修复 README 快速开始）。
 import 'dotenv/config';
 import { z } from 'zod';
+// 仅取类型（verbatimModuleSyntax 下 import type 编译期擦除）：不引入 collectors 运行期依赖，
+// 保 env.ts 作为基础配置模块不被 opencc-js/emoji-regex 等采集侧重依赖污染、且无循环依赖。
+import type { CollectorSource } from '../collectors/types.js';
 
 /**
  * 环境配置 schema（承载 spec「环境配置校验」需求）。
@@ -162,6 +165,81 @@ const sitemapSourceList = z
     return sources;
   });
 
+/**
+ * 全部已注册采集源名（供按源覆盖串校验源名拼写）。
+ * `satisfies Record<CollectorSource, true>` 强制与 `CollectorSource` 联合类型逐一对齐：
+ * 联合类型新增成员却漏加此处 → typecheck 立即失败（防「加了源、覆盖校验却把它当未知源拒掉」的漂移）。
+ * 注意：这里是**已注册源全集**（用于拼写校验），与陈旧度**监控集**（另在 source-staleness.ts 里
+ * 取 `buildRegistry().map(e=>e.source)` 并剔除结构性停用源）不同——覆盖 `blogger:7` 即便本部署
+ * BLOGGER_FEEDS 为空也算合法源名（不属拼写错误），故此处不排除结构性停用源。
+ */
+const ALL_COLLECTOR_SOURCE_SET = {
+  rss: true,
+  hacker_news: true,
+  github: true,
+  arxiv: true,
+  product_hunt: true,
+  show_hn: true,
+  hugging_face_papers: true,
+  sitemap: true,
+  blogger: true,
+} satisfies Record<CollectorSource, true>;
+
+/**
+ * 把 `SOURCE_STALENESS_ALERT_DAYS_OVERRIDES` 解析为按源覆盖阈值 `Map<source, days>`
+ * （add-per-source-staleness-alert，design D3 / spec「覆盖配置解析为容错跳过而非 fail-fast」）。
+ *
+ * 格式：逗号分隔多个 `source:days` 条目（如 `product_hunt:2,blogger:7`）。
+ * **有意偏离本文件其它 env 的 fail-fast 风格**——陈旧度告警是 advisory 可观测能力，一条坏覆盖不应
+ * 拖垮整个应用启动。**误配项跳过并记日志（console.warn 到 stderr）、绝不 addIssue**；**纯空串项**
+ * （如 `a,,b`、首尾逗号产生的空段）是良性格式、**静默跳过不记日志**（避免噪音）：
+ *   - 缺 `:` 分隔 / source 段空 / days 段空（非空但缺段）→ 跳过并记日志；
+ *   - days 非正整数（0 / 负 / 非整数 / NaN）→ 跳过并记日志（禁止 0/负阈值致该源恒判陈旧）；
+ *   - source 不在已注册源集合（ALL_COLLECTOR_SOURCE_SET）→ 跳过并记日志提示拼写（防真源被误以为已配置）；
+ *   - 纯空串项（split+trim 后为空）→ **静默跳过**（良性，不记日志）；
+ *   - 同源多次 → last-wins（Map.set 后者覆盖前者）；
+ *   - 空值 `''` → 空 Map。
+ */
+const stalenessOverrideMap = z
+  .string()
+  .default('')
+  .transform((raw) => {
+    const overrides = new Map<string, number>();
+    const known = new Set<string>(Object.keys(ALL_COLLECTOR_SOURCE_SET));
+    const skip = (entry: string, why: string): void =>
+      console.warn(
+        `[env] SOURCE_STALENESS_ALERT_DAYS_OVERRIDES 条目「${entry}」${why}，已跳过` +
+          `（陈旧度告警为 advisory，坏覆盖不阻断启动）。`,
+      );
+    for (const entry of raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)) {
+      const sepIdx = entry.indexOf(':');
+      if (sepIdx === -1) {
+        skip(entry, '缺少 : 分隔符（须为 source:days）');
+        continue;
+      }
+      const source = entry.slice(0, sepIdx).trim();
+      const daysRaw = entry.slice(sepIdx + 1).trim();
+      if (source.length === 0 || daysRaw.length === 0) {
+        skip(entry, 'source 段或 days 段为空');
+        continue;
+      }
+      if (!known.has(source)) {
+        skip(entry, `源名「${source}」不在已注册源集合内（疑似拼写错误）`);
+        continue;
+      }
+      const days = Number(daysRaw);
+      if (!Number.isInteger(days) || days <= 0) {
+        skip(entry, `天数「${daysRaw}」不是正整数`);
+        continue;
+      }
+      overrides.set(source, days); // 同源多次：后者覆盖前者（last-wins）。
+    }
+    return overrides;
+  });
+
 const envSchema = z.object({
   DATABASE_URL: z
     .string()
@@ -314,6 +392,15 @@ const envSchema = z.object({
   // 单次 alert-scan 最多发送的告警条数（防 Telegram rate limit 刷屏）。
   // 默认 5；超出的候选按 first_seen_at DESC 保留最新，其余待下轮（20min 后）补发。
   ALERT_MAX_PER_SCAN: z.coerce.number().int().positive().default(5),
+
+  // --- 按源采集陈旧度告警（add-per-source-staleness-alert，design D3）---
+  // 全局默认陈旧阈值天数：某已注册源连续超过此天数零新增（max(fetched_at) 早于 now-此天数，
+  // 或从未产出）即经既有 AlertSink 上报。正整数，默认 3。判定纯 DB + 程序比较，绝不交 LLM。
+  SOURCE_STALENESS_ALERT_DAYS: z.coerce.number().int().positive().default(3),
+  // 按源覆盖阈值：逗号分隔 `source:days` 串（如 product_hunt:2,blogger:7），解析为 Map<source, days>。
+  // 容错解析（advisory，有意不 fail-fast）：非法项（非正整数天数 / 缺段 / 未知源名 / 空串项）跳过并记日志、
+  // 同源 last-wins、空值 → 空 Map（见上方 stalenessOverrideMap）。某源无覆盖时用 SOURCE_STALENESS_ALERT_DAYS。
+  SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: stalenessOverrideMap,
 
   // --- 并发评分原子 claim 回收阈值 T（daily-intel-pipeline「降级逐条容错」/ realtime-alerts，design D6）---
   // 日报链与告警高频链可能并发对同一未评分事件评分；送 LLM 前原子 claim（写 judge_claimed_at），

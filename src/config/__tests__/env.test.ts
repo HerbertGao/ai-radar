@@ -9,7 +9,7 @@
  *
  * 纯函数测试，不触发 import 期的 `env` 单例校验（直接调用导出的 parseEnv）。
  */
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 // env.ts 在 import 期会以 process.env 评估 `env` 单例（缺关键变量即 throw）。
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
@@ -558,5 +558,101 @@ describe('parseEnv —— HF_PAPERS_MAX_PER_RUN 校验（add-tier1-ai-sources，
       HF_PAPERS_MAX_PER_RUN: '3.5',
     } as NodeJS.ProcessEnv;
     expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+});
+
+describe('parseEnv —— 按源陈旧度告警配置（add-per-source-staleness-alert，任务 4.1）', () => {
+  // 覆盖串解析**有意不 fail-fast**（advisory 配置）：坏项跳过并记日志、绝不使 parseEnv 抛错。
+  // 用 vi.spyOn 静默 console.warn（避免测试输出噪音），必要处断言跳过发生。
+  // afterAll 恢复：否则 spy 泄漏到同文件后续 suite，静默其真实告警。
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeAll(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterAll(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('SOURCE_STALENESS_ALERT_DAYS 缺省 → 默认 3', () => {
+    const env = parseEnv(validEnv());
+    expect(env.SOURCE_STALENESS_ALERT_DAYS).toBe(3);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES).toBeInstanceOf(Map);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
+  });
+
+  it('SOURCE_STALENESS_ALERT_DAYS 非正（"0"）/ 负 / 非整 → 报错（fail-fast，与覆盖串相反）', () => {
+    for (const bad of ['0', '-1', '3.5', 'abc']) {
+      const source = {
+        ...validEnv(),
+        SOURCE_STALENESS_ALERT_DAYS: bad,
+      } as NodeJS.ProcessEnv;
+      expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    }
+  });
+
+  it('正常覆盖串解析为 Map<source, days>', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: ' product_hunt:2 , blogger:7 ',
+    } as NodeJS.ProcessEnv);
+    const overrides = env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES;
+    expect([...overrides.entries()]).toEqual([
+      ['product_hunt', 2],
+      ['blogger', 7],
+    ]);
+  });
+
+  it('非正整数天数（blogger:0 / blogger:-1 / blogger:abc / blogger:2.5）被跳过', () => {
+    for (const bad of ['blogger:0', 'blogger:-1', 'blogger:abc', 'blogger:2.5']) {
+      const env = parseEnv({
+        ...validEnv(),
+        SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: bad,
+      } as NodeJS.ProcessEnv);
+      // 坏项被跳过 → blogger 无覆盖 → Map 为空（回退全局默认由检测层处理）。
+      expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.has('blogger')).toBe(false);
+      expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
+    }
+  });
+
+  it('未知源名（拼写错误 blooger:7）被跳过并记日志（skip+log 的 log 半边）', () => {
+    warnSpy.mockClear();
+    const env = parseEnv({
+      ...validEnv(),
+      SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: 'blooger:7',
+    } as NodeJS.ProcessEnv);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.has('blogger')).toBe(false);
+    // skip+log 的「log」半边：误配项（非纯空串）必须记日志（提示运营发现），非静默丢弃。
+    expect(warnSpy).toHaveBeenCalled();
+    expect(
+      warnSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes('blooger')),
+    ).toBe(true);
+  });
+
+  it('缺段 / 空串项（"blogger" / ":7" / "blogger:" / 空项）被跳过', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: 'blogger,:7,blogger:,, ,arxiv:4',
+    } as NodeJS.ProcessEnv);
+    // 仅合法项 arxiv:4 留存。
+    expect([...env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.entries()]).toEqual([
+      ['arxiv', 4],
+    ]);
+  });
+
+  it('同源多次 last-wins（blogger:7,blogger:2 → 2）', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: 'blogger:7,blogger:2',
+    } as NodeJS.ProcessEnv);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.get('blogger')).toBe(2);
+  });
+
+  it('空值 → 空 Map', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: '',
+    } as NodeJS.ProcessEnv);
+    expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
   });
 });
