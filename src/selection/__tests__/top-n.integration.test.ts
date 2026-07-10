@@ -14,7 +14,7 @@
  *
  * 缺 DATABASE_URL 时自动跳过。用唯一 dedup_key 前缀隔离造的 event 行，afterAll 清理。
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from '../../db/schema.js';
@@ -108,6 +108,11 @@ async function cleanup() {
 }
 
 beforeAll(cleanup);
+// 逐用例清理（isolation）：本套件多个 it 共用同一张 ai_news_events。若只 afterAll 清理，事件会跨 it
+// 累积；selectTopN 的 TOP_N 名额上限 + 并列事件（同 rank_score/published_at）末位 tiebreaker 用随机
+// event_id → 「本用例入窗事件是否落进前 N」在名额边界处不确定（flaky，2026-07-10 CI 偶发失败根因）。
+// afterEach 逐用例清理使每个 it 只见自己的种子，候选集确定、断言稳定；亦免各用例再靠 topN:100 兜底。
+afterEach(cleanup);
 afterAll(async () => {
   await cleanup();
   await pool?.end();
@@ -281,8 +286,8 @@ describe.skipIf(!databaseUrl)('Top N 候选窗口（DB 侧不变量）', () => {
       publishedAt: new Date(lowerBound.getTime() + 1000), // 下界后 1 秒 → 入窗。
     });
 
-    // topN: 100 避免 TOP_N 默认上限（本套件无 afterEach、跨 it 累积事件可能挤掉本用例的入窗事件）——
-    // 本用例只验「下界 ±1 秒入/出窗」，topN 充足时入窗事件必出现在结果里、不被名额上限混淆。
+    // topN: 100：本用例只验「下界 ±1 秒入/出窗」，给足名额使入窗事件必现于结果、不被 TOP_N 名额上限混淆
+    //（isolation 已由 afterEach 保证；此处名额充足是额外把「窗口成员资格」与「名额上限」解耦）。
     const top = await selectTopN({ now: NOW, topN: 100, importanceFloor: 60, windowDays }, db!);
     const ids = top.map((e) => e.eventId);
     expect(ids).not.toContain(justBefore); // < lowerBound → 出窗（闭区间下界严格之外）。
