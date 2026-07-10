@@ -29,4 +29,4 @@
 ## 5. 规范同步与收尾
 
 - [x] 5.1 `npm run typecheck`、`npm run lint`、`npm test` 全绿。
-- [ ] 5.2 运行 `/opsx:apply` 完成实现后，按流程 `/opsx:archive` 将 `source-staleness-alert` 增量规范同步进主规范。
+- [x] 5.2 运行 `/opsx:apply` 完成实现后，按流程 `/opsx:archive` 将 `source-staleness-alert` 增量规范同步进主规范。
