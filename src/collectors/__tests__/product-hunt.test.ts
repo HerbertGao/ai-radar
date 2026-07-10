@@ -159,6 +159,24 @@ describe('collectProductHunt 限流与鉴权', () => {
     expect(items.map((i) => i.sourceItemId)).toEqual(['a', 'b']);
   });
 
+  it('postedAfter 用 48h 回溯窗口（非「今日 0 点」，防 PH 太平洋日边界错位滤空）', async () => {
+    // 回归：曾用今日 00:00(上海)=前一日 16:00Z，与 PH 太平洋发布日（时间戳约 07:01Z）错位，单日
+    // 贴边窗口稳定返回 0（product_hunt 采集静默死）。改为 now−48h 固定回溯窗口，跨时区/时刻不漏。
+    const now = new Date('2026-07-10T15:30:00.000Z');
+    let capturedPostedAfter: unknown;
+    await phMod.collectProductHunt({
+      now,
+      fetchGraphql: async (_query, variables) => {
+        capturedPostedAfter = variables.postedAfter;
+        return { body: bodyWith([]), ...okHeaders };
+      },
+    });
+    // now − 48h，毫秒级精确（回退到「今日 0 点」或改动窗口小时数即失败）。
+    expect(capturedPostedAfter).toBe(
+      new Date('2026-07-08T15:30:00.000Z').toISOString(),
+    );
+  });
+
   it('401 鉴权错误：不重试，立即抛出（attempts=1）', async () => {
     let calls = 0;
     const logged: string[] = [];

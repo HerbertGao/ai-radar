@@ -24,7 +24,6 @@
  */
 import { env } from '../config/env.js';
 import { normalizeUrl } from '../dedup/normalize.js';
-import { startOfDayInTimeZone } from '../push/push-date.js';
 import { extractCanonicalDomain } from './product-keys.js';
 import {
   contentHash,
@@ -114,6 +113,8 @@ export interface ProductHuntCollectorOptions {
   logError?: LogError | undefined;
   /** 注入 sleep（测试免等待）。 */
   sleep?: ((ms: number) => Promise<void>) | undefined;
+  /** 参考时刻，决定 postedAfter 回溯窗口起点（默认当前时刻；测试注入固定时刻断言窗口值）。 */
+  now?: Date | undefined;
 }
 
 const realSleep = (ms: number): Promise<void> =>
@@ -168,13 +169,18 @@ function toDate(raw: string | null | undefined): Date | null {
 }
 
 /**
- * 取「今日 0 点（**Asia/Shanghai**，env.PUSH_TIMEZONE）」的 ISO，作 postedAfter 过滤当日上榜。
- *
- * 必须与 push_date / 产品推送窗口同源时区（Asia/Shanghai）——用 UTC 午夜会在时区边界附近让 PH
- * 的「今天」与上海「今天」错位（Bugbot #3）。复用 push-date 的 startOfDayInTimeZone（daysBack=0）。
+ * postedAfter 回溯窗口（小时）。**用固定回溯窗口而非「今日 0 点」**：PH 的发布日以太平洋时区为界
+ * （产品时间戳约 07:01Z），与 Asia/Shanghai「今日零点」（前一日 16:00Z）错位——单日贴边窗口会把当日
+ * PH 批次滤空。2026-07-01 起 PH 端 `postedAfter`+`VOTES` 日边界行为变化，实测「今日 0 点」窗口稳定
+ * 返回 0（product_hunt 采集自此静默死；24/48h 回溯窗口实测正常返回当日产品）。48h 稳定覆盖最近约
+ * 2 个 PH 发布日，跨时区/跨采集时刻都不漏；重复由 `UNIQUE(source, source_item_id)` + 日报 first-seen
+ * 窗口去重兜底，故宽窗口安全（宁多勿漏，不再贴日边界）。
  */
-function startOfTodayIso(): string {
-  return startOfDayInTimeZone(new Date(), 0).toISOString();
+const POSTED_AFTER_LOOKBACK_HOURS = 48;
+
+/** postedAfter = now − lookbackHours 的 ISO（UTC）。回溯窗口而非日边界，避免 PH 太平洋发布日错位滤空。 */
+function postedAfterIso(now: Date, lookbackHours: number): string {
+  return new Date(now.getTime() - lookbackHours * 60 * 60 * 1000).toISOString();
 }
 
 /**
@@ -222,7 +228,7 @@ export function mapProductHuntPost(post: ProductHuntPost): CollectedItem {
   };
 }
 
-/** 当日上榜产品的 GraphQL 查询（按票数倒序，postedAfter=今日）。 */
+/** 近窗上榜产品的 GraphQL 查询（按票数倒序，postedAfter=近 48h 回溯窗口，见 POSTED_AFTER_LOOKBACK_HOURS）。 */
 const POSTS_QUERY = `
 query DailyPosts($first: Int!, $postedAfter: DateTime) {
   posts(first: $first, order: VOTES, postedAfter: $postedAfter) {
@@ -277,8 +283,12 @@ export async function collectProductHunt(
   const rateLimitFloor = options.rateLimitFloor ?? 0;
   const logError = options.logError ?? defaultLogError;
   const sleep = options.sleep ?? realSleep;
+  const now = options.now ?? new Date();
 
-  const variables = { first: limit, postedAfter: startOfTodayIso() };
+  const variables = {
+    first: limit,
+    postedAfter: postedAfterIso(now, POSTED_AFTER_LOOKBACK_HOURS),
+  };
 
   let lastError: unknown;
   let result: ProductHuntFetchResult | null = null;
