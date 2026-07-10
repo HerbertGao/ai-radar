@@ -6,7 +6,7 @@
 
 ## 2. 检测模块
 
-- [x] 2.1 新建 `src/pipeline/source-staleness.ts`，导出 `detectStaleSources({ now, sources?, thresholds?, defaultDays? }, dbh)`；`sources` 默认取 `buildRegistry().map(e => e.source)` 去重，**再剔除结构性停用源**（`RSS_FEEDS` 为空时的 `rss`、`BLOGGER_FEEDS` 为空时的 `blogger`），`thresholds`/`defaultDays` 默认取 env。
+- [x] 2.1 新建 `src/pipeline/source-staleness.ts`，导出 `detectStaleSources({ now, sources?, thresholds?, defaultDays? }, dbh)`；`sources` 默认取 `buildRegistry().map(e => e.source)` 去重，**再剔除结构性停用源**（list 型配置为空：`RSS_FEEDS` 空的 `rss`、`BLOGGER_FEEDS` 空的 `blogger`、`SITEMAP_SOURCES` 空的 `sitemap`），`thresholds`/`defaultDays` 默认取 env。
 - [x] 2.2 实现按源聚合查询：`SELECT source, max(fetched_at) FROM raw_items WHERE source = ANY($sources) GROUP BY source`（Drizzle）。
 - [x] 2.3 实现判定：对每个已注册源，结果集缺席或 `max(fetched_at) < now − 该源阈值天数` → 陈旧；返回 `{ source, lastFetched: Date|null, staleDays: number|null }[]`（仅含陈旧源）。阈值解析：源在 overrides 里用其值，否则用 `defaultDays`。
 - [x] 2.4 判定逻辑禁止任何 LLM 调用（纯 DB + 程序比较）。
@@ -24,7 +24,7 @@
 - [x] 4.3 集成测（真实 pg）：种入不同 `fetched_at` 的 `raw_items`，断言陈旧源被识别、新鲜源不被识别、从未产出的已注册源判陈旧；用唯一 source 前缀隔离并清理。
 - [x] 4.4 集成/单元测：注入抛错的查询桩，断言 best-effort 阶段被隔离、`runDailyWorkflow` 的 `outcome` 与推送不受影响、不进熔断分母。
 - [x] 4.5 测 AlertSink 契约：注入 mock `AlertSink`——有 ≥1 陈旧源时**恰好调用一次**且消息含每个陈旧源的 `source` + `lastFetched`/`staleDays`；全部新鲜时**零调用**。
-- [x] 4.6 测 registry 默认源集合：不传 `sources`，断言检测器读 `buildRegistry().map(e => e.source)` 且**排除结构性停用源**（`RSS_FEEDS`/`BLOGGER_FEEDS` 为空时不含 rss/blogger）、配置非空的已注册无产出源被纳入并判陈旧——不改检测代码即验证自动纳入。
+- [x] 4.6 测 registry 默认源集合：不传 `sources`，断言检测器读 `buildRegistry().map(e => e.source)` 且**排除结构性停用源**（`RSS_FEEDS`/`BLOGGER_FEEDS`/`SITEMAP_SOURCES` 为空时不含 rss/blogger/sitemap）、配置非空的已注册无产出源被纳入并判陈旧——不改检测代码即验证自动纳入。
 
 ## 5. 规范同步与收尾
 

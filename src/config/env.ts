@@ -191,10 +191,12 @@ const ALL_COLLECTOR_SOURCE_SET = {
  *
  * 格式：逗号分隔多个 `source:days` 条目（如 `product_hunt:2,blogger:7`）。
  * **有意偏离本文件其它 env 的 fail-fast 风格**——陈旧度告警是 advisory 可观测能力，一条坏覆盖不应
- * 拖垮整个应用启动。故任一非法项**跳过并记日志（console.warn 到 stderr）、绝不 addIssue**：
- *   - 缺 `:` 分隔 / source 段空 / days 段空 / 空串项 → 跳过；
- *   - days 非正整数（0 / 负 / 非整数 / NaN）→ 跳过（禁止 0/负阈值致该源恒判陈旧）；
- *   - source 不在已注册源集合（ALL_COLLECTOR_SOURCE_SET）→ 跳过并提示拼写（防真源被误以为已配置）；
+ * 拖垮整个应用启动。**误配项跳过并记日志（console.warn 到 stderr）、绝不 addIssue**；**纯空串项**
+ * （如 `a,,b`、首尾逗号产生的空段）是良性格式、**静默跳过不记日志**（避免噪音）：
+ *   - 缺 `:` 分隔 / source 段空 / days 段空（非空但缺段）→ 跳过并记日志；
+ *   - days 非正整数（0 / 负 / 非整数 / NaN）→ 跳过并记日志（禁止 0/负阈值致该源恒判陈旧）；
+ *   - source 不在已注册源集合（ALL_COLLECTOR_SOURCE_SET）→ 跳过并记日志提示拼写（防真源被误以为已配置）；
+ *   - 纯空串项（split+trim 后为空）→ **静默跳过**（良性，不记日志）；
  *   - 同源多次 → last-wins（Map.set 后者覆盖前者）；
  *   - 空值 `''` → 空 Map。
  */

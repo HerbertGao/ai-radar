@@ -9,7 +9,7 @@
  *
  * 纯函数测试，不触发 import 期的 `env` 单例校验（直接调用导出的 parseEnv）。
  */
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 // env.ts 在 import 期会以 process.env 评估 `env` 单例（缺关键变量即 throw）。
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
@@ -564,8 +564,13 @@ describe('parseEnv —— HF_PAPERS_MAX_PER_RUN 校验（add-tier1-ai-sources，
 describe('parseEnv —— 按源陈旧度告警配置（add-per-source-staleness-alert，任务 4.1）', () => {
   // 覆盖串解析**有意不 fail-fast**（advisory 配置）：坏项跳过并记日志、绝不使 parseEnv 抛错。
   // 用 vi.spyOn 静默 console.warn（避免测试输出噪音），必要处断言跳过发生。
+  // afterAll 恢复：否则 spy 泄漏到同文件后续 suite，静默其真实告警。
+  let warnSpy: ReturnType<typeof vi.spyOn>;
   beforeAll(() => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterAll(() => {
+    warnSpy.mockRestore();
   });
 
   it('SOURCE_STALENESS_ALERT_DAYS 缺省 → 默认 3', () => {
@@ -610,8 +615,7 @@ describe('parseEnv —— 按源陈旧度告警配置（add-per-source-staleness
   });
 
   it('未知源名（拼写错误 blooger:7）被跳过并记日志（skip+log 的 log 半边）', () => {
-    const warn = vi.spyOn(console, 'warn');
-    warn.mockClear();
+    warnSpy.mockClear();
     const env = parseEnv({
       ...validEnv(),
       SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: 'blooger:7',
@@ -619,8 +623,10 @@ describe('parseEnv —— 按源陈旧度告警配置（add-per-source-staleness
     expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
     expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.has('blogger')).toBe(false);
     // skip+log 的「log」半边：误配项（非纯空串）必须记日志（提示运营发现），非静默丢弃。
-    expect(warn).toHaveBeenCalled();
-    expect(warn.mock.calls.some((c) => String(c[0]).includes('blooger'))).toBe(true);
+    expect(warnSpy).toHaveBeenCalled();
+    expect(
+      warnSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes('blooger')),
+    ).toBe(true);
   });
 
   it('缺段 / 空串项（"blogger" / ":7" / "blogger:" / 空项）被跳过', () => {
