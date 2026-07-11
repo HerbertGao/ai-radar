@@ -1,6 +1,7 @@
 ---
 name: "OPSX: Explore"
 description: 进入探索模式 - 思考想法、调查问题、澄清需求
+allowed-tools: Bash(openspec:*)
 category: Workflow
 tags: [workflow, explore, experimental, thinking]
 ---

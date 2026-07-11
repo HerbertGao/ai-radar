@@ -1,6 +1,7 @@
 ---
 name: "OPSX: Sync"
 description: 将变更中的增量规范同步到主规范
+allowed-tools: Bash(openspec:*)
 category: Workflow
 tags: [workflow, specs, experimental]
 ---

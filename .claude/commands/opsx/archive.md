@@ -1,6 +1,7 @@
 ---
 name: "OPSX: Archive"
 description: 在实验性工作流中归档已完成的变更
+allowed-tools: Bash(openspec:*)
 category: Workflow
 tags: [workflow, archive, experimental]
 ---

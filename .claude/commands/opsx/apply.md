@@ -1,6 +1,7 @@
 ---
 name: "OPSX: Apply"
 description: 从 OpenSpec 变更中实现任务（实验性）
+allowed-tools: Bash(openspec:*)
 category: Workflow
 tags: [workflow, artifacts, experimental]
 ---

@@ -1,6 +1,7 @@
 ---
 name: "OPSX: Propose"
 description: 一步创建变更并生成所有产出物
+allowed-tools: Bash(openspec:*)
 category: Workflow
 tags: [workflow, artifacts, experimental]
 ---
