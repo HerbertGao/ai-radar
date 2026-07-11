@@ -451,6 +451,11 @@ const envSchema = z.object({
   // 默认 'on'。仅日报链调用语义层（告警链恒走硬去重快路径，不受此开关影响）。
   SEMANTIC_DEDUP_ENABLED: z.enum(['on', 'off']).default('on'),
 
+  // 知识库语义检索 baseline（add-kb-retrieval-baseline，design D3）：searchKb top-k 缺省值。
+  // 检索原语内还会双向归一化到 [1,50] 整数（防直调传 0/负/小数致非法 LIMIT），本值只是缺省起点。
+  // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量）。
+  KB_SEARCH_TOP_K: z.coerce.number().int().positive().default(8),
+
   // --- AI 博主经验提炼（add-ai-blogger-experience-mining，design 风险/权衡）---
   // 经验提炼前对超长 transcript/博文的截断字符数（**镜像 EMBEDDING_TEXT_MAX_CHARS**）：
   // 防长文本 token 爆。提炼 Agent 取 raw_item content 摘录（截断到此值）后调 generateObject。

@@ -19,6 +19,7 @@
     "mcp": "tsx src/mcp/server.ts",
     "smoke": "tsx src/pipeline/smoke.ts",
     "kb:backfill": "tsx src/kb/backfill-main.ts",
+    "kb:search": "tsx src/kb/search-cli.ts",
     "mr:seed": "tsx src/mr/ingest/seed-main.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
