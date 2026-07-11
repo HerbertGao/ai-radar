@@ -16,9 +16,9 @@
 import { Queue, Worker, type ConnectionOptions, type Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import { env } from '../config/env.js';
+import { makeLocalCtx } from './run-context.js';
 import {
-  runAlertScan,
-  type RunAlertScanOptions,
+  run,
   type RunAlertScanResult,
 } from './alert-scan.js';
 
@@ -85,8 +85,6 @@ export async function scheduleAlertScan(
 export interface AlertScanWorkerOptions {
   /** BullMQ 连接（默认复用 env.REDIS_URL）。 */
   connection?: ConnectionOptions;
-  /** 透传给 runAlertScan 的注入点（生产留空走默认；测试/手动可注入）。 */
-  workflow?: Omit<RunAlertScanOptions, 'now'>;
   /** 并发度（默认 1）。 */
   concurrency?: number;
 }
@@ -105,10 +103,13 @@ export function createAlertScanWorker(
     ALERT_SCAN_QUEUE,
     async (job: Job<AlertScanJobData>) => {
       const now = job.data?.nowIso ? new Date(job.data.nowIso) : undefined;
-      return runAlertScan({
-        ...options.workflow,
-        ...(now ? { now } : {}),
+      // 处理器 shim（design D5）：构造本地 ctx（trigger='alert-scan'，input 携可选 now）→ 调薄
+      // run(ctx) 包装（生产默认补齐 DI，抛错经包装 emit run.failed 后 re-throw → job 失败可重试）。
+      const ctx = makeLocalCtx({
+        trigger: 'alert-scan',
+        input: now ? { now } : {},
       });
+      return run(ctx);
     },
     {
       connection,

@@ -208,6 +208,60 @@ describe.skipIf(!canRun)('周报端到端：选名单 + 推送 + 按周幂等', 
     expect(rows[0]!.status).toBe('success');
   });
 
+  it('阶段 emit 序列（2 阶段 select→push）+ 轻量确定性面 parity（5.1）', async () => {
+    // 经 options.emit（核心级）捕获粗粒度阶段序列。weekly 二阶段（design D4）：select/push 各 guard 一次、
+    // 不随通道数重复。前向断言（before=0）。
+    await insertWeeklyEvent({
+      id: 'emitseq',
+      title: 'Emit seq weekly',
+      summaryZh: 's',
+      headlineZh: 'h',
+      firstSeenAt: IN_WINDOW,
+    });
+    const emitted: string[] = [];
+    const sender = okSender();
+    const result = await runWeeklyReport({
+      now: TRIGGER,
+      dbh: db!,
+      channels: ['telegram'],
+      senders: { telegram: sender },
+      lock: LOCK_OPTS,
+      emit: (kind: string) => emitted.push(kind),
+    });
+    const stages = emitted.filter((k) => k.startsWith('stage.'));
+    expect(stages).toEqual(['stage.select', 'stage.push']);
+    // 逐 channel 结局事件（design D4）。
+    expect(emitted).toContain('outcome.channel');
+    // 核心绝不发 run.failed（run(ctx) 包装契约）。
+    expect(emitted).not.toContain('run.failed');
+    // 轻量确定性面 parity：target_id=iso_week、一行 weekly(success)。
+    expect(result.channels[0]!.outcome).toBe('sent');
+    const rows = await fetchWeeklyRecords();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.target_id).toBe('2026-W23');
+    expect(rows[0]!.status).toBe('success');
+  });
+
+  it('全通道空名单 run 仍发 stage.push：阶段序列保持 select→push 二阶段', async () => {
+    // 不插任何窗口内事件/产品 → 名单为空 → 该通道 skipped。但 run 已进入 dispatch 阶段，
+    // stage.push 须照发（守住 weekly「select→push 二阶段」契约，不因空名单丢一段）。
+    const emitted: string[] = [];
+    const sender = okSender();
+    const result = await runWeeklyReport({
+      now: TRIGGER,
+      dbh: db!,
+      channels: ['telegram'],
+      senders: { telegram: sender },
+      lock: LOCK_OPTS,
+      emit: (kind: string) => emitted.push(kind),
+    });
+    const stages = emitted.filter((k) => k.startsWith('stage.'));
+    expect(stages).toEqual(['stage.select', 'stage.push']); // 空名单也二阶段。
+    expect(result.channels[0]!.outcome).toBe('skipped'); // 名单空 → 该通道 skipped。
+    expect(sender.calls).toBe(0); // 空名单不发送。
+    expect(emitted).not.toContain('run.failed');
+  });
+
   it('merge_conflict 产品排除出周报正文', async () => {
     await insertWeeklyProduct({ name: `${PRODUCT_NAME_PREFIX} 正常品`, lastSeenAt: IN_WINDOW });
     await insertWeeklyProduct({

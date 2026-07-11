@@ -319,6 +319,74 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
     expect(result.topNCount).toBe(2);
   });
 
+  it('同 now 双跑推送幂等：UNIQUE(target_type,target_id,channel,push_date) 只落一行 event(success)（5.2）', async () => {
+    // 真集成 Postgres 双跑、钉 now（不靠 mock dbh）：第二次同 URL（不同 source_item_id 模拟重抓）塌缩进
+    // 既有已 success 事件 → 待发集合空 → 不重发；断言同一约束只落一行、pending→success 终态不变。
+    const url = 'https://idem.example.com/daily/1';
+    const runOnce = (id: string) =>
+      runDailyWorkflow({
+        now: NOW,
+        dbh: db!,
+        collect: { collectors: collectorsReturning([item({ id, url, title: 'Idempotent daily' })]) },
+        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+        sender: okSender(),
+        channels: ['telegram'],
+        lock: LOCK_OPTS,
+        alert: vi.fn(),
+        staleness: async () => [],
+      });
+
+    const first = await runOnce('idem-a');
+    expect(first.outcome).toBe('pushed');
+    const second = await runOnce('idem-b');
+    expect(second.outcome).toBe('skipped-no-candidates'); // 已 success → 无待发、不重发。
+
+    // 同一 UNIQUE 约束只落一行 event（push_date=getPushDate(NOW)=2000-01-01 SH），状态终为 success。
+    const { rows } = await pool!.query<{ status: string }>(
+      `SELECT status FROM push_records
+        WHERE target_type='event' AND channel='telegram' AND push_date='2000-01-01'`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe('success');
+  });
+
+  it('阶段 emit 序列：collect→dedup→score→select→digest→push→kb + outcome.pushed（组 B 前向断言，7 阶段有序）', async () => {
+    // 经 options.emit（核心级）捕获粗粒度阶段 + 结局事件序列。核心绝不 emit run.failed（那是 run(ctx) 包装职责）。
+    const items = [
+      item({ id: 'seq1', url: 'https://ex.com/seq1', title: 'Stage sequence one' }),
+    ];
+    const emitted: string[] = [];
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+      emit: (kind: string) => emitted.push(kind),
+    });
+    expect(result.outcome).toBe('pushed');
+    const stagesAndOutcome = emitted.filter(
+      (k) => k.startsWith('stage.') || k.startsWith('outcome.'),
+    );
+    expect(stagesAndOutcome).toEqual([
+      'stage.collect',
+      'stage.dedup',
+      'stage.score',
+      'stage.select',
+      'stage.digest',
+      'stage.push',
+      'stage.kb',
+      'outcome.pushed',
+    ]);
+    // 核心不发 run.failed（re-throw + run.failed 是 run(ctx) 包装契约，见 run-lane-wrappers.test.ts）。
+    expect(emitted).not.toContain('run.failed');
+  });
+
   it('judge 阶段超阈值即中止（抛 WorkflowAbortError，不推）', async () => {
     const items = [
       item({ id: 'j1', url: 'https://ex.com/j1', title: 'BAD a' }),

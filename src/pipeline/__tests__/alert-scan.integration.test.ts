@@ -216,6 +216,33 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     expect(rows[0]!.status).toBe('success');
   });
 
+  it('阶段 emit 序列（5 阶段 collect→dedup→score→select→push，无 kb/无 digest）+ 确定性面 parity（5.1）', async () => {
+    // 经 options.emit（核心级）捕获粗粒度阶段序列。alert 五阶段（design D4，无 kb），前向断言（before=0）。
+    const emitted: string[] = [];
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([rssItem('Emit seq alert', 'https://x.com/emitseq')]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        emit: (kind: string) => emitted.push(kind),
+      }),
+    );
+    const stages = emitted.filter((k) => k.startsWith('stage.'));
+    expect(stages).toEqual(['stage.collect', 'stage.dedup', 'stage.score', 'stage.select', 'stage.push']);
+    // 逐 candidate/channel 结局事件（design D4，无 run 级 rollup）。
+    expect(emitted).toContain('outcome.channel');
+    // 核心绝不发 run.failed（re-throw + run.failed 是 run(ctx) 包装契约，见 run-lane-wrappers.test.ts）。
+    expect(emitted).not.toContain('run.failed');
+    // 确定性面 parity：候选/推送/一行 alert(success)（与既有钉定期望一致）。
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1);
+    const rows = await alertRecords();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe('success');
+  });
+
   it('6.3 告警链不触发语义合并 / KB 入库（保持硬去重快路径，仅日报链做语义层）', async () => {
     // spy 语义合并 / KB 入库编排入口：跑一次产生并处理事件的完整 alert-scan（含 collapse + dispatch），
     // 断言二者**零调用**——语义去重与 KB 入库仅日报链执行，告警链恒走硬去重快路径（spec / design D3）。
