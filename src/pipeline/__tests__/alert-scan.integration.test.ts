@@ -190,6 +190,9 @@ const opts = (over: Record<string, unknown> = {}) => ({
   windowDays: 0,
   // 测试每用例 TRUNCATE 全表后只有本用例 seed 的数据，上限不影响断言；给足空间即可。
   maxPerScan: 100,
+  // 告警入选候选缺中文摘要者会跑 digestEvent；注入抛错桩使其确定性降级为 headline 回退链
+  //（不真调 LLM），与 2.1 前「告警链不摘要」行为 parity（summary_zh/headline_zh 保持 NULL、走回退渲染）。
+  digest: { generateObjectFn: async () => { throw new Error('digest disabled in test'); }, maxAttempts: 1, logError: () => {} },
   ...over,
 });
 
@@ -625,6 +628,8 @@ describe.skipIf(!databaseUrl)('runAlertScan 发布时间回填阶段（4.4）', 
     judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
     threshold: 85,
     publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
+    // 抛错桩使回填后达阈值候选的摘要确定性降级为 headline 回退链，不真调 LLM。
+    digest: { generateObjectFn: async () => { throw new Error('digest disabled in test'); }, maxAttempts: 1, logError: () => {} },
     ...over,
   });
 
@@ -723,5 +728,304 @@ describe.skipIf(!databaseUrl)('runAlertScan 发布时间回填阶段（4.4）', 
       `SELECT published_at FROM ai_news_events WHERE event_id = $1`, [belowId]);
     expect(above.rows[0]!.published_at).not.toBeNull();
     expect(below.rows[0]!.published_at).toBeNull();
+  });
+});
+
+/**
+ * add-high-freq-p0-push 组 C（任务 6.1 / 6.2）：告警渲染（canonicalUrl + 中文 headline_zh + 回退链）
+ * 与首次启用发布时间基线水位回归。真集成 Postgres，NOW 钉 2098 远未来锚点、windowDays=0 旁路下界
+ * （隔离基线为唯一变量）。全部注入 sender mock / 钉 channels（守 VITEST 不真发飞书/Telegram，memory
+ * test-no-prod-sends）。afterEach TRUNCATE 隔离，每用例只见本用例 seed 的数据。
+ */
+describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基线水位（6.1/6.2）', () => {
+  /**
+   * Seed 一个已评分（达阈值）事件 + 代表 raw_item（带显式 canonical_url），并经
+   * representative_raw_item_id 回指——供 selectAlertCandidates 的 LEFT JOIN 取到规范化原文链接。
+   * collapsed=true 使 collapseUncollapsedRawItems 不重塌缩成新事件（同 4.4 seedNullDateScoredEvent）。
+   */
+  async function seedEventWithRawItem(args: {
+    title: string;
+    canonicalUrl: string | null;
+    publishedAt: Date | null;
+    importance?: number;
+    content?: string | null;
+  }): Promise<string> {
+    const ts = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const rir = await pool!.query<{ id: string }>(
+      `INSERT INTO raw_items (source, source_item_id, url, title, canonical_url, content, collapsed)
+       VALUES ('rss', $1, $2, $3, $4, $5, true) RETURNING id`,
+      [`${SOURCE}-${ts}`, `https://x.com/src/${ts}`, args.title, args.canonicalUrl, args.content ?? null],
+    );
+    const rawId = rir.rows[0]!.id;
+    const { rows } = await pool!.query<{ event_id: string }>(
+      `INSERT INTO ai_news_events
+         (representative_title, representative_raw_item_id, importance_score, published_at, first_seen_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING event_id`,
+      [args.title, rawId, String(args.importance ?? 90), args.publishedAt, new Date()],
+    );
+    return rows[0]!.event_id;
+  }
+
+  // ── 6.1(a) 摘要成功路径：消息渲染中文 headline_zh + canonicalUrl 规范化链接。
+  it('6.1(a) summarizeEvent 成功 → 消息含中文 headline_zh + canonicalUrl 链接；grounding 正文入 prompt', async () => {
+    // 可辨识正文：钉 grounding 回归——raw_items.content 须经 SELECT 投影 → AlertCandidate → digestEvent
+    // → summarizeEvent buildPrompt 拼入 prompt。若把 content/source 投影退回 title-only（round-1 MAJOR
+    // 回归），下方 capturedPrompt 断言失败（stub 忽略入参的旧测试无法捕获此回归，见 CR 三列集分析）。
+    const GROUNDING_BODY = 'GROUNDING_BODY_正文接地检验_9f3a';
+    await seedEventWithRawItem({
+      title: 'Major model release',
+      canonicalUrl: 'https://example.com/launch-a',
+      content: GROUNDING_BODY,
+      publishedAt: NOW, // 窗口内（windowDays=0 旁路仅免下界，NOW<=now 且非 NULL 过闸）。
+    });
+    let capturedPrompt = '';
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) }, // 不采新条目，只选既有 seed。
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        // 覆盖默认抛错桩：摘要成功桩（返回经 digestOutputSchema 校验的中文标题/摘要）+ 捕获 prompt 验 grounding。
+        digest: {
+          generateObjectFn: async ({ prompt }: { prompt: string }) => {
+            capturedPrompt = prompt;
+            return {
+              object: {
+                headline_zh: '重大模型发布震撼业界',
+                summary_zh: '这是一条用于测试渲染的中文摘要正文。',
+              },
+            };
+          },
+          maxAttempts: 1,
+          logError: () => {},
+        },
+      }),
+    );
+
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1);
+    // 渲染取中文 headline_zh（非原始英文标题）。
+    expect(sender.texts[0]).toContain('重大模型发布震撼业界');
+    // canonicalUrl 经 LEFT JOIN 回指 → 渲染 [原文](url)。
+    expect(sender.texts[0]).toContain('https://example.com/launch-a');
+    // grounding 回归钉：raw_items.content 确实流入摘要 prompt（投影→候选→digestEvent→buildPrompt）。
+    expect(capturedPrompt).toContain(GROUNDING_BODY);
+
+    // 库内确认摘要已持久化（供后进日报「已摘要守卫」复用）。
+    const { rows } = await pool!.query<{ summary_zh: string | null; headline_zh: string | null }>(
+      `SELECT summary_zh, headline_zh FROM ai_news_events`,
+    );
+    expect(rows[0]!.headline_zh).toBe('重大模型发布震撼业界');
+    expect(rows[0]!.summary_zh).toBe('这是一条用于测试渲染的中文摘要正文。');
+  });
+
+  // ── 6.1(b) 回指为 NULL 的达阈值事件仍告警（1.1 LEFT JOIN 不丢候选，消息无链接、不报错）。
+  it('6.1(b) representative_raw_item_id 为 NULL 的达阈值事件仍告警（LEFT JOIN 保候选，无链接）', async () => {
+    // seedScoredEvent 不建 raw_item → representative_raw_item_id 为 NULL → LEFT JOIN canonicalUrl 为 NULL。
+    await seedScoredEvent({ title: 'Null backref event', publishedAt: NOW });
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+      }),
+    );
+
+    expect(result.alertCandidateCount).toBe(1); // LEFT JOIN（非 INNER）：回指 NULL 不丢候选。
+    expect(sender.calls).toBe(1); // 仍告警（不漏）。
+    expect(sender.texts[0]).toContain('Null backref event'); // headline 回退到代表标题。
+    expect(sender.texts[0]).not.toContain('原文'); // canonicalUrl NULL → 无链接行、不报错。
+  });
+
+  // ── 6.1(c) summarizeEvent 失败 → headline 回退链，仍告警不漏；canonicalUrl 链接独立于摘要仍渲染。
+  it('6.1(c) summarizeEvent 抛错 → 走 headline 回退链仍告警不漏；canonicalUrl 链接不受影响', async () => {
+    await seedEventWithRawItem({
+      title: 'Digest fails but link stays',
+      canonicalUrl: 'https://example.com/launch-c',
+      publishedAt: NOW,
+    });
+    const sender = okSender();
+    // opts 默认 digest 即抛错桩（summarizeEvent 失败 → DigestFailureError → digestEvent 返回 fallback，
+    // candidate 保持 headline_zh/summary_zh=NULL，dispatch 走 headline 回退链渲染代表标题）。
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+      }),
+    );
+
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1); // 摘要失败绝不漏告警。
+    expect(sender.texts[0]).toContain('Digest fails but link stays'); // headline 回退到代表标题。
+    expect(sender.texts[0]).toContain('https://example.com/launch-c'); // 链接来自 LEFT JOIN、独立于摘要。
+    // 摘要失败未写 headline_zh/summary_zh（保持 NULL，绝不落半截）。
+    const { rows } = await pool!.query<{ summary_zh: string | null; headline_zh: string | null }>(
+      `SELECT summary_zh, headline_zh FROM ai_news_events`,
+    );
+    expect(rows[0]!.summary_zh).toBeNull();
+    expect(rows[0]!.headline_zh).toBeNull();
+  });
+
+  // ── 6.1(d) P0 可观测：p0.observed emit 载荷 = 本次告警计数 + 通道 + 各命中的 importance_score/event_id。
+  it('6.1(d) p0.observed emit 载荷与命中一致（count/channels/hits.importanceScore）', async () => {
+    const events: Array<{ kind: string; payload?: unknown }> = [];
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([rssItem('Observable P0', 'https://x.com/obs')]) },
+        judge: { judge: { generateObjectFn: judgeMock(92), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        emit: (kind: string, payload?: unknown) => events.push({ kind, payload }),
+      }),
+    );
+    expect(result.alertCandidateCount).toBe(1);
+    const p0 = events.find((e) => e.kind === 'p0.observed');
+    expect(p0).toBeDefined();
+    const payload = p0!.payload as {
+      count: number;
+      channels: string[];
+      hits: Array<{ eventId: string; importanceScore: number | null }>;
+    };
+    expect(payload.count).toBe(1);
+    expect(payload.channels).toEqual(['telegram']);
+    expect(payload.hits).toHaveLength(1);
+    expect(payload.hits[0]!.importanceScore).toBe(92); // 命中事件 importance（P0 抽检口径），非 NULL。
+    expect(typeof payload.hits[0]!.eventId).toBe('string');
+  });
+
+  // ── 6.1(e) 摘要**持久化**失败（updateSummaryZh 的 .update 抛非 DigestFailureError）→ 仍告警不漏、summary 保持 NULL。
+  //    补 spec 场景「摘要生成**或持久化**失败走回退链不漏告警」的持久化半边（6.1(c) 只覆盖生成失败）。
+  it('6.1(e) 摘要持久化失败（.update(ai_news_events) 抛 DB 异常）→ 仍告警不漏、summary 保持 NULL', async () => {
+    await seedEventWithRawItem({
+      title: 'Persist fails but still alerts',
+      canonicalUrl: 'https://example.com/persist-fail',
+      publishedAt: NOW,
+    });
+    // 只拦 .update(ai_news_events)：令 digestEvent 内 updateSummaryZh 抛非 DigestFailureError（模拟持久化
+    // DB 异常）→ digestEvent re-throw → runAlertScan 逐条 try/catch 隔离降级为 headline 回退链。dispatcher
+    // 只 .update(push_records)，投递不受影响（其余方法经 Reflect.get 透传真实 db）。
+    const failingSummaryDb = new Proxy(db!, {
+      get(target, prop, receiver) {
+        if (prop === 'update') {
+          return (table: Parameters<typeof target.update>[0]) => {
+            if (table === schema.aiNewsEvents) {
+              throw new Error('summary UPDATE failed (simulated DB error)');
+            }
+            return target.update(table);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        dbh: failingSummaryDb,
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        // 摘要生成成功（校验通过的中文）→ 流程走到 updateSummaryZh → 由上面 Proxy 抛错触发持久化失败分支。
+        digest: {
+          generateObjectFn: async () => ({
+            object: { headline_zh: '不该被持久化的标题', summary_zh: '不该被持久化的摘要正文。' },
+          }),
+          maxAttempts: 1,
+          logError: () => {},
+        },
+      }),
+    );
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1); // 持久化失败绝不漏告警。
+    expect(sender.texts[0]).toContain('Persist fails but still alerts'); // headline 回退到代表标题。
+    // 持久化失败：summary_zh/headline_zh 保持 NULL（绝不落半截，回退链兜底）。
+    const { rows } = await pool!.query<{ summary_zh: string | null; headline_zh: string | null }>(
+      `SELECT summary_zh, headline_zh FROM ai_news_events`,
+    );
+    expect(rows[0]!.summary_zh).toBeNull();
+    expect(rows[0]!.headline_zh).toBeNull();
+  });
+
+  // ── 6.2 基线水位：published_at < baseline 的存量不候选，>= baseline 的新事件正常候选。
+  it('6.2 基线水位：< baseline 的存量启用后不候选，>= baseline 的新事件候选', async () => {
+    const baseline = new Date(NOW.getTime() - 5 * 24 * 3600 * 1000); // NOW-5 天。
+    const stale = await seedScoredEvent({
+      title: 'stale pre-baseline',
+      publishedAt: new Date(NOW.getTime() - 10 * 24 * 3600 * 1000), // < baseline。
+    });
+    const fresh = await seedScoredEvent({
+      title: 'fresh post-baseline',
+      publishedAt: new Date(NOW.getTime() - 2 * 24 * 3600 * 1000), // >= baseline。
+    });
+
+    // 无基线（minPublishedAt=null）：windowDays=0 旁路下界，两者都过闸（isNotNull + lte(now)）→ 均候选。
+    const noBaseline = await selectAlertCandidates(85, db!, ['telegram'], NOW, 0, 100, null);
+    expect(noBaseline.map((c) => c.eventId).sort()).toEqual([stale, fresh].sort());
+
+    // 加基线：谓词叠加 published_at >= baseline → stale 被排除，只剩 fresh（与评分状态/通道无关）。
+    const withBaseline = await selectAlertCandidates(85, db!, ['telegram'], NOW, 0, 100, baseline);
+    expect(withBaseline.map((c) => c.eventId)).toEqual([fresh]);
+  });
+
+  // ── 6.2 幂等：同一 P0 事件同 push_date 双跑绝不双推——UNIQUE(alert,event,channel,push_date) 只落一行。
+  it('6.2 同一 P0 事件双跑不双推：UNIQUE(alert,event,channel,push_date) 只落一行', async () => {
+    const items = collectorsReturning([rssItem('Idempotent P0', 'https://x.com/idem')]);
+    const s1 = okSender();
+    await runAlertScan(
+      opts({
+        collect: { collectors: items },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: s1 },
+        threshold: 85,
+      }),
+    );
+    expect(s1.calls).toBe(1); // 首跑告警一次。
+
+    // 同 push_date 再跑（事件已 alert-success）：候选窗口「从未 success」排除它，不再候选/不双推。
+    const s2 = okSender();
+    const r2 = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        senders: { telegram: s2 },
+        threshold: 85,
+      }),
+    );
+    expect(r2.alertCandidateCount).toBe(0);
+    expect(s2.calls).toBe(0);
+
+    // 显式断言四元组只落一行（TRUNCATE 隔离 → alert/telegram/本日仅本事件一行）。
+    const { rows } = await pool!.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM push_records
+        WHERE target_type='alert' AND channel='telegram' AND push_date=$1`,
+      [ALERT_PUSH_DATE],
+    );
+    expect(rows[0]!.n).toBe('1');
+  });
+
+  // ── 6.2 跨天 per-channel 可靠补发口径不变：telegram 已 success、feishu 未 success 者对多通道仍候选。
+  it('6.2 per-channel 可靠补发口径不变：telegram 已 success、feishu 未 success → 多通道仍候选', async () => {
+    const fresh = await seedScoredEvent({ title: 'per-channel resend', publishedAt: NOW });
+    // 手插 telegram alert-success（模拟 telegram 已投递、feishu 尚缺）。
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('alert', $1, 'telegram', $2, 'success')`,
+      [fresh, ALERT_PUSH_DATE],
+    );
+
+    // [telegram] 单通道：已全 success（distinct 1 = 1）→ 移出候选（一生一次）。
+    const tgOnly = await selectAlertCandidates(85, db!, ['telegram'], NOW, 0, 100, null);
+    expect(tgOnly.map((c) => c.eventId)).not.toContain(fresh);
+
+    // [telegram, feishu]：feishu 尚缺 alert-success（distinct 1 < 2）→ 仍候选、可靠补发 feishu。
+    const both = await selectAlertCandidates(85, db!, ['telegram', 'feishu'], NOW, 0, 100, null);
+    expect(both.map((c) => c.eventId)).toContain(fresh);
   });
 });

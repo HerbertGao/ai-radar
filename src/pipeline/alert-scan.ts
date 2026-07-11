@@ -33,17 +33,19 @@
  *   与日报 `event` 互不挤占（日报已推同一事件不吞掉告警）。
  * - **一生一次去重**：候选「该 event_id 从未以该 channel success 告警过」管跨天；
  *   `UNIQUE(alert,event_id,channel,push_date)` 兜底同日并发（dispatcher 状态机承载）。
- * - **独立单例锁** `alert:{channel}:{event_id}`：job 级短时持有 + TTL/finally 释放（锁键无时间，
+ * - **独立单例锁** `alert:{event_id}`（per-event，覆盖该事件向所有通道的分发）：job 级短时持有 + TTL/finally 释放（锁键无时间，
  *   无 TTL 且崩溃未释放会永久死锁该事件告警，故释放语义不可省）。
  * - **failed 告警跨天可重试**：一生一次约束的是 `success` 唯一；failed 当日按 dispatcher 置 failed，
  *   事件仍「从未 success 告警」满足候选窗口，新 push_date 可重试。
  * - **状态机复用**：告警推送复用 dispatcher 同一「待发→pending→原子送达→success/failed」状态机
  *   （含 headline 缺失回退链——告警事件可能尚无中文摘要），仅 target_type/channel 口径不同。
  */
-import { and, desc, gte, isNotNull, isNull, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
-import { aiNewsEvents, pushRecords } from '../db/schema.js';
-import { env, isFeishuEnabled } from '../config/env.js';
+import { aiNewsEvents, pushRecords, rawItems } from '../db/schema.js';
+import { env, isFeishuEnabled, alertMinPublishedAt } from '../config/env.js';
+import { digestEvent } from '../agents/digest/persistence.js';
+import type { SummarizeOptions } from '../agents/digest/index.js';
 import {
   collectSources,
   REALTIME_NEWS_SOURCES,
@@ -100,6 +102,11 @@ export interface RunAlertScanOptions {
   senders?: Partial<Record<Channel, MessageSender>>;
   /** 告警单例锁选项（注入 mock Redis / TTL）。 */
   lock?: AcquireAlertLockOptions;
+  /**
+   * 中文摘要打磨注入：对入选候选缺中文标题/摘要者跑 digestEvent 时的 SummarizeOptions
+   * （注入 mock generateObjectFn / maxAttempts / logError）。缺省用真实摘要 Agent；测试注入桩避免真实 LLM。
+   */
+  digest?: SummarizeOptions;
   /** 运行期日志 sink（默认 console.error）。 */
   log?: AlertLogSink;
   /**
@@ -141,7 +148,7 @@ export interface RunAlertScanResult {
   dispatched: AlertDispatchOutcome[];
 }
 
-/** 评分后达阈值告警候选的最小视图（供拼告警消息 + 渲染回退链）。 */
+/** 评分后达阈值告警候选的最小视图（供拼告警消息 + 渲染回退链 + P0 可观测）。 */
 interface AlertCandidate {
   eventId: string;
   representativeTitle: string | null;
@@ -149,6 +156,11 @@ interface AlertCandidate {
   headlineZh: string | null;
   publishedAt: Date | null;
   canonicalUrl: string | null;
+  /** 代表 raw_item 正文/来源：仅供补摘要 grounding（与日报同源），非渲染字段。 */
+  content: string | null;
+  source: string | null;
+  /** 命中阈值的 importance_score（供 P0 质量可观测抽检；numeric 列解析为 number）。 */
+  importanceScore: number | null;
 }
 
 /**
@@ -174,6 +186,9 @@ export async function selectAlertCandidates(
   now: Date = new Date(),
   windowDays: number = env.ALERT_FIRST_SEEN_WINDOW_DAYS,
   maxCandidates: number = env.ALERT_MAX_PER_SCAN,
+  // 首次启用发布时间基线水位（守 policy-push-timeliness）：非 null 时叠加候选谓词
+  // published_at >= 此基线。缺省经 alertMinPublishedAt() 从 env 解析一次（未设/空串 opt-out → null）。
+  minPublishedAt: Date | null = alertMinPublishedAt(),
 ): Promise<AlertCandidate[]> {
   const cfgChannels = channels.length > 0 ? channels : [CHANNEL.telegram];
   // Model B + 各通道可靠补发：候选 = 「尚未 alert-success 投递给**所有**已配置通道」——已 alert-success
@@ -204,8 +219,20 @@ export async function selectAlertCandidates(
       summaryZh: aiNewsEvents.summaryZh,
       headlineZh: aiNewsEvents.headlineZh,
       publishedAt: aiNewsEvents.publishedAt,
+      importanceScore: aiNewsEvents.importanceScore,
+      // canonical_url 经 representative_raw_item_id LEFT JOIN 回指 raw_items（采集期 normalizeUrl
+      // 已去 utm/ref 等追踪参数）。**LEFT JOIN（非 INNER）**：representative_raw_item_id 为 NULL 或
+      // 对应 raw_item 已被塌缩删除时，此列为 NULL 但事件仍留候选（消息无链接、不报错）——绝不因回指
+      // 失败丢候选造成漏告警（漏告警比无链接更糟）。
+      canonicalUrl: rawItems.canonicalUrl,
+      // 代表 raw_item 正文 + 来源：供入选候选补摘要时 grounding（与日报 loadRepresentativeFields
+      // 同源）。缺此则告警链生成无正文的 title-only 摘要并持久化，被日报「已摘要守卫」复用 → 降级
+      // 日报对该 P0 事件的摘要质量；同经 LEFT JOIN 取，NULL 时防幻觉护栏照旧、不报错。
+      content: rawItems.content,
+      source: rawItems.source,
     })
     .from(aiNewsEvents)
+    .leftJoin(rawItems, eq(aiNewsEvents.representativeRawItemId, rawItems.id))
     .where(
       and(
         // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
@@ -224,6 +251,11 @@ export async function selectAlertCandidates(
         // 时效闸上界（恒含，任何 windowDays 都加）：published_at <= now 拦确定性来源（RSS/GitHub）与
         // AI 的任何未来值（未来值 `>= 下界` 恒真会绕过下界闸被当重大发布告警，故上界绝不可省）。
         lte(aiNewsEvents.publishedAt, now),
+        // 首次启用发布时间基线水位（守 policy-push-timeliness）：非 null 时叠加
+        // published_at >= 基线——与时效下界同为 published_at 上的 gte，DB 自然取 max（有效下界 =
+        // max(时效下界, 基线)）。只告警启用后发布的新闻，启用前发布的存量（无论何时被评分、无论后加了
+        // 哪个通道）一律排除。谓词在 published_at、不写任何 push_records 假记录；未设（null）则不加。
+        minPublishedAt !== null ? gte(aiNewsEvents.publishedAt, minPublishedAt) : undefined,
       ),
     )
     // 单次扫描上限：优先最新发布事件（published_at DESC），超出 maxCandidates 的下轮补发。
@@ -236,7 +268,12 @@ export async function selectAlertCandidates(
     summaryZh: r.summaryZh,
     headlineZh: r.headlineZh,
     publishedAt: r.publishedAt,
-    canonicalUrl: null, // 告警渲染回退链可无链接；canonicalUrl 由调用方按需补（本期保守置 null）。
+    // numeric 列经 drizzle 返回 string；解析成 number 供 P0 可观测（NULL 已被 isNotNull 谓词排除）。
+    importanceScore: r.importanceScore !== null ? Number(r.importanceScore) : null,
+    // LEFT JOIN 回指的规范化原文链接（无回指 / raw_item 已删 → NULL，渲染无链接、不报错）。
+    canonicalUrl: r.canonicalUrl,
+    content: r.content,
+    source: r.source,
   }));
 }
 
@@ -367,6 +404,43 @@ export async function runAlertScan(
       `（窗口 ${windowDays}天，单次上限 ${maxPerScan} 条）`,
   );
 
+  // ── 中文摘要打磨：对入选候选（≤ maxPerScan，极少）中缺中文标题/摘要者，
+  // 复用日报摘要 Agent 的 digestEvent（per-event summarizeEvent + 持久化），使告警渲染 headline_zh 为中文
+  // 而非原始英文标题；持久化供该事件后进日报被「已摘要守卫」(run-daily-workflow) 复用、不重复摘要。
+  // **逐条 try/catch 隔离**：摘要生成或持久化失败仅降为 dispatcher 的 headline 回退链（headline_zh →
+  // summary_zh 截断 → representative_title → 仅标题），绝不报错或漏告警（摘要是打磨、非告警前提）。
+  // 不 emit 新 stage（保持 collect/dedup/score/select/push 五阶段序列不变）。
+  for (const candidate of candidates) {
+    if (candidate.headlineZh !== null && candidate.summaryZh !== null) continue;
+    try {
+      const outcome = await digestEvent(
+        {
+          eventId: candidate.eventId,
+          representativeTitle: candidate.representativeTitle,
+          canonicalUrl: candidate.canonicalUrl,
+          // grounding（与日报 loadRepresentativeFields 同源）：喂正文 + 来源，避免生成 title-only
+          // 摘要被日报「已摘要守卫」复用而降级日报摘要质量；缺失仍走防幻觉护栏、不报错。
+          // ponytail: 只接 raw_items.content 原始正文，高频告警链不跑 og:description enrichment（保持
+          // 精简车道）；极少的空正文 P0 若被告警链先摘要，日报复用其 title-only 摘要——比修复前全体
+          // title-only 已是净改善。upgrade: 若空正文 P0 变常见，再在此链补 enrichment。
+          content: candidate.content,
+          source: candidate.source,
+        },
+        options.digest,
+        dbh,
+      );
+      if (outcome.status === 'summarized') {
+        // 就地更新候选，使随后 dispatch 渲染取到中文 headline/summary（digestEvent 已落库持久化）。
+        candidate.headlineZh = outcome.headlineZh;
+        candidate.summaryZh = outcome.summaryZh;
+      }
+    } catch (error) {
+      // 摘要生成/持久化失败：逐条隔离、不漏告警——保持原候选，dispatch 走 headline 回退链。
+      const reason = error instanceof Error ? error.message : String(error);
+      log(`告警摘要降级[${candidate.eventId}]: ${reason}（走 headline 回退链，不漏告警）`);
+    }
+  }
+
   emit('stage.push');
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i]!;
@@ -414,6 +488,23 @@ export async function runAlertScan(
       await lock.release();
     }
   }
+
+  // ── P0 质量可观测：每次扫描完成后经 emit（RunContext seam → pino）结构化记录本次
+  // 告警计数 N、各命中 importance_score + event_id、以及通道集，供人工抽检精确/召回与噪音率。
+  // 纯确定性旁路——不 LLM 判质量、不额外推送、不改判定/不阻塞（emit 缺省 no-op；run(ctx) 注入 ctx.emit）。
+  emit('p0.observed', {
+    count: candidates.length,
+    channels: channelSenders.map((c) => c.channel),
+    hits: candidates.map((c) => ({
+      eventId: c.eventId,
+      importanceScore: c.importanceScore,
+    })),
+  });
+  log(
+    `P0 可观测: 告警 ${candidates.length} 条，命中 importance=[${candidates
+      .map((c) => c.importanceScore)
+      .join(', ')}]，通道 ${channelSenders.map((c) => c.channel).join('/')}`,
+  );
 
   return {
     pushDate,

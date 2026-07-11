@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 // 使套件在不完整 shell env 下也能干净运行（占位绝不影响 parseEnv 的入参——它收显式 source）。
 let parseEnv: typeof import('../env.js').parseEnv;
 let isFeishuEnabled: typeof import('../env.js').isFeishuEnabled;
+let alertMinPublishedAt: typeof import('../env.js').alertMinPublishedAt;
 
 beforeAll(async () => {
   process.env.DATABASE_URL ||= 'postgres://u:p@localhost:5432/test';
@@ -27,7 +28,7 @@ beforeAll(async () => {
   process.env.TELEGRAM_CHAT_ID ||= 'test-chat-id';
   // 纯净 CI 无 .env 时 import env.js 的单例校验会因缺 PRODUCT_HUNT_TOKEN throw、整套件 import 期崩溃假绿（FIX-C，比照 product-hunt.test.ts）。
   process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
-  ({ parseEnv, isFeishuEnabled } = await import('../env.js'));
+  ({ parseEnv, isFeishuEnabled, alertMinPublishedAt } = await import('../env.js'));
 });
 
 /** 一份能通过校验的最小合法 env。各用例在其上做删除/改写。 */
@@ -654,5 +655,77 @@ describe('parseEnv —— 按源陈旧度告警配置（add-per-source-staleness
       SOURCE_STALENESS_ALERT_DAYS_OVERRIDES: '',
     } as NodeJS.ProcessEnv);
     expect(env.SOURCE_STALENESS_ALERT_DAYS_OVERRIDES.size).toBe(0);
+  });
+});
+
+describe('parseEnv —— 首次启用发布时间基线水位 fail-fast（add-high-freq-p0-push，任务 6.4）', () => {
+  // 跨字段不变量：ALERT_SCAN_ENABLED='true' 但 ALERT_MIN_PUBLISHED_AT **未设**（既非 ISO 亦非显式空串
+  // opt-out）→ superRefine fail-fast，防「启用却忘设基线 → 存量 P0 刷屏」（守 policy-push-timeliness）。
+  // 三态可分：未设(undefined) / 显式空串('') opt-out / 合法 ISO；非法 ISO 由 .datetime() 拒。
+
+  it('启用告警 + 基线未设 → 抛错（superRefine 跨字段 fail-fast，报错含字段名）', () => {
+    const source = { ...validEnv(), ALERT_SCAN_ENABLED: 'true' } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/ALERT_MIN_PUBLISHED_AT/);
+  });
+
+  it('启用告警 + 合法 ISO 基线 → 通过', () => {
+    const source = {
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: '2026-07-11T00:00:00.000Z',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.ALERT_SCAN_ENABLED).toBe('true');
+    expect(env.ALERT_MIN_PUBLISHED_AT).toBe('2026-07-11T00:00:00.000Z');
+  });
+
+  it('启用告警 + 显式空串基线 → 通过（明示放弃基线 opt-out，与 undefined 三态可分）', () => {
+    const source = {
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: '',
+    } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.ALERT_MIN_PUBLISHED_AT).toBe(''); // 空串（opt-out），非 undefined。
+  });
+
+  it('启用告警 + 非法 ISO 基线（"not-a-date"）→ 抛错（.datetime() 校验，不静默匹配空）', () => {
+    const source = {
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: 'not-a-date',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('禁用告警 + 基线未设 → 通过（默认关部署照常启动，不触发 fail-fast）', () => {
+    const source = { ...validEnv(), ALERT_SCAN_ENABLED: 'false' } as NodeJS.ProcessEnv;
+    const env = parseEnv(source);
+    expect(env.ALERT_SCAN_ENABLED).toBe('false');
+    expect(env.ALERT_MIN_PUBLISHED_AT).toBeUndefined();
+  });
+
+  // alertMinPublishedAt() 三态合并（env 三态 → 查询谓词的 Date|null 水位）：未设/空串 opt-out 都无水位，
+  // 仅合法 ISO 出 Date——这是「三态 env」与「候选查询 published_at>=基线 谓词」之间的接缝，集成测用
+  // 显式 Date/null 绕过它，故此处直测合并逻辑。
+  it('alertMinPublishedAt：ISO → Date，未设/空串 opt-out → null', () => {
+    const iso = '2026-07-11T00:00:00.000Z';
+    const withIso = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: iso,
+    } as NodeJS.ProcessEnv);
+    expect(alertMinPublishedAt(withIso)).toEqual(new Date(iso));
+
+    const optOut = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: '',
+    } as NodeJS.ProcessEnv);
+    expect(alertMinPublishedAt(optOut)).toBeNull(); // 显式空串 opt-out → 无水位。
+
+    const unset = parseEnv({ ...validEnv(), ALERT_SCAN_ENABLED: 'false' } as NodeJS.ProcessEnv);
+    expect(alertMinPublishedAt(unset)).toBeNull(); // undefined（未设）→ 无水位。
   });
 });

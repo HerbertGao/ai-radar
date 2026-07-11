@@ -375,13 +375,14 @@ const envSchema = z.object({
   // 默认 85，严于日报候选 should_push 的 importance>=75 与 Top N 下限闸>=60（实时门槛更高防刷屏）。
   // 判定纯程序阈值，禁止 LLM 决定是否告警。
   ALERT_IMPORTANCE_THRESHOLD: z.coerce.number().min(0).max(100).default(85),
-  // 实时告警高频轮询 cron（BullMQ repeat.pattern）。默认每 20 分钟（保守，靠真实数据调，design 待解决问题）。
+  // 实时告警高频轮询 cron（BullMQ repeat.pattern）。默认每 15 分钟（落 base spec「15–30 分钟」保守窗口内、
+  // 对稀有 P0 已足够即时；仍 env 可配，靠真实数据调）。
   // 高频链路全源 0/空轮是常态、不告警；只采实时新闻源 {rss,hacker_news,github}，不碰 arXiv/PH。
-  ALERT_SCAN_CRON: z.string().min(1).default('*/20 * * * *'),
+  ALERT_SCAN_CRON: z.string().min(1).default('*/15 * * * *'),
   ALERT_SCAN_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   ALERT_SCAN_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
-  // 告警单例锁 `alert:{channel}:{event_id}` TTL（毫秒）：job 级短时持有，覆盖「单事件渲染+单通道送达」
-  // 最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
+  // 告警单例锁 `alert:{event_id}`（per-event，覆盖该事件向所有通道的分发）TTL（毫秒）：job 级短时持有，
+  // 覆盖「单事件渲染 + 多通道送达」最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
   ALERT_LOCK_TTL_MS: z.coerce.number().int().positive().default(60000),
   // 告警候选时间窗口（天数）：仅对近 N 天内的事件发告警（防冷启动积压刷屏）。
   // **语义已变更**（fix-push-recency-by-published-at D1/D5）：天数复用、变量名保留（保配置兼容），
@@ -390,8 +391,17 @@ const envSchema = z.object({
   // 与未来 published_at（见 alert-scan.ts 顶部注释与 design D1）。
   ALERT_FIRST_SEEN_WINDOW_DAYS: z.coerce.number().int().nonnegative().default(3),
   // 单次 alert-scan 最多发送的告警条数（防 Telegram rate limit 刷屏）。
-  // 默认 5；超出的候选按 first_seen_at DESC 保留最新，其余待下轮（20min 后）补发。
+  // 默认 5；超出的候选按 published_at DESC 保留最新，其余待下轮（15min 后）补发。
   ALERT_MAX_PER_SCAN: z.coerce.number().int().positive().default(5),
+  // 首次启用发布时间基线水位（守 policy-push-timeliness）：
+  // 启用瞬间防旧消息刷屏——告警候选须额外满足 `published_at >= 此基线`（与时效下界取 max），只告警基线之后
+  // 发布的新闻，启用前发布的存量（无论何时被评分、无论后加了哪个通道）一律排除（谓词见 selectAlertCandidates）。
+  // Zod 校验为**合法 ISO 时刻或显式空串**；**必须 .optional()、不给 .default('')**，使「未设(undefined)
+  // vs 显式空串('') vs ISO」三态可分（仿 Feishu .optional()+superRefine 先例）——
+  // 未设 + ALERT_SCAN_ENABLED='true' → superRefine fail-fast（防启用却忘设基线刷屏）；
+  // 空串 = 运维明示放弃基线、自担刷屏风险；ISO = 水位。非法 ISO 启动即报错（不静默匹配空/静默压制全部）。
+  // 经 alertMinPublishedAt() 解析成 Date 一次，绝不在查询站点逐次解析。
+  ALERT_MIN_PUBLISHED_AT: z.string().datetime().or(z.literal('')).optional(),
 
   // --- 按源采集陈旧度告警（add-per-source-staleness-alert，design D3）---
   // 全局默认陈旧阈值天数：某已注册源连续超过此天数零新增（max(fetched_at) 早于 now-此天数，
@@ -556,6 +566,24 @@ const envSchema = z.object({
       });
     }
   })
+  // 首次启用防旧消息刷屏跨字段不变量（add-high-freq-p0-push，design D6，守 policy-push-timeliness）：
+  // ALERT_SCAN_ENABLED='true' 但 ALERT_MIN_PUBLISHED_AT **未设置**（undefined——既非 ISO 亦非显式空串 opt-out）
+  // → 启动即 fail-fast、拒绝注册告警链。把首次启用防刷屏守卫从「部署次序文档」升级为「代码强制」，
+  // 防「启用却忘设基线 → 存量 P0 刷屏」这一 policy-push-timeliness 事故；运维须显式二选一。
+  // 注：显式空串('') 是合法的「放弃基线」opt-out、不触发本闸（与 undefined 三态可分，见字段定义）。
+  .superRefine((data, ctx) => {
+    if (data.ALERT_SCAN_ENABLED === 'true' && data.ALERT_MIN_PUBLISHED_AT === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ALERT_MIN_PUBLISHED_AT'],
+        message:
+          `实时告警已启用（ALERT_SCAN_ENABLED='true'）但未设置发布时间基线水位 ALERT_MIN_PUBLISHED_AT。` +
+          `启用瞬间会把 published_at 近 N 天内、达阈值、从未告警的存量事件当作 P0 批量推送（刷屏，违反 policy-push-timeliness）。` +
+          `请显式二选一：① 将 ALERT_MIN_PUBLISHED_AT 设为启用时刻的 ISO 时刻（如 new Date().toISOString()），只告警启用后发布的新闻；` +
+          `② 设为显式空串('')明示放弃基线、自担旧消息刷屏风险。`,
+      });
+    }
+  })
   // 并发评分原子 claim 回收阈值不变量（realtime-alerts / daily-intel-pipeline「降级逐条容错」）：
   // 回收阈值 T 必须 **严格 > L + W**（L=LLM_TIMEOUT_MS 单条 LLM 硬超时，W=JUDGE_WRITE_BUDGET_MS
   // 写分提交延迟上界）。否则正在合法评分/写分（总时长 < L+W）的事件可能被另一链路误回收 → 双评分覆写。
@@ -638,6 +666,18 @@ export function isWeeklyReportEnabled(e: Env = env): boolean {
 
 export function isAlertScanEnabled(e: Env = env): boolean {
   return e.ALERT_SCAN_ENABLED === 'true';
+}
+
+/**
+ * 首次启用发布时间基线水位（守 policy-push-timeliness）：
+ * 把已校验的 ALERT_MIN_PUBLISHED_AT 解析成 Date 一次，供告警候选查询加 `published_at >= 基线` 谓词。
+ * 未设（undefined——仅当 ALERT_SCAN_ENABLED!='true'，否则 superRefine 已 fail-fast）或显式空串('')opt-out → null（无水位、不加谓词）；
+ * ISO 时刻 → new Date(iso)。**在此解析一次**，调用方绝不在查询站点逐次 new Date。
+ *
+ * @param e 已校验 env（默认全局 env；测试可注入局部 env）。
+ */
+export function alertMinPublishedAt(e: Env = env): Date | null {
+  return e.ALERT_MIN_PUBLISHED_AT ? new Date(e.ALERT_MIN_PUBLISHED_AT) : null;
 }
 
 /** Model Radar 5b 各调度链是否启用（默认禁用；worker-main 据此决定是否注册对应 BullMQ 链）。 */
