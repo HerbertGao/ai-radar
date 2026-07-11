@@ -65,7 +65,7 @@ function makeConsoleLogger(): Logger {
 
 /**
  * 本地 driver 上的 RunContext 装配器。
- * - emit(kind, payload) → 落一条结构化日志记录 { event: kind, ...payload }。
+ * - emit(kind, payload) → 落一条结构化日志记录 { ...payload, event: kind }（event 后置防覆盖）。
  * - propose({ tool, args }) → 查 handlers[tool] 直执行、emit action.executed、resolve 结果；
  *   无 handler 抛清晰错误（misconfig 时炸响，A0 仅单测桩会走到）。
  */
@@ -74,7 +74,8 @@ export function makeLocalCtx(opts: MakeLocalCtxOptions = {}): RunContext {
   const handlers = opts.handlers ?? {};
 
   const emit = (kind: string, payload?: object): void => {
-    logger.info({ event: kind, ...(payload ?? {}) }, kind);
+    // payload 先展开、event 后置：确保 payload 里若混入 event 键也不会盖掉生命周期事件名。
+    logger.info({ ...(payload ?? {}), event: kind }, kind);
   };
 
   const ctx: RunContext = {
