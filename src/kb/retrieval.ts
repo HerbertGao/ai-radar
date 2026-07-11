@@ -23,53 +23,33 @@
  * `{query, results:[{docId, kbTitle, cosineSim, entities}], scoreStats, returned}`——**只逐查、不含语料级 COUNT**
  * （保原语=单条 KNN；语料级覆盖计数由测量 CLI search-cli.ts 每次运行算一次）。纯旁路、不改返回、不写库。
  */
-import { sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
-import { aiNewsEvents, kbDocuments } from '../db/schema.js';
 import { env } from '../config/env.js';
 import { embedTexts, type EmbedTextsOptions } from '../dedup/embedding.js';
+import { searchKbCore, type KbSearchResult } from './retrieval-core.js';
+
+// KB 检索结果类型定义现落在 env-clean 核心（retrieval-core.ts）；此处 re-export 保 A2 消费方 import 路径不变。
+export type { KbSearchResult };
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
 
-/** top-k 归一化上限：防超大 topK 触发巨量 seq-scan 输出（D3）。 */
-const TOP_K_MAX = 50;
-
-/** 一条带分检索结果（id 为字符串，保 JSON 序列化安全）。 */
-export interface KbSearchResult {
-  /** kb_documents.id（bigint → 字符串，防 JSON 崩，仿 store.ts:193）。 */
-  id: string;
-  kbTitle: string | null;
-  summaryZh: string | null;
-  /** jsonb（结构不定），原样返回。 */
-  entities: unknown;
-  /** jsonb（结构不定），原样返回。 */
-  sourceUrls: unknown;
-  /** date 列，drizzle 返回 YYYY-MM-DD 字符串。 */
-  eventDate: string | null;
-  longTermValue: number | null;
-  /** 余弦相似度 `1 - (embedding <=> $q)`。 */
-  cosineSim: number;
-}
-
 /** searchKb 可注入选项：透传给 embedTexts（embedManyFn / maxAttempts / logError）+ topK。 */
 export interface SearchKbOptions extends EmbedTextsOptions {
-  /** top-k（缺省 env.KB_SEARCH_TOP_K；原语内归一化到 [1,50] 整数）。 */
+  /** top-k（缺省 env.KB_SEARCH_TOP_K；核内归一化到 [1,50] 整数）。 */
   topK?: number;
 }
 
 /**
- * 把查询向量序列化为 pgvector 字面量字符串 `[v1,v2,...]`（作参数化占位符绑定、`::vector` 转型）。
- * 与 semantic-search.ts / schema.ts vector customType toDriver 同口径。非有限值让 DB 报错优于静默替换。
- */
-function toPgVectorLiteral(vector: readonly number[]): string {
-  return `[${vector.join(',')}]`;
-}
-
-/**
- * 知识库事件域语义检索（只读、确定性）。
+ * 知识库事件域语义检索（只读、确定性）——**薄封装**，委托 env-clean 核心 `searchKbCore`。
  *
- * @param query   查询串（纯空白经 trim 判定为空 → 短路返回 []，不调 embed）。
+ * 本入口保留三条 env-dirty 值 import（`db/index` / `config/env` / `dedup/embedding`），供 worker 环境
+ * （CLI `kb:search` / 集成测，已有全局 env）使用；MCP 纯查询进程改走 `retrieval-core.ts` env-clean 核心。
+ * 职责=把 `db` / `env.KB_SEARCH_TOP_K` / `embedTexts`（含注入桩）作实参喂给核心：
+ * - 非有限 `topK`（NaN/Infinity/未传）经 `Number.isFinite` 回落 `env.KB_SEARCH_TOP_K`；核内再二次归一化到 [1,50]。
+ * - `embed` 闭包委托 `embedTexts(texts, options)`（复用 `env.EMBEDDING_MODEL`，守 D7 同模型 cosine 可比）。
+ *
+ * @param query   查询串（纯空白经 trim 判定为空 → 核内短路返回 []，不调 embed）。
  * @param options topK / embedTexts 透传选项（embedManyFn 注入桩、logError）。
  * @param dbh     可注入 db 或事务句柄（默认全局 db）。
  */
@@ -78,103 +58,16 @@ export async function searchKb(
   options: SearchKbOptions = {},
   dbh: DbLike = defaultDb,
 ): Promise<KbSearchResult[]> {
-  const logError =
-    options.logError ??
-    ((message: string, detail: unknown) =>
-      console.error(`[kb-retrieval] ${message}`, detail));
-
-  // 空/纯空白查询短路：不发起 embedding（embedTexts 只挡空数组、不挡纯空白，纯空白会嵌成退化向量）。
-  if (query.trim().length === 0) return [];
-
-  // top-k 双向归一化到 [1,50] 整数（原语内，非仅 CLI 层——防直调绕过 Zod 产生非法 LIMIT）。
-  // 非有限 topK（NaN/Infinity/null）经 Number.isFinite 兜底回落 env 默认：否则 Math.trunc(NaN)=NaN，
-  // drizzle 见非 `>=0` 数会省略 LIMIT 子句 → 静默无界全表扫描（此守卫勿删）。
+  // 入口层 env 兜底：非有限 topK 回落 env 默认（核内对有限值再归一化到 [1,50]）。
   const requestedTopK = Number.isFinite(options.topK)
     ? (options.topK as number)
     : env.KB_SEARCH_TOP_K;
-  const topK = Math.max(1, Math.min(Math.trunc(requestedTopK), TOP_K_MAX));
-  if (topK !== requestedTopK) {
-    logError('topK 越界，已归一化到 [1,50] 整数', {
-      requested: requestedTopK,
-      normalized: topK,
-    });
-  }
 
-  // 查询向量化（复用 env.EMBEDDING_MODEL，守 D7 同模型 cosine 可比不变量）。
-  const [queryVec] = await embedTexts([query], options);
-  if (!queryVec || queryVec.length === 0) return [];
-
-  const queryLiteral = toPgVectorLiteral(queryVec);
-  // 余弦距离 distance = embedding <=> $q::vector；queryLiteral 作占位符绑定（参数化，禁字符串拼 SQL）。
-  const distanceExpr = sql<number>`(${kbDocuments.embedding} <=> ${queryLiteral}::vector)`;
-
-  // D8 谓词：事件域 + 有 embedding + tombstone 事件域只读反连接排除；取序 `<=> $q, id`（id 消并列任意序）。
-  const rows = await dbh
-    .select({
-      id: kbDocuments.id,
-      kbTitle: kbDocuments.kbTitle,
-      summaryZh: kbDocuments.summaryZh,
-      entities: kbDocuments.entities,
-      sourceUrls: kbDocuments.sourceUrls,
-      eventDate: kbDocuments.eventDate,
-      longTermValue: kbDocuments.longTermValue,
-      cosineSim: sql<number>`1 - ${distanceExpr}`,
-    })
-    .from(kbDocuments)
-    .where(
-      sql`${kbDocuments.targetType} = 'event'
-        AND ${kbDocuments.embedding} IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM ${aiNewsEvents} e
-          WHERE e.event_id = ${kbDocuments.targetId}
-            AND e.merged_into IS NOT NULL
-        )`,
-    )
-    .orderBy(distanceExpr, kbDocuments.id)
-    .limit(topK);
-
-  const results: KbSearchResult[] = rows.map((r) => ({
-    id: String(r.id), // bigint → string（防 JSON.stringify 崩，仿 store.ts:193）。
-    kbTitle: r.kbTitle,
-    summaryZh: r.summaryZh,
-    entities: r.entities,
-    sourceUrls: r.sourceUrls,
-    eventDate: r.eventDate,
-    longTermValue: r.longTermValue,
-    cosineSim: Number(r.cosineSim),
-  }));
-
-  logRetrievalObservability(query, results, logError);
-  return results;
-}
-
-/**
- * 多跳缺口可观测（D5）：结构化 stderr 逐查记录——只逐查免费字段，不含语料级 COUNT（保原语=单条 KNN）。
- * 纯旁路观测（非 LLM 判质量、不改返回、不写库）。
- */
-function logRetrievalObservability(
-  query: string,
-  results: readonly KbSearchResult[],
-  logError: (message: string, detail: unknown) => void,
-): void {
-  const sims = results.map((r) => r.cosineSim);
-  const scoreStats =
-    sims.length > 0
-      ? {
-          max: Math.max(...sims),
-          min: Math.min(...sims),
-          mean: sims.reduce((a, b) => a + b, 0) / sims.length,
-        }
-      : { max: null, min: null, mean: null };
-  logError('检索可观测记录', {
+  return searchKbCore({
     query,
-    results: results.map((r) => ({
-      docId: r.id,
-      kbTitle: r.kbTitle,
-      cosineSim: r.cosineSim,
-      entities: r.entities,
-    })),
-    scoreStats,
-    returned: results.length,
+    topK: requestedTopK,
+    dbh,
+    embed: (texts) => embedTexts(texts, options),
+    ...(options.logError ? { logError: options.logError } : {}),
   });
 }

@@ -32,6 +32,15 @@ const mcpEnvSchema = z.object({
   // Model Radar 快照陈旧阈值天数（与 `src/config/env.ts` 同口径/同默认，**不硬编码裸常量**、防 stale 口径漂移）：
   // recommend_coding_subscription handler 现 build 快照时显式喂给 env-clean 的 build.ts（design D5）。
   MR_STALENESS_THRESHOLD_DAYS: z.coerce.number().int().positive().default(30),
+  // search_kb（add-conversational-rag D7）需 embedding 凭据（查询向量化）。守「纯查询只需 DATABASE_URL」不变量：
+  // 三者一律**可选**（不设 default——不在 MCP 侧硬编码 OpenRouter URL / 模型名裸常量，防与 config/env 口径漂移）。
+  // 「三凭据齐 → search_kb 检索证据；缺任一 → 该工具 fail-closed（toIsError）」，其余工具 + 整个 server 照常。
+  LLM_API_KEY: z.string().min(1).optional(),
+  LLM_BASE_URL: z
+    .string()
+    .url('LLM_BASE_URL 必须是合法 URL（OpenAI 兼容端点，如 https://openrouter.ai/api/v1）')
+    .optional(),
+  EMBEDDING_MODEL: z.string().min(1).optional(),
 });
 
 /** MCP 宽松 env 类型。 */

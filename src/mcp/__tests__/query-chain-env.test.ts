@@ -31,18 +31,25 @@ const repoRoot = resolve(here, '../../..');
 const toolsIndex = resolve(repoRoot, 'src/mcp/tools/index.ts');
 const snapshotBuild = resolve(repoRoot, 'src/mr/snapshot/build.ts');
 const mcpDb = resolve(repoRoot, 'src/mcp/db.ts');
+// add-conversational-rag 组 A：env-clean 检索核心 + embed 变体 + search_kb 工具（handler-execution 守护）。
+const retrievalCore = resolve(repoRoot, 'src/kb/retrieval-core.ts');
+const embedClean = resolve(repoRoot, 'src/kb/embed-clean.ts');
+const mcpEnv = resolve(repoRoot, 'src/mcp/env.ts');
+const mcpContext = resolve(repoRoot, 'src/mcp/context.ts');
+const searchKbTool = resolve(repoRoot, 'src/mcp/tools/search-kb.ts');
 
 const databaseUrl = process.env.DATABASE_URL;
 
 describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
-  it('allTools 注册 8 工具', async () => {
+  it('allTools 注册 9 工具', async () => {
     // 进程内、DB 无关：本测试进程有完整 env，import tools/index.ts 不剥离 env，纯查 allTools 注册数。
+    // 8→9：add-conversational-rag 组 A 注册 search_kb（handler 内动态 import env-clean 检索核心 + embed 变体）。
     const { allTools } = await import('../tools/index.js');
     expect(Array.isArray(allTools)).toBe(true);
-    expect(allTools.length).toBe(8);
+    expect(allTools.length).toBe(9);
   });
 
-  it('静态兜底：8 个 tool 文件顶层 import 区不 static import 推送链/快照构建/全局 env', async () => {
+  it('静态兜底：9 个 tool 文件顶层 import 区不 static import 推送链/快照构建/全局 env', async () => {
     const files = [
       'get-today.ts',
       'search-events.ts',
@@ -52,6 +59,7 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
       'mark-product.ts',
       'push-event-now.ts',
       'recommend-coding.ts', // 组 C 已建：纳入顶层 import 纪律校验。
+      'search-kb.ts', // add-conversational-rag 组 A：handler 内动态 import env-clean 检索核心 + embed 变体、顶层不触全局 env。
     ];
     // 禁止出现在「顶层 import 语句」里的 specifier（push_event_now / recommend_coding 经 await import 动态加载、不算）。
     const forbidden = [
@@ -101,6 +109,29 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
       buildImportStatements.some((s) => s.includes('../../config/env.js')),
       'build.ts 顶层不得 import config/env.js',
     ).toBe(false);
+
+    // add-conversational-rag 组 A（D7）：env-clean 检索核心 + env-clean embed 变体的前向脆弱性守卫。
+    // 二者被 search-kb.ts 在 handler 内动态 import；embed 变体运行期更被注入桩替换、**不经实跑**——
+    // 其「无 top-level eager-env import」的清洁性**唯一被证的路径**就是这里的静态 grep（相对路径随文件位置改、须对）。
+    // 注意：kb 文件在 src/kb/ → 相对 specifier 前缀是 `../`（一级），非 tool 文件的 `../../`。
+    for (const kbFile of [retrievalCore, embedClean]) {
+      const kbSrc = await readFile(kbFile, 'utf8');
+      const kbImportStatements = kbSrc.match(/^import\b[\s\S]*?from\s+['"][^'"]+['"]/gm) ?? [];
+      // config/env.js 顶层完全不得 import（值或类型均不需要——凭据/topK 由参数注入）。
+      expect(
+        kbImportStatements.some((s) => s.includes('../config/env.js')),
+        `${kbFile}: 顶层不得 import config/env.js（env-clean）`,
+      ).toBe(false);
+      // db/index.js / dedup/embedding.js 若出现须 `import type`（运行期擦除、不触全局 parseEnv）。
+      for (const spec of ['../db/index.js', '../dedup/embedding.js']) {
+        for (const stmt of kbImportStatements.filter((s) => s.includes(spec))) {
+          expect(
+            stmt.trimStart().startsWith('import type'),
+            `${kbFile}: ${spec} 须 import type：${stmt.replace(/\s+/g, ' ').trim()}`,
+          ).toBe(true);
+        }
+      }
+    }
   });
 });
 
@@ -116,7 +147,7 @@ describe.skipIf(!databaseUrl)('查询链仅 DATABASE_URL 可加载（N2 / 子进
     };
 
     const script = `import(${JSON.stringify(toolsIndex)}).then((m) => {
-      if (!Array.isArray(m.allTools) || m.allTools.length !== 8) {
+      if (!Array.isArray(m.allTools) || m.allTools.length !== 9) {
         console.error('allTools 数量异常: ' + (m.allTools && m.allTools.length));
         process.exit(2);
       }
@@ -179,5 +210,92 @@ describe.skipIf(!databaseUrl)('查询链仅 DATABASE_URL 可加载（N2 / 子进
     expect(stderr).not.toContain('BAD_SNAPSHOT');
     // 子进程 `npx tsx` 冷启动 + import + 实跑可 >5s（子进程自身 60s 预算），it 默认 5s 超时过紧。
     // 外层 it 给 70s：比子进程 60s 预算多 10s 冗余，容 spawn/IPC/teardown 开销（否则子进程用满 60s 即误红）。
+  }, 70_000);
+
+  // add-conversational-rag 组 A（design D7 / spec search_kb / task 4.4 · 6.3）：search_kb 的 handler-execution
+  // 守护——裁剪 env 实跑（非仅装载工具清单）。装载期测只 import tools/index.ts（注册 handler、不执行），
+  // 抓不到 handler 运行期 `await import` env-clean 检索核心 / embed 变体时的 parseEnv 崩溃，故须实跑。
+  it('剪裁 env（仅 DATABASE_URL）实跑 env-clean 检索核心：过动态 import 边界不触 parseEnv、返回证据（注入 embed 桩不触网）', async () => {
+    // happy-path：动态 import env-clean 检索核心（search_kb handler 运行期做的事）+ 经 mcp/db.ts 建仅-DATABASE_URL
+    // 连接 + 调 searchKbCore。**注入 env-clean embed 桩**（返回定长非零假向量、不触网、守「测试不触网」不变量）——
+    // 检索证据路径不可约要一次 embedding 调用，不能像 build.ts 先例那样纯 DB 实跑。
+    // 若核心未 env-clean（仍值 import db/index / config/env / dedup/embedding），`await import` 即触 parseEnv → 抛 → exit 1 → 红。
+    const prunedEnv: NodeJS.ProcessEnv = {
+      DATABASE_URL: databaseUrl,
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+    };
+
+    const script = `(async () => {
+      const core = await import(${JSON.stringify(retrievalCore)});
+      const dbMod = await import(${JSON.stringify(mcpDb)});
+      const db = dbMod.getMcpDb(process.env.DATABASE_URL);
+      // env-clean embed 桩：[1,0,...,0] 单位向量（非零，cosine 有定义）；绝不触网。
+      const embed = async (texts) => texts.map(() => { const v = new Array(1536).fill(0); v[0] = 1; return v; });
+      const results = await core.searchKbCore({ query: 'env-clean 冒烟', topK: 3, dbh: db, embed });
+      await dbMod.closeMcpDb();
+      if (!Array.isArray(results)) {
+        console.error('BAD_RESULTS');
+        process.exit(2);
+      }
+      process.exit(0);
+    })().catch((e) => {
+      console.error('CORE_THREW: ' + (e && e.message ? e.message : String(e)));
+      process.exit(1);
+    });`;
+
+    const { stderr } = await execFileAsync('npx', ['tsx', '-e', script], {
+      cwd: repoRoot,
+      env: prunedEnv,
+      timeout: 60_000,
+    });
+    expect(stderr).not.toContain('CORE_THREW');
+    expect(stderr).not.toContain('BAD_RESULTS');
+  }, 70_000);
+
+  it('剪裁 env（仅 DATABASE_URL、无 LLM 凭据）实跑 search_kb handler：缺凭据单 fail-closed、其余 9 工具 + server 仍起', async () => {
+    // fail-closed：裁剪 env（无 LLM_API_KEY）下实跑 search_kb handler——handler 先动态 import env-clean 核心 + embed 变体
+    // （证明缺凭据分支也过动态 import 边界不触 parseEnv 崩），再判凭据 → 返回**单** isError（不 throw、不崩 server）；
+    // 且 allTools 仍 9（server 可注册全部工具）。
+    const prunedEnv: NodeJS.ProcessEnv = {
+      DATABASE_URL: databaseUrl,
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+    };
+
+    const script = `(async () => {
+      const envMod = await import(${JSON.stringify(mcpEnv)});
+      const dbMod = await import(${JSON.stringify(mcpDb)});
+      const ctxMod = await import(${JSON.stringify(mcpContext)});
+      const toolMod = await import(${JSON.stringify(searchKbTool)});
+      const idxMod = await import(${JSON.stringify(toolsIndex)});
+      const parsed = envMod.parseMcpEnv(process.env);
+      if (!parsed.ok) { console.error('ENV_PARSE_FAILED: ' + parsed.message); process.exit(3); }
+      if (parsed.env.LLM_API_KEY) { console.error('UNEXPECTED_LLM_KEY'); process.exit(5); }
+      const db = dbMod.getMcpDb(process.env.DATABASE_URL);
+      ctxMod.setContext({ env: parsed.env, db });
+      const res = await toolMod.searchKbTool.handler({ query: 'x', topK: 5 }, {});
+      await dbMod.closeMcpDb();
+      if (!res || res.isError !== true) { console.error('NOT_FAILCLOSED'); process.exit(2); }
+      if (!Array.isArray(idxMod.allTools) || idxMod.allTools.length !== 9) {
+        console.error('BAD_TOOLCOUNT: ' + (idxMod.allTools && idxMod.allTools.length));
+        process.exit(4);
+      }
+      process.exit(0);
+    })().catch((e) => {
+      console.error('HANDLER_THREW: ' + (e && e.message ? e.message : String(e)));
+      process.exit(1);
+    });`;
+
+    const { stderr } = await execFileAsync('npx', ['tsx', '-e', script], {
+      cwd: repoRoot,
+      env: prunedEnv,
+      timeout: 60_000,
+    });
+    expect(stderr).not.toContain('HANDLER_THREW');
+    expect(stderr).not.toContain('ENV_PARSE_FAILED');
+    expect(stderr).not.toContain('UNEXPECTED_LLM_KEY');
+    expect(stderr).not.toContain('NOT_FAILCLOSED');
+    expect(stderr).not.toContain('BAD_TOOLCOUNT');
   }, 70_000);
 });

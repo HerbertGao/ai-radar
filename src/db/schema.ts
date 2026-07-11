@@ -26,6 +26,7 @@ import {
   boolean,
   customType,
   date,
+  index,
   integer,
   jsonb,
   numeric,
@@ -826,4 +827,56 @@ export const mrCatalogVersion = pgTable(
       .defaultNow(),
   },
   (table) => [unique('mr_catalog_version_version_key').on(table.version)],
+);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * 对话 RAG 会话存档（add-conversational-rag / Plan A A3，design D4）—— A3 **自有状态**表。
+ *
+ * 边界（design D3）：A3 对 DOMAIN（kb_documents / ai_news_events / mr_* 各表 / ai_products）只 SELECT，
+ * 只读写本表。**指针式**：`hit_kb_ids` 存命中的 kb_id 数组（引用），**绝不存 KB 正文拷贝**。
+ *
+ * 幂等/唯一由 DB 约束（守 CLAUDE.md「唯一约束绝不交 LLM」）：
+ * - `UNIQUE(user_id, conversation_id, turn)` —— 并发同 turn 冲突不产生重复行；服务端派生 turn、
+ *   冲突后重试 turn+1（store 层，见 conversation-store.ts），不静默丢轮次。
+ * - `INDEX(user_id, conversation_id)` —— 历史读回按 (user_id, conversation_id) ORDER BY turn。
+ *
+ * 多用户 seam（design D4，未来）：`user_id` NOT NULL DEFAULT 'local'（本期恒 'local'），store/retrieval
+ * 读写今就带 `WHERE user_id = $ctx` 隔离谓词——多用户为改**值**（绑已验证 CF Access JWT claim）非改代码
+ * 路径，绝不取客户端传值（否则 IDOR）。`conversation_id` 服务端生成（crypto.randomUUID）、`turn` 服务端派生。
+ *
+ * 保留期（design D4，显式决策）：raw_query/answer 明文存、本期无 TTL；预留 created_at 供未来 cron 清理。
+ */
+export const ragConversations = pgTable(
+  'rag_conversations',
+  {
+    id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+    // 多用户 seam：本期恒 'local'；未来绑已验证 CF Access JWT claim（design D4）。
+    userId: varchar('user_id', { length: 128 }).notNull().default('local'),
+    // 服务端生成（crypto.randomUUID），不信客户端。
+    conversationId: varchar('conversation_id', { length: 128 }).notNull(),
+    // 服务端派生（现有最大 turn + 1），不信客户端；UNIQUE 组件。
+    turn: integer('turn').notNull(),
+    rawQuery: text('raw_query'),
+    rewrittenQuery: text('rewritten_query'),
+    // 指针式：命中的 kb_id 数组引用，绝不存 KB 正文拷贝（design D4）。
+    hitKbIds: jsonb('hit_kb_ids').$type<string[]>(),
+    answer: text('answer'),
+    // '有据' / '无据'（handler 证据轴）。
+    evidence: varchar('evidence', { length: 16 }),
+    model: varchar('model', { length: 128 }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    // 幂等/唯一由 DB 约束：并发同 turn 第二次冲突、不产生重复行（design D4）。
+    unique('rag_conversations_user_id_conversation_id_turn_key').on(
+      table.userId,
+      table.conversationId,
+      table.turn,
+    ),
+    // 历史读回：WHERE (user_id, conversation_id) ORDER BY turn。
+    index('rag_conversations_user_id_conversation_id_idx').on(
+      table.userId,
+      table.conversationId,
+    ),
+  ],
 );

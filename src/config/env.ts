@@ -456,6 +456,32 @@ const envSchema = z.object({
   // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量）。
   KB_SEARCH_TOP_K: z.coerce.number().int().positive().default(8),
 
+  // --- 对话 RAG 证据阈值（add-conversational-rag，design D5①）---
+  // handler 在作答前判「无据」的最低余弦相似度下界：`searchKb` 返回 top-k **无相似度下界**（retrieval 无 floor），
+  // 故「低相似→无据」须在 **handler 层**（非 searchKb）加此阈值——本轮 top-k 命中最高 cosine < 此值、或 KB 无命中、
+  // 或空查询 → `answer=null`/`evidence='无据'`，不发起作答、不杜撰；且它同时是 citations-eligible 集的过滤线
+  // （LLM 只能引「命中集 ∩ ≥阈值」，见 design D5②）。范围 [0,1]；越界/NaN 启动即报错。
+  // ponytail: 保守缺省 0.3（能滤明显不相关命中的地板值），实现期按 A2 `kb:search` 实测分布校（design Open Questions）。
+  RAG_MIN_COSINE: z.coerce.number().min(0).max(1).default(0.3),
+
+  // --- 对话 RAG 公开 Web 出口最小成本/输入下限（add-conversational-rag，design D11 / spec「公开 Web 出口多层防护与最小下限」）---
+  // `/advisor` query 长度上限（信任边界输入校验）：超此字符数直接拒绝（防上下文塞爆 + 压缩注入 payload 空间）。
+  // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量）。ponytail: 4000 够正常追问、远小于模型上下文。
+  RAG_MAX_QUERY_CHARS: z.coerce.number().int().positive().default(4000),
+  // 全局每日 LLM 调用上限（公开端点安全地板）：Redis `INCR rag:llmcalls:<UTC-date>` 计数，达此值当日 fail-closed
+  // 停止作答（越限或 Redis 不可用均拒绝、绝不 fail-open）。**非** per-user 专业成本模型（那仍延后，design D11）。
+  // 非法值启动即报错。ponytail: 保守 500/日，实测按用量调。
+  RAG_DAILY_LLM_CALL_CAP: z.coerce.number().int().positive().default(500),
+  // --- 对话 RAG `/advisor` in-app CF Access JWT 校验（design D10 / spec「直连绕过边缘鉴权被 in-app 拦」）---
+  // CF Access 应用的 AUD tag（承重层：即便 CF Access 误配/直连绕过，in-app JWT 仍拦 `/advisor`）。
+  // **可选**（默认空）：留空时 `/advisor` **fail-closed 拒绝服务**（不半开放公开 LLM 端点）——不影响 worker/纯
+  // Model Radar 部署启动。校验 `aud`；`iss`/`jwks_uri` 由 CF_ACCESS_TEAM_DOMAIN 派生（见下）。
+  CF_ACCESS_AUD: z.string().default(''),
+  // CF Access team 域（如 `myteam.cloudflareaccess.com`）：派生 `iss=https://<域>` 与
+  // `jwks_uri=https://<域>/cdn-cgi/access/certs`（不手写 RS256，交 hono/jwk）。**可选**（默认空）：
+  // 与 CF_ACCESS_AUD 任一为空 → `/advisor` fail-closed 拒绝服务。
+  CF_ACCESS_TEAM_DOMAIN: z.string().default(''),
+
   // --- AI 博主经验提炼（add-ai-blogger-experience-mining，design 风险/权衡）---
   // 经验提炼前对超长 transcript/博文的截断字符数（**镜像 EMBEDDING_TEXT_MAX_CHARS**）：
   // 防长文本 token 爆。提炼 Agent 取 raw_item content 摘录（截断到此值）后调 generateObject。
