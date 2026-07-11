@@ -5,7 +5,7 @@
  * **独立周级调度任务（对齐 daily-intel-pipeline，绝不塞进 runDailyWorkflow / 日报队列）**：
  * 周报是与日报、产品发现并列的独立 BullMQ 调度入口，其**内部**是一条顺序子流程
  *   选高价值事件/产品名单（程序规则，复用已落库摘要，不触 LLM）→ 推送（复用 dispatcher 同一状态机）
- * 但整体独立于日报链运行（见本文件 queue/worker 工厂）。
+ * 但整体独立于日报链运行（BullMQ queue/worker 工厂在 weekly-queue.ts，design D6）。
  *
  * 关键不变量（绝不可违背，weekly-report spec / design D6）：
  *
@@ -45,7 +45,6 @@
  * 文件归属边界：本文件只调用/引用 dispatcher / targets / push-date / product-digest 已导出函数与
  * schema，不重写其逻辑、不改 schema；周报候选查询在本文件用程序条件表达。
  */
-import { Queue, Worker, type ConnectionOptions, type Job } from 'bullmq';
 import { randomUUID } from 'node:crypto';
 import { Redis } from 'ioredis';
 import { and, eq, gte, isNull, lt, sql } from 'drizzle-orm';
@@ -68,22 +67,9 @@ import { createFeishuSender } from '../push/feishu.js';
 import type { WeeklySelectedEvent } from '../push/message.js';
 import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import { dateInTimeZone, startOfDayInTimeZone } from '../push/push-date.js';
-import { buildConnection } from './queue.js';
+import type { RunContext } from './run-context.js';
 
 type DbLike = typeof defaultDb;
-
-/**
- * 周报默认 cron（BullMQ repeat.pattern）：每周一 09:07（Asia/Shanghai）。
- * **分钟字段避整点/半点（∉ {0,30}）**降低飞书限流（同日报 DAILY_DIGEST_CRON 默认意图）；
- * 周一触发使汇总窗口恰为「刚结束的完整一周」（上周一→本周一）。
- *
- * 注：周报 cron 配置未引入新 env（本组文件归属边界禁改 config/env.ts）；用本常量作默认，
- * 可经 scheduleWeeklyReport 的 cron/tz 参数覆盖（wiring 层注入）。cron 时区默认与 push_date
- * 同源 Asia/Shanghai，防触发时区与汇总周口径漂移。
- */
-export const DEFAULT_WEEKLY_CRON = '7 9 * * 1';
-/** 周报 cron 时区（与 push_date 同源 Asia/Shanghai，防漂移）。 */
-export const DEFAULT_WEEKLY_CRON_TZ = 'Asia/Shanghai';
 
 /**
  * 周报推送单例锁默认 TTL（毫秒）：10 分钟。覆盖单 channel 一次周报 dispatch 最坏时长
@@ -92,13 +78,6 @@ export const DEFAULT_WEEKLY_CRON_TZ = 'Asia/Shanghai';
  * 「同 channel 同 iso_week 重新获取锁」的恢复上界。
  */
 const DEFAULT_WEEKLY_LOCK_TTL_MS = 10 * 60 * 1000;
-
-/** 周报队列名（独立于 daily-digest / product-digest，绝不复用）。 */
-export const WEEKLY_REPORT_QUEUE = 'weekly-report';
-/** 周报 job 名。 */
-export const WEEKLY_REPORT_JOB = 'weekly-report';
-/** cron 重复任务稳定标识，防重复注册同一 cron。 */
-const WEEKLY_CRON_JOB_ID = 'weekly-report-cron';
 
 // ──────────────────────────────────────────────────────────────────────────
 // 周锚点：窗口下界/上界 + iso_week + push_date（同源，禁两处口径漂移）
@@ -459,6 +438,11 @@ export interface RunWeeklyReportOptions {
   lock?: AcquireWeeklyLockOptions;
   /** 事件/产品候选各取前 N 条（默认 env.TOP_N）。 */
   limit?: number;
+  /**
+   * run-event 发射钩子（Phase A0，design D3/D4）：阶段进入 / 逐 channel 结局时经它发一条粗粒度事件；
+   * **缺省 no-op**。由薄 run(ctx) 包装注入 ctx.emit；直调核心的测试不传则静默。DI 仍留 options（design D2）。
+   */
+  emit?: RunContext['emit'];
 }
 
 export interface RunWeeklyReportResult {
@@ -534,6 +518,8 @@ export async function runWeeklyReport(
   const now = options.now ?? new Date();
   const dbh = options.dbh ?? defaultDb;
   const limit = options.limit ?? env.TOP_N;
+  // run-event 发射（Phase A0）：缺省 no-op；run(ctx) 包装注入 ctx.emit。
+  const emit = options.emit ?? (() => {});
 
   // 锚点：窗口 + iso_week + push_date 同源（防跨周边界抖动错配）。
   const anchor = weeklyAnchor(now);
@@ -545,6 +531,10 @@ export async function runWeeklyReport(
 
   let eventCount = 0;
   let productCount = 0;
+  // select/push 各发一次粗粒度阶段事件（design D4「weekly 二」）：per-channel 循环内首次进入时发，
+  // 用 guard 保证每 run 恰一条、不随通道数重复（结局仍逐 channel，见下）。
+  let selectStageEmitted = false;
+  let pushStageEmitted = false;
 
   for (const { channel, sender } of channelSenders) {
     // 独立单例锁 weekly:{channel}:{iso_week}（防两并发实例各发一条）。锁键用汇总周 iso_week。
@@ -553,21 +543,34 @@ export async function runWeeklyReport(
       console.error(
         `[weekly-report] 锁: ${channel} iso_week=${anchor.isoWeek} 未抢到单例锁，本实例放弃该通道`,
       );
+      emit('outcome.channel', { channel, result: 'locked' });
       channels.push({ channel, outcome: 'locked', targetIds: [] });
       continue;
     }
 
     try {
+      if (!selectStageEmitted) {
+        emit('stage.select');
+        selectStageEmitted = true;
+      }
       // 程序规则选名单（事件 + 产品），复用已落库 summary_zh/headline_zh，**零 LLM 调用**。
       const events = await selectWeeklyEvents(anchor, dbh, limit);
       const products = await selectWeeklyProducts(anchor, dbh, limit);
       eventCount = events.length;
       productCount = products.length;
 
+      // stage.push 在候选选定后、逐通道空名单 skip 之前发（guard 保每 run 恰一条）：任何进入 dispatch
+      // 阶段的 run（含全通道空名单）都发 stage.push，守住 weekly「select→push 二阶段」契约、不因空名单少一段。
+      if (!pushStageEmitted) {
+        emit('stage.push');
+        pushStageEmitted = true;
+      }
+
       if (events.length === 0 && products.length === 0) {
         console.error(
           `[weekly-report] 推送[${channel}]: iso_week=${anchor.isoWeek} 名单为空 → skipped`,
         );
+        emit('outcome.channel', { channel, result: 'skipped' });
         channels.push({ channel, outcome: 'skipped', targetIds: [] });
         continue;
       }
@@ -592,6 +595,7 @@ export async function runWeeklyReport(
         `[weekly-report] 推送[${channel}]: outcome=${dispatch.outcome}, iso_week=${anchor.isoWeek}, ` +
           `事件 ${events.length} + 产品 ${products.length}`,
       );
+      emit('outcome.channel', { channel, result: dispatch.outcome });
       channels.push({
         channel,
         outcome: dispatch.outcome,
@@ -609,6 +613,31 @@ export async function runWeeklyReport(
     productCount,
     channels,
   };
+}
+
+/**
+ * 薄 run(ctx) 包装（Phase A0，design D2/D4）：把 RunContext 映射到 runWeeklyReport 核心的运维子集
+ * （emit + 可选 now，其余 DI 走生产默认），委托核心；抛错时 emit 一条 run.failed 后 RE-THROW 原错误
+ * （run(ctx) 仍 reject → BullMQ job 失败可重试）。ctx.trigger 恒为 'weekly-report'（design D9）。
+ * 现有集成测试仍直调 runWeeklyReport(options) 注入 mock，不受影响。
+ */
+export async function run(
+  ctx: RunContext,
+  // ponytail: 测试缝——默认委托生产核心；单测注入抛错桩验证 run.failed emit + re-throw 契约。
+  core: typeof runWeeklyReport = runWeeklyReport,
+): Promise<RunWeeklyReportResult> {
+  const input = (ctx.input ?? {}) as { now?: Date };
+  try {
+    return await core({
+      emit: ctx.emit,
+      ...(input.now ? { now: input.now } : {}),
+    });
+  } catch (err) {
+    ctx.emit('run.failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 /**
@@ -634,88 +663,4 @@ function buildWeeklySummaryItem(
     // weekly 渲染明细（仅 weekly target_type 用；其他 target_type 无此字段、渲染走原逻辑）。
     weeklyItems: { events: [...events], products: [...products] },
   };
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// 独立 BullMQ queue / worker 工厂（独立周级调度，绝不嵌 runDailyWorkflow / 复用日报队列）
-// ──────────────────────────────────────────────────────────────────────────
-
-/** weekly-report job 的 payload（预留 now 供手动触发指定时刻）。 */
-export interface WeeklyReportJobData {
-  /** 可选参考时刻 ISO 串（手动触发回填特定周；cron 触发不带，worker 用当前时刻）。 */
-  nowIso?: string;
-}
-
-/** 创建 weekly-report 队列实例（独立队列，调用方负责 close）。 */
-export function createWeeklyReportQueue(
-  connection: ConnectionOptions = buildConnection(),
-): Queue<WeeklyReportJobData> {
-  return new Queue<WeeklyReportJobData>(WEEKLY_REPORT_QUEUE, {
-    connection,
-    defaultJobOptions: {
-      attempts: env.DAILY_DIGEST_JOB_ATTEMPTS,
-      backoff: { type: 'exponential', delay: 60_000 },
-      removeOnComplete: { count: 50 },
-      removeOnFail: { count: 100 },
-    },
-  });
-}
-
-/**
- * 注册周报周级 cron 重复任务（幂等：稳定 jobId 防重复注册同一 cron）。
- *
- * 默认 cron = DEFAULT_WEEKLY_CRON（每周一 09:07 Asia/Shanghai，避整点/半点降飞书限流）；
- * 可由参数覆盖（wiring 层注入）。cron 时区默认与 push_date 同源 Asia/Shanghai，防漂移。
- *
- * @param queue 周报队列。
- * @param pattern cron 表达式（默认 DEFAULT_WEEKLY_CRON）。
- * @param tz cron 时区（默认 DEFAULT_WEEKLY_CRON_TZ）。
- */
-export async function scheduleWeeklyReport(
-  queue: Queue<WeeklyReportJobData>,
-  pattern: string = DEFAULT_WEEKLY_CRON,
-  tz: string = DEFAULT_WEEKLY_CRON_TZ,
-): Promise<Job<WeeklyReportJobData>> {
-  return queue.upsertJobScheduler(
-    WEEKLY_CRON_JOB_ID,
-    { pattern, tz },
-    {
-      name: WEEKLY_REPORT_JOB,
-      data: {},
-    },
-  );
-}
-
-export interface WeeklyReportWorkerOptions {
-  /** BullMQ 连接（默认复用 env.REDIS_URL）。 */
-  connection?: ConnectionOptions;
-  /** 透传给 runWeeklyReport 的注入点（生产留空走默认；测试/手动可注入）。 */
-  workflow?: Omit<RunWeeklyReportOptions, 'now'>;
-  /** 并发度（周报由 per-channel 单例锁兜底，默认 1）。 */
-  concurrency?: number;
-}
-
-/**
- * 创建并启动 weekly-report worker（独立 worker，调用方负责 worker.close()）。
- * job.data.nowIso 存在时用它作参考时刻（手动回填特定周）；否则用当前时刻（cron 触发）。
- */
-export function createWeeklyReportWorker(
-  options: WeeklyReportWorkerOptions = {},
-): Worker<WeeklyReportJobData, RunWeeklyReportResult> {
-  const connection = options.connection ?? buildConnection();
-
-  return new Worker<WeeklyReportJobData, RunWeeklyReportResult>(
-    WEEKLY_REPORT_QUEUE,
-    async (job: Job<WeeklyReportJobData>) => {
-      const now = job.data?.nowIso ? new Date(job.data.nowIso) : undefined;
-      return runWeeklyReport({
-        ...options.workflow,
-        ...(now ? { now } : {}),
-      });
-    },
-    {
-      connection,
-      concurrency: options.concurrency ?? 1,
-    },
-  );
 }

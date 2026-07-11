@@ -38,7 +38,7 @@ import {
   createWeeklyReportQueue,
   scheduleWeeklyReport,
   createWeeklyReportWorker,
-} from './weekly-report.js';
+} from './weekly-queue.js';
 import {
   createEventReviewQueue,
   scheduleEventReview,

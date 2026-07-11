@@ -114,6 +114,7 @@ import {
   type StaleSource,
 } from './source-staleness.js';
 import type { BackfillPublishedAtResult } from '../agents/published-at-inference/backfill.js';
+import type { RunContext } from './run-context.js';
 
 type DbLike = typeof defaultDb;
 
@@ -234,6 +235,12 @@ export interface RunDailyWorkflowOptions {
    * `now` 由本编排注入（recency 窗口与 push_date 同源）。
    */
   experienceSelect?: Omit<SelectExperiencesOptions, 'now'>;
+  /**
+   * run-event 发射钩子（Phase A0，design D3/D4）：阶段进入 / 结局时经它发一条粗粒度事件；
+   * **缺省 no-op**。由薄 run(ctx) 包装注入 ctx.emit；直调核心的测试 / smoke 不传则静默。
+   * DI/测试 seam 仍留 options 核心、不进 ctx（design D2）。
+   */
+  emit?: RunContext['emit'];
 }
 
 /** 工作流结束状态（供 worker / 可观测 / 测试断言）。 */
@@ -420,6 +427,8 @@ export async function runDailyWorkflow(
   const dbh = options.dbh ?? defaultDb;
   const alert = options.alert ?? defaultAlert;
   const abortRatio = options.abortRatio ?? env.DEGRADE_ABORT_RATIO;
+  // run-event 发射（Phase A0，design D3/D4）：缺省 no-op；run(ctx) 包装注入 ctx.emit。
+  const emit = options.emit ?? (() => {});
   const pushDate = getPushDate(now);
 
   // 全局单例锁：某 push_date 只允许一个实例跑（崩溃靠 TTL + finally 释放，design D5/D6）。
@@ -433,6 +442,7 @@ export async function runDailyWorkflow(
   const lock = await acquireDigestLock(pushDate, lockOptions);
   if (lock === null) {
     console.error(`[pipeline] 锁: push_date=${pushDate} 未抢到单例锁，本实例放弃`);
+    emit('outcome.skipped-locked', { pushDate });
     return {
       outcome: 'skipped-locked',
       pushDate,
@@ -453,6 +463,7 @@ export async function runDailyWorkflow(
     //    回溯窗口增量采集而非每轮全量或固定一点；无漏窗 + crash-safe 由「固定窗口重叠 + store 层
     //    UNIQUE(source, source_item_id) 幂等」共同保障（见 arxiv-cursor.ts）。仅当调用方未自带 arxiv
     //    采集选项（测试可注入桩/自带游标）时注入默认游标，不覆盖测试注入。
+    emit('stage.collect');
     const collectOptions = withDefaultArxivCursor(options.collect);
     const collected = await collectAndStore({ ...collectOptions, dbh });
     const collectedCount = collected.items.length;
@@ -461,6 +472,7 @@ export async function runDailyWorkflow(
     // ── 阶段 2：去重塌缩。处理库内**所有**未塌缩的可处理 raw_items（collapseUncollapsedRawItems，
     //    按 collapsed 标记驱动、幂等）：每条塌缩后置 collapsed=true，source_count 恰好贡献一次，
     //    崩溃补塌缩安全；不再依赖脆弱的 store.insertedIds（Wave2a / Codex C1）。
+    emit('stage.dedup');
     const outcomes = await collapseUncollapsedRawItems(dbh);
     // **新闻类可处理条目数**（feishu-push 5.7 / daily-intel-pipeline MODIFIED）：
     // collapseUncollapsedRawItems 的查询层已排除 raw_type product/paper，故其 outcomes 只含
@@ -610,6 +622,7 @@ export async function runDailyWorkflow(
     }
 
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。
+    emit('stage.score');
     const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
     const judgeStage: StageDegrade = {
       processed: judgeResult.judged, // 分母 = 本轮送判（未评分）事件数。
@@ -660,6 +673,7 @@ export async function runDailyWorkflow(
     // ── 阶段 4：Top N 选择（程序确定性，不交给 LLM）。统一日报模型 Model B：选一份 channel-blind
     // Top N，候选窗口排除「已投递给所有已配置通道」者（还差任一通道就留在名单、由各通道 per-channel
     // 跨天补发）。故先解析「已配置通道集」传入 selectTopN（同一份 channelSenders 在阶段 6 复用分发）。
+    emit('stage.select');
     const channelSenders = resolveChannelSenders(options);
     const topN = await selectTopN(
       { now, channels: channelSenders.map((c) => c.channel) },
@@ -672,6 +686,7 @@ export async function runDailyWorkflow(
     );
 
     // ── 阶段 5：中文摘要逐条。分母 = Top N。单条降级回退/剔除（G5 内已处理），绝不推半截。
+    emit('stage.digest');
     const repFields = await loadRepresentativeFields(
       dbh,
       topN.map((e) => e.eventId),
@@ -923,6 +938,7 @@ export async function runDailyWorkflow(
     //    早退（三元，design D6 命门）：新闻 Top N（**抑制后** pushableDeduped）空 **∧** 所有 channel
     //    的产品候选皆空 **∧** 所有 channel 的经验候选皆空才不推；任一段非空都不早退（防纯经验日漏推——
     //    无新闻无产品但有高价值经验时仍须推实践锦囊）。仅部分段空时仍推非空段（各 dispatch 内逐 channel 再判）。
+    emit('stage.push');
     if (
       pushableDeduped.length === 0 &&
       [...productsByChannel.values()].every((p) => p.length === 0) &&
@@ -931,6 +947,7 @@ export async function runDailyWorkflow(
       // 新闻 Top N 空（摘要分母 = 0 或全被剔除）且所有 channel 产品候选、经验候选亦空 → 无可推，正常
       // 结束（不告警、不中止）。仅部分段空不在此早退（落到下方逐 channel dispatch 推非空段）。
       console.error(`[pipeline] 推送: 新闻、产品与经验候选皆空 → skipped-no-candidates`);
+      emit('outcome.skipped-no-candidates', { pushDate });
       return {
         outcome: 'skipped-no-candidates',
         pushDate,
@@ -1046,6 +1063,7 @@ export async function runDailyWorkflow(
     //    （push 已 success，整 job 抛错会致 BullMQ 重跑日报、徒增重复 push 风险）。故整段包 try/catch：
     //    runKbIngestion 内部已逐条隔离（Agent/embed/写入失败跳过该条、认领状态感知幂等），此处再兜一层
     //    防御性 catch（如选候选 SELECT 异常），任何异常仅记日志、不抛断、不影响 outcome（语义/KB 层独立于熔断）。
+    emit('stage.kb');
     let kbResult: KbIngestionResult | undefined;
     try {
       kbResult = await runKbIngestion({ now, ...options.kb }, dbh);
@@ -1062,10 +1080,12 @@ export async function runDailyWorkflow(
       );
     }
 
+    const finalOutcome: WorkflowOutcome = anySent ? 'pushed' : 'skipped-no-candidates';
+    emit('outcome.' + finalOutcome, { pushDate });
     return {
       // 所有通道均非 failed：有任一 'sent' → pushed；否则（全 skipped，如各通道今日已 success）
       // → skipped-no-candidates。
-      outcome: anySent ? 'pushed' : 'skipped-no-candidates',
+      outcome: finalOutcome,
       pushDate,
       collectedCount,
       newsProcessableCount,
@@ -1082,6 +1102,33 @@ export async function runDailyWorkflow(
     };
   } finally {
     await lock.release();
+  }
+}
+
+/**
+ * 薄 run(ctx) 包装（Phase A0，design D2/D4）：把 driver 无关的 RunContext 映射到 runDailyWorkflow
+ * 核心的运维子集（emit + 可选 now，其余 DI 走生产默认），委托核心；抛错时 emit 一条 run.failed 终态
+ * 后 RE-THROW 原错误（run(ctx) 仍 reject → BullMQ job 失败可重试，守 worker.ts 整 job 重试外壳）。
+ * ctx.trigger 恒为 'digest'（design D9），A0 不 switch。现有集成测试 / smoke 仍直调
+ * runDailyWorkflow(options) 注入 mock，不受影响（核心签名仅新增可选 emit）。
+ */
+export async function run(
+  ctx: RunContext,
+  // ponytail: 测试缝——默认委托生产核心；单测注入抛错桩验证 run.failed emit + re-throw 契约（2.2）。
+  //           worker/生产调 run(ctx) 单参走默认核心。DI 仍留 options、不进 ctx（design D2）。
+  core: typeof runDailyWorkflow = runDailyWorkflow,
+): Promise<RunDailyWorkflowResult> {
+  const input = (ctx.input ?? {}) as { now?: Date };
+  try {
+    return await core({
+      emit: ctx.emit,
+      ...(input.now ? { now: input.now } : {}),
+    });
+  } catch (err) {
+    ctx.emit('run.failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 }
 

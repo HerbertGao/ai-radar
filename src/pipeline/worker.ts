@@ -16,17 +16,15 @@ import {
   buildConnection,
   type DailyDigestJobData,
 } from './queue.js';
+import { makeLocalCtx } from './run-context.js';
 import {
-  runDailyWorkflow,
-  type RunDailyWorkflowOptions,
+  run,
   type RunDailyWorkflowResult,
 } from './run-daily-workflow.js';
 
 export interface DailyDigestWorkerOptions {
   /** BullMQ 连接（默认复用 env.REDIS_URL）。 */
   connection?: ConnectionOptions;
-  /** 透传给 runDailyWorkflow 的注入点（生产留空走默认；测试/手动可注入）。 */
-  workflow?: Omit<RunDailyWorkflowOptions, 'now'>;
   /** 并发度（日报是单例任务，默认 1；多于 1 也由单例锁兜底）。 */
   concurrency?: number;
 }
@@ -45,11 +43,15 @@ export function createDailyDigestWorker(
     DAILY_DIGEST_QUEUE,
     async (job: Job<DailyDigestJobData>) => {
       const now = job.data?.nowIso ? new Date(job.data.nowIso) : undefined;
-      // 纯顺序工作流：worker 只 await 它，不拆阶段、不投递子消息（design D7）。
-      return runDailyWorkflow({
-        ...options.workflow,
-        ...(now ? { now } : {}),
+      // 处理器 shim（design D5）：构造本地 ctx（trigger='digest'，input 携可选 now）→ 调薄 run(ctx)
+      // 包装（生产默认补齐 DI）。纯顺序工作流：worker 只 await 它，不拆阶段、不投递子消息（design D7）。
+      // run(ctx) 抛错（含 WorkflowAbortError 熔断中止）经包装 emit run.failed 后 re-throw，
+      // 使 job 失败按整 job 重试外壳重试（worker.ts:7-11 契约不变）。
+      const ctx = makeLocalCtx({
+        trigger: 'digest',
+        input: now ? { now } : {},
       });
+      return run(ctx);
     },
     {
       connection,

@@ -67,6 +67,7 @@ import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
 import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
+import type { RunContext } from './run-context.js';
 
 type DbLike = typeof defaultDb;
 
@@ -111,6 +112,11 @@ export interface RunAlertScanOptions {
    * 注入 mock Redis / TTL；不传则用真实 Redis（集成测有真实 Redis 可用）。
    */
   publishedAtLock?: AcquireAlertLockOptions;
+  /**
+   * run-event 发射钩子（Phase A0，design D3/D4）：阶段进入 / 逐 channel 结局时经它发一条粗粒度事件；
+   * **缺省 no-op**。由薄 run(ctx) 包装注入 ctx.emit；直调核心的测试不传则静默。DI 仍留 options（design D2）。
+   */
+  emit?: RunContext['emit'];
 }
 
 /** 单条告警的发送结果。 */
@@ -283,10 +289,13 @@ export async function runAlertScan(
   const threshold = options.threshold ?? env.ALERT_IMPORTANCE_THRESHOLD;
   const windowDays = options.windowDays ?? env.ALERT_FIRST_SEEN_WINDOW_DAYS;
   const maxPerScan = options.maxPerScan ?? env.ALERT_MAX_PER_SCAN;
+  // run-event 发射（Phase A0）：缺省 no-op；run(ctx) 包装注入 ctx.emit。
+  const emit = options.emit ?? (() => {});
   const pushDate = getPushDate(now);
 
   // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv/PH）+ 入库。
   // 高频链路全源 0 / 空轮是常态：**不**调 classifySystemFailure 做系统级告警（防刷屏）。
+  emit('stage.collect');
   const collected = await collectSources(REALTIME_NEWS_SOURCES, {
     ...options.collect,
   });
@@ -295,10 +304,12 @@ export async function runAlertScan(
   log(`实时源采集: 返回 ${collectedCount} 条（仅 ${REALTIME_NEWS_SOURCES.join('/')}）`);
 
   // ── 阶段 2：去重塌缩（与日报链共用 collapseUncollapsedRawItems，按 collapsed 标记驱动、幂等）。
+  emit('stage.dedup');
   await collapseUncollapsedRawItems(dbh);
 
   // ── 阶段 3：对未评分事件评分（与日报链共用，含并发原子 claim 防双评分）。
   //    评分必在阈值判定**之前**：保证下一步判定时 importance_score 已写（不 NULL 误判）。
+  emit('stage.score');
   const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
   log(
     `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条`,
@@ -332,9 +343,16 @@ export async function runAlertScan(
   // （通道只负责投递上游统一选好的信息，不参与选题）。
   const channelSenders = resolveChannelSenders(options);
   const dispatched: AlertDispatchOutcome[] = [];
+  // 逐项结局（design D4，逐 channel/candidate、无 run 级 rollup）：push 到 dispatched 的同时 emit 一条
+  // outcome.channel。语义等价于原 dispatched.push，dispatched 内容零改（parity）。
+  const record = (o: AlertDispatchOutcome): void => {
+    dispatched.push(o);
+    emit('outcome.channel', { channel: o.channel, eventId: o.eventId, result: o.outcome });
+  };
 
   // channel-agnostic 候选：达阈值 + 近 windowDays 天内首见 + 未全通道 success（一生一次、跨天去重）。
   // maxPerScan 限单次条数（first_seen_at DESC 取最新），超出者下轮补发，防 Telegram rate limit 刷屏。
+  emit('stage.select');
   const candidates = await selectAlertCandidates(
     threshold,
     dbh,
@@ -349,6 +367,7 @@ export async function runAlertScan(
       `（窗口 ${windowDays}天，单次上限 ${maxPerScan} 条）`,
   );
 
+  emit('stage.push');
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i]!;
     // 逐条间隔 1s：Telegram 对单聊天约 1msg/s 限速，避免连续快速发送被 rate limit → failed → 重试刷屏。
@@ -360,7 +379,7 @@ export async function runAlertScan(
     if (lock === null) {
       log(`告警跳过[${candidate.eventId}]: 未抢到单例锁`);
       for (const { channel } of channelSenders) {
-        dispatched.push({ eventId: candidate.eventId, channel, outcome: 'skipped-locked' });
+        record({ eventId: candidate.eventId, channel, outcome: 'skipped-locked' });
       }
       continue;
     }
@@ -376,7 +395,7 @@ export async function runAlertScan(
             { now, sender, channel, targetType: TARGET_TYPE.alert },
             dbh,
           );
-          dispatched.push({
+          record({
             eventId: candidate.eventId,
             channel,
             outcome: result.outcome === 'sent' ? 'sent'
@@ -388,7 +407,7 @@ export async function runAlertScan(
           // dispatch 自身抛错（如渲染/DB 异常）：记为 failed（跨天可重试），隔离不拖垮其余通道。
           const reason = error instanceof Error ? error.message : String(error);
           log(`告警[${channel}][${candidate.eventId}]: 异常隔离 ${reason}`, error);
-          dispatched.push({ eventId: candidate.eventId, channel, outcome: 'failed' });
+          record({ eventId: candidate.eventId, channel, outcome: 'failed' });
         }
       }
     } finally {
@@ -403,4 +422,29 @@ export async function runAlertScan(
     alertCandidateCount: candidates.length,
     dispatched,
   };
+}
+
+/**
+ * 薄 run(ctx) 包装（Phase A0，design D2/D4）：把 RunContext 映射到 runAlertScan 核心的运维子集
+ * （emit + 可选 now，其余 DI 走生产默认），委托核心；抛错时 emit 一条 run.failed 后 RE-THROW 原错误
+ * （run(ctx) 仍 reject → BullMQ job 失败可重试）。ctx.trigger 恒为 'alert-scan'（design D9）。
+ * 现有集成测试仍直调 runAlertScan(options) 注入 mock，不受影响。
+ */
+export async function run(
+  ctx: RunContext,
+  // ponytail: 测试缝——默认委托生产核心；单测注入抛错桩验证 run.failed emit + re-throw 契约。
+  core: typeof runAlertScan = runAlertScan,
+): Promise<RunAlertScanResult> {
+  const input = (ctx.input ?? {}) as { now?: Date };
+  try {
+    return await core({
+      emit: ctx.emit,
+      ...(input.now ? { now: input.now } : {}),
+    });
+  } catch (err) {
+    ctx.emit('run.failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
