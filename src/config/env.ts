@@ -381,8 +381,8 @@ const envSchema = z.object({
   ALERT_SCAN_CRON: z.string().min(1).default('*/15 * * * *'),
   ALERT_SCAN_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   ALERT_SCAN_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
-  // 告警单例锁 `alert:{channel}:{event_id}` TTL（毫秒）：job 级短时持有，覆盖「单事件渲染+单通道送达」
-  // 最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
+  // 告警单例锁 `alert:{event_id}`（per-event，覆盖该事件向所有通道的分发）TTL（毫秒）：job 级短时持有，
+  // 覆盖「单事件渲染 + 多通道送达」最坏时长；崩溃后经 TTL 自动释放（锁键不含时间，无 TTL 会永久死锁该事件告警，故释放语义不可省）。
   ALERT_LOCK_TTL_MS: z.coerce.number().int().positive().default(60000),
   // 告警候选时间窗口（天数）：仅对近 N 天内的事件发告警（防冷启动积压刷屏）。
   // **语义已变更**（fix-push-recency-by-published-at D1/D5）：天数复用、变量名保留（保配置兼容），
