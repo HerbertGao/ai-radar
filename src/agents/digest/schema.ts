@@ -36,6 +36,29 @@ const MAX_SUMMARY_LENGTH = 1000;
  */
 export const HEADLINE_MAX = 80;
 
+/**
+ * 一句话要点 `headline_zh` 字段（必填、非空、去首尾空白后仍非空、不超 HEADLINE_MAX 字），
+ * 供 Telegram 日报渲染。
+ *
+ * 单一事实来源：完整路径（digestOutputSchema）与轻量路径（headlineOnlyOutputSchema）
+ * **共用同一字段定义**，使 HEADLINE_MAX 上限 + mojibake 守卫两路径零漂移。
+ * 超长 / 空串 / mojibake 任一命中即整对象校验失败 → 走既有重试/降级
+ * （不破坏既有 DigestFailureError 降级语义）。校验通过后落库到 ai_news_events.headline_zh。
+ */
+const headlineZhField = z
+  .string()
+  .trim()
+  .min(1, 'headline_zh 不能为空：空要点等价于未产出，必须触发重试/降级')
+  .max(
+    HEADLINE_MAX,
+    `headline_zh 超过 ${HEADLINE_MAX} 字上限：一句话要点须足够短以适配 Telegram 日报，必须触发重试/降级`,
+  )
+  // headline 同样可能命中上游双重编码乱码；与 summary_zh 同规走重试/降级，绝不落库乱码。
+  .refine(
+    (v) => !looksLikeMojibake(v),
+    'headline_zh 检出 mojibake（上游双重编码乱码）：必须触发重试/降级，绝不落库乱码',
+  );
+
 export const digestOutputSchema = z.object({
   /** 中文摘要正文（必填、非空、去除首尾空白后仍非空、不超 MAX_SUMMARY_LENGTH 字）。 */
   summary_zh: z
@@ -52,27 +75,23 @@ export const digestOutputSchema = z.object({
       (v) => !looksLikeMojibake(v),
       'summary_zh 检出 mojibake（上游双重编码乱码）：必须触发重试/降级，绝不落库乱码',
     ),
-  /**
-   * 一句话要点（必填、非空、去首尾空白后仍非空、不超 HEADLINE_MAX 字），供 Telegram 日报渲染。
-   *
-   * 与 summary_zh 由**同一次** generateObject 产出、整对象 Zod 校验；超长 / 空串 / mojibake
-   * 任一命中即整对象校验失败 → 走既有重试/降级（不破坏既有 DigestFailureError 降级语义）。
-   * 校验通过后落库到 ai_news_events.headline_zh。
-   */
-  headline_zh: z
-    .string()
-    .trim()
-    .min(1, 'headline_zh 不能为空：空要点等价于未产出，必须触发重试/降级')
-    .max(
-      HEADLINE_MAX,
-      `headline_zh 超过 ${HEADLINE_MAX} 字上限：一句话要点须足够短以适配 Telegram 日报，必须触发重试/降级`,
-    )
-    // headline 同样可能命中上游双重编码乱码；与 summary_zh 同规走重试/降级，绝不落库乱码。
-    .refine(
-      (v) => !looksLikeMojibake(v),
-      'headline_zh 检出 mojibake（上游双重编码乱码）：必须触发重试/降级，绝不落库乱码',
-    ),
+  // summary_zh 与 headline_zh 由**同一次** generateObject 产出、整对象 Zod 校验。
+  headline_zh: headlineZhField,
 });
 
 /** 经校验的中文摘要输出类型。 */
 export type DigestOutput = z.infer<typeof digestOutputSchema>;
+
+/**
+ * 轻量路径输出 schema（日报 digest 阶段专用）：**仅 `headline_zh`**、无 `summary_zh`。
+ *
+ * 与完整路径共用 headlineZhField（同一 HEADLINE_MAX + mojibake 守卫）。让 generateObject
+ * 只产一句话要点、输出 token 大减；新闻事件的 summary_zh 改由 KB 入库阶段产出并回写。
+ * z.object 默认剥离未声明键——即便 LLM 多返一个 summary_zh，parsed.data 也只含 headline_zh。
+ */
+export const headlineOnlyOutputSchema = z.object({
+  headline_zh: headlineZhField,
+});
+
+/** 经校验的轻量路径输出类型（仅 headline_zh）。 */
+export type HeadlineOnlyOutput = z.infer<typeof headlineOnlyOutputSchema>;

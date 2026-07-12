@@ -55,9 +55,13 @@ export type GenerateObjectFn = (args: {
 export interface KbIngestionInput {
   /** 事件代表标题（必填，构成 prompt 主体）。 */
   representativeTitle: string;
-  /** 事件中文摘要（可选，digest 阶段已产出，供 Agent 参考）。 */
+  /**
+   * 事件中文摘要（可选，**不再假设已由日报 digest 预置**——digest 已降级为只产 headline_zh，
+   * summary_zh 的唯一产出点收敛到本入库阶段）。若上游（如告警链）已产则作 Agent 参考；
+   * 缺省时 Agent grounding 于 representativeTitle + content 原文自产。
+   */
   summaryZh?: string | null;
-  /** 代表 raw_item 正文/摘录（可选，供 Agent 提取实体/标签）。 */
+  /** 代表 raw_item 正文/摘录（grounding 主体之一，恒传；供 Agent 提取实体/标签 + 自产 summary_zh）。 */
   content?: string | null;
   /** 来源 URL（可选，作为 source_urls 候选；Agent 也可只回传已知 URL）。 */
   sourceUrls?: readonly string[];

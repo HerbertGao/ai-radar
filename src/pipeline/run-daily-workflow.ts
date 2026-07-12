@@ -20,7 +20,8 @@
  *   事件仍可推），摘要分母 = 0 正常不推。禁止把「judge 分母 = 0」误判为「今日无候选」中止。
  * - 系统级故障告警以**采集/规范化层**为准：①采集返回条数 = 0 或 ②采集 > 0 但可处理条目数 = 0
  *   → 告警；可处理数含塌缩进既有事件者，故全命中既有事件的正常无新闻日不告警。
- * - 摘要降级用 G5 的 digestEvent（回退 representative_title → canonical_url → 剔除）；绝不推半截。
+ * - 日报 digest 阶段降级用 headlineOnlyEvent（轻量路径，只产 headline_zh；回退 representative_title
+ *   → canonical_url → 剔除）；绝不推半截。summary_zh 改由 KB 入库阶段产出回写（design D1/D2）。
  *
  * 边界：本模块只编排，调用各组已导出函数，不重写其内部逻辑、不改 schema。
  */
@@ -67,7 +68,7 @@ import { backfillPublishedAt } from '../agents/published-at-inference/backfill.j
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 import type { AcquireAlertLockOptions } from './alert-lock.js';
 import {
-  digestEvent,
+  headlineOnlyEvent,
   type EventForDigest,
 } from '../agents/digest/persistence.js';
 import type { SummarizeOptions } from '../agents/digest/index.js';
@@ -317,7 +318,7 @@ interface RepresentativeFields {
  *
  * - canonical_url 供摘要降级回退到 URL（原有职责）。
  * - content/source 经 `representative_raw_item_id` 载入 source-content-enrichment 补全后的正文与来源，
- *   透传 `EventForDigest`（digestEvent 已把二者拼进 prompt）——**只改 forDigest 签名不接此加载即静默
+ *   透传 `EventForDigest`（headlineOnlyEvent/digestEvent 已把二者拼进 prompt）——**只改 forDigest 签名不接此加载即静默
  *   空转**（EventForDigest content/source 恒 undefined、摘要退化仅标题），故加载在此一并取回。
  */
 async function loadRepresentativeFields(
@@ -685,29 +686,31 @@ export async function runDailyWorkflow(
         .join(', ')}）`,
     );
 
-    // ── 阶段 5：中文摘要逐条。分母 = Top N。单条降级回退/剔除（G5 内已处理），绝不推半截。
+    // ── 阶段 5：中文一句话要点（headline）逐条（轻量路径，design D1）。分母 = Top N。
+    //    日报 digest 只产/写 headline_zh，不再产 summary_zh（后者改由 KB 入库阶段回写，design D2）。
+    //    单条降级回退/剔除（headlineOnlyEvent 内已处理），绝不推半截。
     emit('stage.digest');
     const repFields = await loadRepresentativeFields(
       dbh,
       topN.map((e) => e.eventId),
     );
-    let digestDegraded = 0; // 本轮**实际送摘要**中失败降级的条数（不含已缓存跳过者）。
-    let digestProcessed = 0; // 本轮实际送摘要（summary_zh IS NULL）数，仅供逐条日志/可观测。
-    let digestSkipped = 0; // 已有 summary_zh、跳过 digestEvent 的条数（仅可观测）。
+    let digestDegraded = 0; // 本轮**实际送 headline 生成**中失败降级的条数（不含已缓存跳过者）。
+    let digestProcessed = 0; // 本轮实际送 headline 生成（headline_zh IS NULL）数，仅供逐条日志/可观测。
+    let digestSkipped = 0; // 已有 headline_zh、跳过 headlineOnlyEvent 的条数（仅可观测）。
     const pushable: SelectedEvent[] = [];
-    // 逐条进度：先数出本轮真正要送摘要的条数（未缓存者）作分母 M（仅日志用）。
-    const toSummarizeCount = topN.filter((e) => e.summaryZh === null).length;
+    // 逐条进度：先数出本轮真正要送 headline 生成的条数（未缓存者）作分母 M（仅日志用）。
+    const toSummarizeCount = topN.filter((e) => e.headlineZh === null).length;
     let digestStep = 0;
     for (const ev of topN) {
-      // 已摘要守卫（design D8/D9）：已有 summary_zh（非 null）→ 跳过 digestEvent，
-      // 直接用既有 summary_zh 计入 pushable，避免重复 LLM 调用 / 覆盖旧产物为降级回退。
-      if (ev.summaryZh !== null) {
+      // 已生成守卫（design D1）：已有 headline_zh（非 null，如 P0/告警链同产两者）→ 跳过
+      // headlineOnlyEvent，直接用既有 headline_zh 计入 pushable，避免重复 LLM 调用 / 覆盖旧产物为降级回退。
+      if (ev.headlineZh !== null) {
         digestSkipped += 1;
         pushable.push({
           eventId: ev.eventId,
           representativeTitle: ev.representativeTitle,
+          // 库内既有 summary_zh（P0/告警链已产则非空，否则 null → message 层回退 headline）。
           summaryZh: ev.summaryZh,
-          // 已缓存分支：headline 来自 selectTopN（库内 headline_zh，旧事件为 null 走渲染回退）。
           headlineZh: ev.headlineZh,
           canonicalUrl: repFields.get(ev.eventId)?.canonicalUrl ?? null,
           publishedAt: ev.publishedAt,
@@ -718,42 +721,42 @@ export async function runDailyWorkflow(
       digestProcessed += 1;
       digestStep += 1;
       console.error(
-        `[digest] 摘要 ${digestStep}/${toSummarizeCount}（event=${ev.eventId.slice(0, 8)}）`,
+        `[digest] headline ${digestStep}/${toSummarizeCount}（event=${ev.eventId.slice(0, 8)}）`,
       );
       const fields = repFields.get(ev.eventId);
       const forDigest: EventForDigest = {
         eventId: ev.eventId,
         representativeTitle: ev.representativeTitle,
         canonicalUrl: fields?.canonicalUrl ?? null,
-        // 补全后正文 + 来源（组 G 5.2 grounding）：digestEvent 拼进 prompt；补全失败仍空时
+        // 补全后正文 + 来源（组 G 5.2 grounding）：headlineOnlyEvent 拼进 prompt；补全失败仍空时
         // buildPrompt 只在非空时拼入、触发无正文防幻觉护栏（组 D）。
         content: fields?.content ?? null,
         source: fields?.source ?? null,
       };
-      const outcome = await digestEvent(forDigest, options.digest, dbh);
+      const outcome = await headlineOnlyEvent(forDigest, options.digest, dbh);
       if (outcome.degraded) digestDegraded += 1;
       if (outcome.status === 'dropped') {
         // 无任何可展示文本 → 剔除出当日日报（绝不推半截）。
         continue;
       }
-      // summarized（summary_zh 已落库）或 fallback（用 representative_title/URL 回退）
-      // 均可推送；dispatcher 优先读 summary_zh，无则用展示标题（见 message 渲染）。
-      // C6：fallback 时若 representativeTitle 为空，digestEvent 已返回 canonical_url 兜底
+      // headline（headline_zh 已落库）或 fallback（用 representative_title/URL 回退）
+      // 均可推送；dispatcher 优先读 summary_zh，无则用 headline / 展示标题（见 message 渲染）。
+      // fallback 时若 representativeTitle 为空，headlineOnlyEvent 已返回 canonical_url 兜底
       // fallbackText；用它覆盖展示标题，避免 message 渲染「(无标题)」。
-      const summaryZh =
-        outcome.status === 'summarized' ? outcome.summaryZh : null;
       const representativeTitle =
         outcome.status === 'fallback'
           ? outcome.fallbackText
           : ev.representativeTitle;
-      // 本轮新摘要分支：headline 仅 summarized 变体有；fallback（降级）置 null 走渲染回退链。
-      // 必须按 status 收窄（与上方 summaryZh 守卫同形），直取 outcome.headlineZh 会因 fallback 变体无此字段 tsc 失败。
+      // 轻量路径 headline 仅 'headline'（成功）变体有；fallback（降级）置 null 走渲染回退链。
+      // 必须按 status 收窄，直取 outcome.headlineZh 会因 fallback 变体无此字段 tsc 失败。
       const headlineZh =
-        outcome.status === 'summarized' ? outcome.headlineZh : null;
+        outcome.status === 'headline' ? outcome.headlineZh : null;
       pushable.push({
         eventId: ev.eventId,
         representativeTitle,
-        summaryZh: summaryZh ?? ev.summaryZh,
+        // 日报 digest 不再产 summary_zh（改由 KB 入库回写）；取库内既有值：P0/告警链已产则非空，
+        // 否则 null → message 层回退 headline，无回归。
+        summaryZh: ev.summaryZh,
         headlineZh,
         canonicalUrl: repFields.get(ev.eventId)?.canonicalUrl ?? null,
         publishedAt: ev.publishedAt,
@@ -761,14 +764,14 @@ export async function runDailyWorkflow(
       });
     }
     if (digestSkipped > 0) {
-      console.error(`[digest] 跳过已摘要 ${digestSkipped} 条`);
+      console.error(`[digest] 跳过已生成 headline ${digestSkipped} 条`);
     }
     console.error(
-      `[pipeline] 摘要: 送摘要 ${digestProcessed} 条（跳过已摘要 ${digestSkipped} 条）, 降级 ${digestDegraded} 条, 熔断分母（Top N）${topN.length}`,
+      `[pipeline] headline: 送生成 ${digestProcessed} 条（跳过已生成 ${digestSkipped} 条）, 降级 ${digestDegraded} 条, 熔断分母（Top N）${topN.length}`,
     );
     const digestStage: StageDegrade = {
-      // 摘要阶段熔断分母 = 进入摘要的事件数（Top N，含已缓存跳过者），与 spec/design D8 原文一致。
-      // 降级分子 = 本轮实际送摘要中失败的条数。如此「7 缓存 + 1 新失败」= 1/8 < 阈值不误熔断。
+      // digest 阶段熔断分母 = 进入 headline 生成的事件数（Top N，含已缓存跳过者），与 spec/design D4 一致。
+      // 降级分子 = 本轮实际送 headline 生成中失败的条数。如此「7 缓存 + 1 新失败」= 1/8 < 阈值不误熔断。
       processed: topN.length,
       degraded: digestDegraded,
     };
