@@ -15,6 +15,7 @@ import { pingDb } from './db/index.js';
 import { pingRedis } from './health/redis.js';
 import { createModelRadarApp } from './mr/api/model-radar.js';
 import { createModelRadarWebApp } from './mr/web/model-radar-page.js';
+import { createAdvisorApp } from './rag/web/advisor-page.js';
 
 /** 单项依赖的连通状态。 */
 export type DependencyStatus = 'ok' | 'down';
@@ -83,3 +84,6 @@ export const app = createHealthApp();
 app.route('/', createModelRadarApp());
 // 挂载 Model Radar 比价 Web 页（5d-B，GET /model-radar）；SSR 只读快照、不挂 version-304、不写库。
 app.route('/', createModelRadarWebApp());
+// 挂载对话 RAG Web 出口（A3，/advisor 多轮 chat + in-app CF Access JWT + 每日成本地板）；
+// JWT 只挂 /advisor* 前缀、不影响 /health 与公开只读的 /model-radar；未配置 CF Access → /advisor fail-closed。
+app.route('/', createAdvisorApp());
