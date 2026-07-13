@@ -19,6 +19,7 @@ import { db as defaultDb } from '../../db/index.js';
 import { aiNewsEvents } from '../../db/schema.js';
 import {
   summarizeEvent,
+  generateHeadline,
   DigestFailureError,
   type SummarizeEventInput,
   type SummarizeOptions,
@@ -73,6 +74,35 @@ export type DigestOutcome =
     };
 
 /**
+ * 轻量路径（日报 digest 阶段）单条事件处理结果。镜像 DigestOutcome 的 fallback/dropped
+ * 变体（字段同名，供上层用同一逻辑判 pushable + 计熔断降级）；成功变体为 `headline`——
+ * 只产/落库 headline_zh、无 summaryZh。
+ */
+export type HeadlineOnlyOutcome =
+  | {
+      eventId: string;
+      /** headline 成功并已 UPDATE 落库（仅写 headline_zh）。 */
+      status: 'headline';
+      /** 经校验、已落库的一句话要点（供日报渲染）。 */
+      headlineZh: string;
+      degraded: false;
+    }
+  | {
+      eventId: string;
+      /** headline 降级：回退用 representative_title / canonical_url 作展示文本，未写 headline_zh。 */
+      status: 'fallback';
+      /** 推送时应展示的回退文本（representative_title 或兜底 canonical_url）。 */
+      fallbackText: string;
+      degraded: true;
+    }
+  | {
+      eventId: string;
+      /** headline 降级且无任何可展示文本（标题为空且无 URL）→ 剔除出当日日报。 */
+      status: 'dropped';
+      degraded: true;
+    };
+
+/**
  * 仅写 summary_zh + headline_zh：
  * `UPDATE ai_news_events SET summary_zh = ?, headline_zh = ? WHERE event_id = ?`。
  *
@@ -89,6 +119,24 @@ async function updateSummaryZh(
   await dbh
     .update(aiNewsEvents)
     .set({ summaryZh, headlineZh })
+    .where(eq(aiNewsEvents.eventId, eventId));
+}
+
+/**
+ * 轻量路径落库：`UPDATE ai_news_events SET headline_zh = ? WHERE event_id = ?`。
+ *
+ * set 中**仅含** headline_zh，**绝不写 summary_zh**（新闻事件的 summary_zh 改由 KB 入库阶段
+ * 产出回写），也绝不触碰身份/代表/时间/评分列。绝不用 INSERT ... ON CONFLICT。
+ * 仅在 headline 经 Zod 校验通过后调用。
+ */
+async function updateHeadlineZh(
+  dbh: DbLike,
+  eventId: string,
+  headlineZh: string,
+): Promise<void> {
+  await dbh
+    .update(aiNewsEvents)
+    .set({ headlineZh })
     .where(eq(aiNewsEvents.eventId, eventId));
 }
 
@@ -155,6 +203,60 @@ export async function digestEvent(
       throw error;
     }
     // 降级：绝不写 summary_zh（保持 NULL）。回退展示文本或剔除该 event。
+    const fallbackText = resolveFallbackText(event);
+    if (fallbackText !== null) {
+      return {
+        eventId: event.eventId,
+        status: 'fallback',
+        fallbackText,
+        degraded: true,
+      };
+    }
+    return { eventId: event.eventId, status: 'dropped', degraded: true };
+  }
+}
+
+/**
+ * 轻量路径：对一条入选事件只生成并落库 `headline_zh`（不产/不写 summary_zh），失败则降级。
+ *
+ * 日报 digest 阶段（run-daily stage 5）改调本函数替代 digestEvent：签名/降级语义镜像 digestEvent。
+ * 成功路径：generateHeadline 产经校验的 headline_zh → `UPDATE ... SET headline_zh`（仅此一列）
+ *   → 返回 status='headline'。
+ * 降级路径（generateHeadline 抛 DigestFailureError，已记日志、已重试耗尽）：
+ *   - representative_title（或兜底 canonical_url）可用 → status='fallback'，不写 headline_zh；
+ *   - 皆不可用 → status='dropped'，剔除该 event 出当日日报。
+ *
+ * 注意：降级路径**不写** headline_zh（保持 NULL），推送层据 fallbackText 走既有渲染回退链。
+ */
+export async function headlineOnlyEvent(
+  event: EventForDigest,
+  options: SummarizeOptions = {},
+  dbh: DbLike = defaultDb,
+): Promise<HeadlineOnlyOutcome> {
+  const title = event.representativeTitle?.trim() ?? '';
+  const input: SummarizeEventInput = {
+    // representativeTitle 极个别为空串时用 canonicalUrl 占位作 prompt 主体（同 digestEvent）。
+    title: title || event.canonicalUrl?.trim() || '(无标题)',
+    content: event.content ?? null,
+    source: event.source ?? null,
+  };
+
+  try {
+    const output = await generateHeadline(input, options);
+    // output.headline_zh 已经 Zod 校验（非空），落库仅写 headline_zh 一列。
+    await updateHeadlineZh(dbh, event.eventId, output.headline_zh);
+    return {
+      eventId: event.eventId,
+      status: 'headline',
+      headlineZh: output.headline_zh,
+      degraded: false,
+    };
+  } catch (error) {
+    if (!(error instanceof DigestFailureError)) {
+      // 非预期错误（如 DB 连接断开）：不静默吞掉，向上抛由编排层处理。
+      throw error;
+    }
+    // 降级：绝不写 headline_zh（保持 NULL）。回退展示文本或剔除该 event。
     const fallbackText = resolveFallbackText(event);
     if (fallbackText !== null) {
       return {

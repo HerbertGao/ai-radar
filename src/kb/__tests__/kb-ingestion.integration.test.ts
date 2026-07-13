@@ -63,21 +63,35 @@ const embedStub: EmbedManyFn = async ({ values }) => ({
   embeddings: values.map(() => validVec()),
 });
 
-/** 直接 INSERT 一条 ai_news_events，返回 event_id。 */
+/**
+ * 直接 INSERT 一条 ai_news_events，返回 event_id。
+ * summaryZh：未传 → 默认 'seed 摘要'（保留原有用例行为）；显式传 null → NULL（供回写测试）。
+ */
 async function seedEvent(args: {
   dedupKey: string;
   title: string;
   mergedInto?: string | null;
   publishedAt?: Date | null;
+  summaryZh?: string | null;
 }): Promise<string> {
+  const summaryZh = 'summaryZh' in args ? args.summaryZh : 'seed 摘要';
   const { rows } = await pool!.query<{ event_id: string }>(
     `INSERT INTO ai_news_events
        (dedup_key, representative_title, summary_zh, first_seen_at, last_seen_at, published_at, merged_into)
      VALUES ($1, $2, $3, now(), now(), $4, $5)
      RETURNING event_id`,
-    [args.dedupKey, args.title, 'seed 摘要', args.publishedAt ?? null, args.mergedInto ?? null],
+    [args.dedupKey, args.title, summaryZh, args.publishedAt ?? null, args.mergedInto ?? null],
   );
   return rows[0]!.event_id;
+}
+
+/** 读回一条 ai_news_events 的 summary_zh（供回写断言）。 */
+async function fetchSummaryZh(eventId: string): Promise<string | null> {
+  const { rows } = await pool!.query<{ summary_zh: string | null }>(
+    `SELECT summary_zh FROM ai_news_events WHERE event_id = $1`,
+    [eventId],
+  );
+  return rows[0]?.summary_zh ?? null;
 }
 
 /** 直接 INSERT 一条 push_records（success）。 */
@@ -299,5 +313,101 @@ describe.skipIf(!databaseUrl)('知识库入库幂等 + 准入闸 + tombstone 排
     expect(await countDocs(survivor)).toBe(1);
     expect(await countDocs(tomb)).toBe(0);
     expect(await countRecords(tomb)).toBe(0);
+  });
+});
+
+/**
+ * downgrade-daily-digest（Plan A A4，组 B）：KB 入库回写 summary_zh 回归。
+ *
+ * 覆盖 spec「知识摘要 Agent 产出入库元数据」MODIFIED + 任务 4.3：
+ * - 回写发生：push-success 事件（summary_zh 为 NULL）入库后 ai_news_events.summary_zh 被回写
+ *   （该值即 weekly 零 LLM 复用的来源）；
+ * - `< 70` 未入 KB 者亦回写（回写独立于 >= 70 准入 KB 写）；
+ * - summary_zh 已存在时 Agent **仍照常跑**产 long_term_value（供准入闸），回写 `WHERE ... IS NULL`
+ *   不覆盖现值——**断言 P0/已摘要事件不被误挡出 KB（KB-admission 无回归）**。
+ *
+ * 各用例用唯一 push_date + 唯一 dedup_key 前缀隔离；per-eventId 断言精确、result 计数用 >= 兜底。
+ */
+describe.skipIf(!databaseUrl)('KB 入库回写 summary_zh（组 B / A4 降级搬迁）', () => {
+  it('回写：summary_zh 为 NULL 的 push-success 事件入库后被回写（>= 70 入 KB）', async () => {
+    const pushDate = '2026-07-01';
+    const eventId = await seedEvent({
+      dedupKey: `${PREFIX}-wb-hi-${Date.now()}`,
+      title: '高价值回写事件',
+      summaryZh: null,
+    });
+    await seedPushSuccess(eventId, pushDate);
+
+    const result = await runKbIngestion(
+      {
+        now: new Date('2026-07-01T03:00:00Z'),
+        agent: { generateObjectFn: metadataStub(85) },
+        embed: { embedManyFn: embedStub },
+        store: { logError: () => {} },
+        logError: () => {},
+      },
+      db!,
+    );
+
+    expect(result.ingested).toBeGreaterThanOrEqual(1);
+    expect(await countDocs(eventId)).toBe(1);
+    // Agent 产出的 summary_zh 被回写（NULL → 'KB 中文摘要'），weekly 后续零 LLM 复用此值。
+    expect(await fetchSummaryZh(eventId)).toBe('KB 中文摘要');
+  });
+
+  it('回写：long_term_value < 70 未入 KB 的事件 summary_zh 仍被回写（回写独立于准入闸）', async () => {
+    const pushDate = '2026-07-02';
+    const eventId = await seedEvent({
+      dedupKey: `${PREFIX}-wb-lo-${Date.now()}`,
+      title: '低价值回写事件',
+      summaryZh: null,
+    });
+    await seedPushSuccess(eventId, pushDate);
+
+    const result = await runKbIngestion(
+      {
+        now: new Date('2026-07-02T03:00:00Z'),
+        agent: { generateObjectFn: metadataStub(62) },
+        embed: { embedManyFn: embedStub },
+        store: { logError: () => {} },
+        logError: () => {},
+      },
+      db!,
+    );
+
+    expect(result.gatedOut).toBeGreaterThanOrEqual(1);
+    // 未入 KB（< 70 被准入闸拦下），但回写仍在准入闸之前发生。
+    expect(await countDocs(eventId)).toBe(0);
+    expect(await fetchSummaryZh(eventId)).toBe('KB 中文摘要');
+  });
+
+  it('summary_zh 已存在（如 P0/告警链已产）：Agent 仍跑产 long_term_value、回写 WHERE IS NULL 不覆盖、KB 准入无回归', async () => {
+    const pushDate = '2026-07-03';
+    const eventId = await seedEvent({
+      dedupKey: `${PREFIX}-wb-exist-${Date.now()}`,
+      title: 'P0 已摘要事件',
+      summaryZh: '告警链已产摘要',
+    });
+    await seedPushSuccess(eventId, pushDate);
+
+    const result = await runKbIngestion(
+      {
+        now: new Date('2026-07-03T03:00:00Z'),
+        agent: { generateObjectFn: metadataStub(85) },
+        embed: { embedManyFn: embedStub },
+        store: { logError: () => {} },
+        logError: () => {},
+      },
+      db!,
+    );
+
+    // Agent 照常跑（未因 summary_zh 已存在而跳过）→ 产 long_term_value=85 → 过闸入 KB。
+    // kb_documents=1 即证 Agent 已运行并产出 long_term_value：若跳过 Agent 则无从判闸、无从入库。
+    expect(result.agentOk).toBeGreaterThanOrEqual(1);
+    expect(result.ingested).toBeGreaterThanOrEqual(1);
+    // KB-admission 无回归：P0/已摘要高价值事件未被误挡出 KB。
+    expect(await countDocs(eventId)).toBe(1);
+    // 回写 `WHERE summary_zh IS NULL`：列非空 → 不覆盖现值（幂等无操作，非跳过 Agent）。
+    expect(await fetchSummaryZh(eventId)).toBe('告警链已产摘要');
   });
 });

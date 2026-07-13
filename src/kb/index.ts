@@ -7,13 +7,19 @@
  *    `target_type='event'`、`push_date=今日`）**且** `ai_news_events.merged_into IS NULL`（非 tombstone）
  *    的 event——单一口径（排除 tombstone 与落选事件，控成本，对齐流水线 Push → KB Ingestion 顺序）。
  * 2. **逐条 KB Agent 产元数据（5.1）**：generateKbMetadata（generateObject + Zod，含 long_term_value
- *    钉死 [0,100]）；校验不过 / 重试耗尽 → 记日志、**跳过该条不入库、不中止整批**。
- * 3. **准入闸（程序，5.2）**：仅 `long_term_value >= 70` 入库（QA §13.1 知识库不是垃圾桶）；
+ *    钉死 [0,100]）；grounding 于**原文**（representativeTitle + raw_items.content），不再假设 summary_zh
+ *    已由日报预置（digest 已降级只产 headline_zh）。**Agent 对每条候选照常跑**（long_term_value 唯一来源、
+ *    供准入闸），绝不因 summary_zh 已存在而跳过；校验不过 / 重试耗尽 → 记日志、**跳过该条不入库、不中止整批**。
+ * 3. **回写 summary_zh（降级搬迁）**：Agent 产出的 summary_zh 原子条件回写 `ai_news_events`
+ *    `UPDATE ... SET summary_zh WHERE event_id = ? AND summary_zh IS NULL`（幂等 + 抗并发告警链写，
+ *    列已非空即不覆盖）——**在准入闸之前**，覆盖所有 push-success 候选（含 `< 70` 未入 KB 者），供 weekly 零 LLM
+ *    复用；best-effort、never throw（失败隔离该条、不阻塞已成功推送）。
+ * 4. **准入闸（程序，5.2）**：仅 `long_term_value >= 70` 入库（QA §13.1 知识库不是垃圾桶）；
  *    准入闸为**程序判定**（非 LLM 决定是否入库）。低于阈值 → 记录为未达阈、跳过。
- * 4. **embedding**：对 `kb_title + summary_zh` 经 embedTexts（复用组 C 低层原语）生成；失败 → 记日志、
+ * 5. **embedding**：对 `kb_title + summary_zh` 经 embedTexts（复用组 C 低层原语）生成；失败 → 记日志、
  *    embedding 置 null（不阻断入库，列可空、供未来检索）。Agent/embed 失败一律跳过该条或降级 embedding，
  *    **不抛断、不污染 KB**。
- * 5. **状态感知认领 + 两表原子入库（5.3）**：storeKbDocument（claim CAS + 同事务两表写入 / 失败回滚置 failed）。
+ * 6. **状态感知认领 + 两表原子入库（5.3）**：storeKbDocument（claim CAS + 同事务两表写入 / 失败回滚置 failed）。
  *
  * kb_provider='custom'（本地表）。本阶段运行在日报链单例锁内、在 push 之后。
  */
@@ -201,6 +207,9 @@ export async function runKbIngestion(
 
   for (const event of candidateEvents) {
     // 1. KB Agent 产元数据（外部 LLM 调用，带重试；失败 → 跳过该条不入库、不中止整批）。
+    //    grounding 于**原文**（representativeTitle + raw_items.content）——不再假设 summary_zh 已由日报预置
+    //    （digest 已降级只产 headline_zh）；summaryZh 若上游已产则作参考，缺省 Agent 自产。
+    //    **对每条候选照常跑**（long_term_value 唯一来源、供准入闸），绝不因 summary_zh 已存在而跳过。
     let metadata;
     try {
       metadata = await generateKbMetadata(
@@ -222,7 +231,29 @@ export async function runKbIngestion(
       continue;
     }
 
-    // 2. 准入闸（程序判定，非 LLM）：仅 long_term_value >= 70 入库。
+    // 2. 回写 summary_zh 到 ai_news_events（原子条件写，best-effort、never throw）。
+    //    **必在准入闸之前**：< 70 事件也回写（回写覆盖所有 push-success 候选，独立于 >= 70 准入 KB 写）。
+    //    Agent 已对每条候选跑完（上一步），此处只 gate 回写、不 gate Agent——`WHERE summary_zh IS NULL`
+    //    令幂等 + 抗并发告警链写（列已非空即不覆盖，如 P0/告警链已产）；set 仅含 summary_zh，绝不碰塌缩首建列。
+    //    回写失败隔离该条、不抛断整批、不阻塞已成功推送（push 早已完成）。
+    try {
+      await dbh
+        .update(aiNewsEvents)
+        .set({ summaryZh: metadata.summary_zh })
+        .where(
+          and(
+            eq(aiNewsEvents.eventId, event.eventId),
+            isNull(aiNewsEvents.summaryZh),
+          ),
+        );
+    } catch (error) {
+      logError('summary_zh 回写失败（best-effort，不阻塞入库/已成功推送）', {
+        eventId: event.eventId,
+        error,
+      });
+    }
+
+    // 3. 准入闸（程序判定，非 LLM）：仅 long_term_value >= 70 入库。
     if (metadata.long_term_value < KB_ADMISSION_FLOOR) {
       result.gatedOut += 1;
       logError('候选未达准入阈（long_term_value < 70），不写入知识库', {
@@ -232,7 +263,7 @@ export async function runKbIngestion(
       continue;
     }
 
-    // 3. embedding（对 kb_title + summary_zh）：失败降级 null（列可空，不阻断入库）。
+    // 4. embedding（对 kb_title + summary_zh）：失败降级 null（列可空，不阻断入库）。
     let embedding: number[] | null = null;
     const embedText = `${metadata.kb_title}\n${metadata.summary_zh}`.trim();
     if (embedText.length > 0) {
@@ -248,7 +279,7 @@ export async function runKbIngestion(
       }
     }
 
-    // 4. 状态感知认领 + 两表原子入库。
+    // 5. 状态感知认领 + 两表原子入库。
     const outcome = await storeKbDocument(
       {
         targetType,

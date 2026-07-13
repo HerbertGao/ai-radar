@@ -759,6 +759,203 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
 });
 
 /**
+ * 日报降级回归（downgrade-daily-digest 组 C，tasks 4.2/4.4/4.5）。
+ *
+ * A4 把日报 digest 阶段（stage 5）从「同产 summary_zh + headline_zh」降级为**只产 headline_zh**
+ * 的轻量路径（headlineOnlyEvent；summary_zh 改由 KB 入库阶段回写）。本块钉死降级后仍守住的口径：
+ * - 4.2 确定性面：入选 event 按 rank 排序、push_records 行不变；stage 5 只写 headline_zh、不写 summary_zh。
+ * - 4.4 幂等命名空间：P0 alert（target_type='alert'）与日报 event（target_type='event'）互不吞
+ *   （日报仍完整 recap 已 P0 的事件、接受重叠）。
+ * - 4.5 断路器：digest 段 headline 失败率超阈仍熔断（denominator=Top N / 阈值 / 抛错口径不变）；judge 段不变。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 日报降级回归（组 C 4.2/4.4/4.5）', () => {
+  /** 记录发送文本的 sender（供断言入选 event 在日报正文中的顺序）。 */
+  function recordingSender(): MessageSender & { texts: string[] } {
+    const s = {
+      texts: [] as string[],
+      async send(text: string): Promise<void> {
+        s.texts.push(text);
+      },
+    };
+    return s;
+  }
+
+  it('4.2 确定性面：入选 event 按 rank 排序、push_records 行不变；stage 5 只写 headline_zh 不写 summary_zh', async () => {
+    // 两条候选，importance 拉开（high=95 / low=75）→ rank_score 拉开 → 日报正文 high 在 low 之前。
+    const items = [
+      item({ id: 'dg-hi', url: 'https://ex.com/dg-hi', title: 'RANKHIGH item' }),
+      item({ id: 'dg-lo', url: 'https://ex.com/dg-lo', title: 'RANKLOW item' }),
+    ];
+    // 按标题给不同 importance（judgeMock 的全局 importance 无法区分单条）。
+    const judgeByTitle = async (args: { prompt: string }) => ({
+      object: {
+        is_ai_related: true,
+        type: 'news',
+        category: 'AI',
+        importance: args.prompt.includes('RANKHIGH') ? 95 : 75,
+        novelty: 80,
+        developer_relevance: 80,
+        hype_risk: 10,
+        should_push: true,
+        reason: 'ok',
+      },
+    });
+    const sender = recordingSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeByTitle, maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+      staleness: async () => [],
+      // 注入必失败的 KB 摘要 Agent：令 stage 7 KB 入库确定性地不回写 summary_zh，隔离下方
+      // 「stage 5 不写 summary_zh」断言（否则 KB agent 成功会回写、断言随 KB 桩变化而假失败）。
+      kb: {
+        agent: {
+          generateObjectFn: async () => {
+            throw new Error('KB agent 桩：本测试令 KB 不回写以隔离 stage-5 断言');
+          },
+          maxAttempts: 1,
+        },
+      },
+    });
+    expect(result.outcome).toBe('pushed');
+    // digest 熔断分母 = Top N = 2、headline 全成功 → 0 降级（denominator/口径不因降级路径改变）。
+    expect(result.digest).toEqual({ processed: 2, degraded: 0 });
+
+    // push_records：两条候选各落一行 event(success)，无多无少（分发行口径不因 stage 5 变轻而改变）。
+    const { rows: pr } = await pool!.query<{ n: string; s: string }>(
+      `SELECT count(*) AS n, min(status) AS s FROM push_records
+        WHERE target_type='event' AND channel='telegram' AND push_date='2000-01-01'`,
+    );
+    expect(pr[0]!.n).toBe('2');
+    expect(pr[0]!.s).toBe('success');
+
+    // 入选顺序（确定性）：日报正文里 high 标题出现在 low 标题之前（rank_score DESC）。
+    expect(sender.texts).toHaveLength(1);
+    const text = sender.texts[0]!;
+    const hiAt = text.indexOf('RANKHIGH');
+    const loAt = text.indexOf('RANKLOW');
+    expect(hiAt).toBeGreaterThanOrEqual(0);
+    expect(loAt).toBeGreaterThanOrEqual(0);
+    expect(hiAt).toBeLessThan(loAt);
+
+    // 降级核心：stage 5 只写 headline_zh、绝不写 summary_zh（后者改由 KB 入库回写）。
+    const { rows: ev } = await pool!.query<{
+      headline_zh: string | null;
+      summary_zh: string | null;
+    }>(
+      `SELECT headline_zh, summary_zh FROM ai_news_events WHERE representative_title LIKE $1`,
+      [`${TITLE_MARKER} RANK%`],
+    );
+    expect(ev).toHaveLength(2);
+    for (const row of ev) {
+      expect(row.headline_zh).not.toBeNull(); // 轻量路径已产并落库 headline。
+      expect(row.summary_zh).toBeNull(); // 日报 digest 不再产 summary_zh。
+    }
+  });
+
+  it('4.4 幂等命名空间：日报完整 recap 已 P0 的事件——alert 与 event 各落一行、互不吞', async () => {
+    // 预置一条已评分 should_push 事件，并预置该事件的 P0 alert 推送行（模拟 P0 已即时推过）。
+    // computePendingSet 只查 target_type=event → alert 行不挡日报；日报仍把该事件按 event 命名空间完整推。
+    const url = 'https://overlap.example.com/p0/1';
+    const { sha256Hex, normalizeUrl } = await import('../../dedup/normalize.js');
+    const dedupKey = sha256Hex(normalizeUrl(url)!);
+    const { rows: seed } = await pool!.query<{ event_id: string }>(
+      `INSERT INTO ai_news_events
+         (dedup_key, representative_title, representative_raw_item_id, should_push,
+          importance_score, novelty_score, developer_relevance_score, hype_risk_score,
+          first_seen_at, published_at, is_ai_related, source_count)
+       VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,true,1) RETURNING event_id`,
+      [
+        dedupKey,
+        `${TITLE_MARKER} P0 overlap event`,
+        new Date(),
+        new Date('2000-01-01T00:00:00Z'),
+      ],
+    );
+    const eventId = seed[0]!.event_id;
+    // 预置 P0 alert 推送行（target_type='alert'，同 target_id / channel / push_date）。
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('alert', $1, 'telegram', '2000-01-01', 'success')`,
+      [eventId],
+    );
+
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      // 采集一条同 URL 条目塌缩进既有事件（collectedCount>0，避新闻真空告警），事件仍是那条已评分的。
+      collect: {
+        collectors: collectorsReturning([
+          item({ id: 'ov', url, title: 'P0 overlap rearrival' }),
+        ]),
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+      staleness: async () => [],
+    });
+    // 日报未被 alert 命名空间挡住——完整 recap 该事件并推送。
+    expect(result.outcome).toBe('pushed');
+    expect(sender.calls).toBe(1);
+
+    // 同一 target_id 下 alert 与 event 各一行、各自 success——两命名空间互不吞。
+    const { rows } = await pool!.query<{ target_type: string; status: string }>(
+      `SELECT target_type, status FROM push_records
+        WHERE target_id=$1 AND channel='telegram' AND push_date='2000-01-01'
+        ORDER BY target_type`,
+      [eventId],
+    );
+    expect(rows).toEqual([
+      { target_type: 'alert', status: 'success' },
+      { target_type: 'event', status: 'success' },
+    ]);
+  });
+
+  it('4.5 断路器：digest 段 headline 失败率超阈仍熔断（stage=digest、denom=Top N、不推）', async () => {
+    // judge 全过（大分母、0 降级）；两条候选的 headline 生成全失败（digest 分母 2、降级 2 = 1.0 > 0.5）。
+    // 换成轻量 headline 路径后，「逐条失败」= headline 失败——熔断 denominator/阈值/抛错口径不变。
+    const items = [
+      item({ id: 'cb1', url: 'https://ex.com/cb1', title: 'break one' }),
+      item({ id: 'cb2', url: 'https://ex.com/cb2', title: 'break two' }),
+    ];
+    const sender = okSender();
+    const alert = vi.fn();
+    const err = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      // headline 对所有 Top N 失败（failTitles 命中两条标题）→ digest 分母 2、降级 2 = 1.0 > 0.5。
+      digest: {
+        generateObjectFn: digestMock({ failTitles: new Set(['break one', 'break two']) }),
+        maxAttempts: 1,
+      },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    }).catch((e: unknown) => e);
+    // 抛错口径不变：WorkflowAbortError，stage=digest（非 judge），rate=1.0。
+    expect(err).toBeInstanceOf(WorkflowAbortError);
+    expect((err as InstanceType<typeof WorkflowAbortError>).stage).toBe('digest');
+    expect((err as InstanceType<typeof WorkflowAbortError>).rate).toBe(1);
+    // 熔断即不推残缺日报、发告警。
+    expect(sender.calls).toBe(0);
+    expect(alert).toHaveBeenCalled();
+  });
+});
+
+/**
  * runDailyWorkflow 按源陈旧度告警阶段编排集成测试（add-per-source-staleness-alert 组 B，
  * tasks 3.1/3.2/3.3 + 4.4/4.5）。陈旧度检测在系统级告警之后、judge/digest 熔断 throw 之前的
  * best-effort 阶段运行；注入 `staleness` 桩确定性控制返回陈旧源 / 抛错，断言：
