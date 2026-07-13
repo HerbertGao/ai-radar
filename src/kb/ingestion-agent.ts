@@ -56,8 +56,8 @@ export interface KbIngestionInput {
   /** 事件代表标题（必填，构成 prompt 主体）。 */
   representativeTitle: string;
   /**
-   * 事件中文摘要（可选，**不再假设已由日报 digest 预置**——digest 已降级为只产 headline_zh，
-   * summary_zh 的唯一产出点收敛到本入库阶段）。若上游（如告警链）已产则作 Agent 参考；
+   * 事件中文摘要（可选，**不再假设已由日报 digest 预置**——日报 digest 已降级为只产 headline_zh，
+   * 新闻事件的 summary_zh 改由本入库阶段生成回写）。若上游（如告警链）已为 P0 事件预置则作 Agent 参考；
    * 缺省时 Agent grounding 于 representativeTitle + content 原文自产。
    */
   summaryZh?: string | null;

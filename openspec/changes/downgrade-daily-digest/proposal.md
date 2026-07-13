@@ -7,7 +7,7 @@ Plan A Phase A4（定位见 `docs/hangar-migration-plan-a.md`「Phase A4 — 日
 ## What Changes
 
 - **日报 digest 阶段只产 `headline_zh`（日报唯一显示字段），停产 `summary_zh`**：现 `summarizeEvent` 一次 `generateObject` 同产 `summary_zh`（~1000 字，**日报不显示**、仅落库，`message.ts:11` 载明）+ `headline_zh`（一句话、日报唯一显示）。日报阶段改走**只产 headline** 的轻量路径。
-- **`summary_zh` 生成迁到 KB 入库阶段（去冗余）**：现 KB 摘要 Agent 本就对**每条已推送成功候选**跑一次（算 `long_term_value` 供准入闸、同调产 `summary_zh`），与日报 digest 的 summary 生成**重复**。降级后 `summary_zh` 唯一产出点收敛到 KB 入库：Agent grounding 原文产 `summary_zh`、**原子条件回写** `ai_news_events`（`WHERE summary_zh IS NULL`，只 gate 写回、**绝不 gate Agent 调用**）——weekly 复用 + KB grounding 不丢，净省日报那次 ~1000 字 summary 生成。
+- **`summary_zh` 生成迁到 KB 入库阶段（去冗余）**：现 KB 摘要 Agent 本就对**每条已推送成功候选**跑一次（算 `long_term_value` 供准入闸、同调产 `summary_zh`），与日报 digest 的 summary 生成**重复**。降级后**日报路径不再产 `summary_zh`**、其产出收敛到 KB 入库（告警链仍为 P0 事件另产）：Agent grounding 原文产 `summary_zh`、**原子条件回写** `ai_news_events`（`WHERE summary_zh IS NULL`，只 gate 写回、**绝不 gate Agent 调用**）——weekly 复用 + KB grounding 不丢，净省日报那次 ~1000 字 summary 生成。
 - **日报保持完整低频兜底、接受与 P0 内容重叠（不加跨命名空间去重）**：告警（`target_type='alert'`）与日报（`'event'`）是**刻意分开的幂等命名空间**（`alert-scan.ts:32`「日报已推同一事件不吞掉告警」），日报本就会 recap 已 P0 的事件。本变更**沿用**此现状、不加去重——日报=完整低频兜底、P0=即时高价值。（放弃计划早稿「不与 P0 重叠」DoD——该 DoD 建立在「P0 自动去重」的**错误前提**上。）
 - **断路器结构不变**：digest 阶段仍是熔断 abort-ratio 的 denominator（阶段/分母 = Top-N/阈值/抛错口径全不动）；只是该段所测的**逐条调用从「summary+headline」变轻为「仅 headline」**——「中文摘要阶段逐条失败」语义照旧成立（headline 亦 `summary_zh` 契约里的中文摘要字段），故 `daily-intel-pipeline` 规范**无需改动**。
 
@@ -30,7 +30,7 @@ Plan A Phase A4（定位见 `docs/hangar-migration-plan-a.md`「Phase A4 — 日
 
 - **改动代码**：`src/agents/digest/`（新增 headline-only 路径）、`src/pipeline/run-daily-workflow.ts`（digest 阶段改调 headline-only 路径）、`src/kb/`（入库 grounding 改原文 + `summary_zh` 回写 `ai_news_events`）。
 - **不改**：`src/push/dispatcher.ts` 幂等、双锁、`computePendingSet`、`message.ts` 渲染（日报本就只显示 `headline_zh`）、熔断结构（`daily-intel-pipeline` 规范）、`product`/`experience` 段、`alert-scan` 车道（P0 仍产 summary+headline）、时间源。
-- **成本（本质是去冗余）**：现状日报 digest（stage 5）与 KB 入库（stage 7）**各产一次 `summary_zh`**（重复）。降级后日报 digest 只产便宜的 `headline_zh`，`summary_zh` 唯一产出点收敛到 KB 入库 Agent——净省日报那次 ~1000 字 summary 生成。
+- **成本（本质是去冗余）**：现状日报 digest（stage 5）与 KB 入库（stage 7）**各产一次 `summary_zh`**（重复）。降级后日报 digest 只产便宜的 `headline_zh`，新闻事件 `summary_zh` 的产出收敛到 KB 入库 Agent（日报路径不再产；告警链 P0 另算）——净省日报那次 ~1000 字 summary 生成。
 - **weekly 覆盖降级但优雅（非严格零丢失）**：新 `summary_zh` 覆盖 **push-success**（非全 Top-N，见 design D5/D7）；Top-N-但-未推成功 / KB-Agent-失败的事件回退 `headline_zh`（digest 已产、非空）。全部 8 个 `summary_zh` 读点均 null-tolerant、代码零改（且 `WEEKLY_REPORT_ENABLED` 现为 false）。
 - **前置（软）**：A1 P0 即时推已在位——no-dedup 选择已把它从**硬**依赖降为**软**前提（日报仍完整、不自断高价值路径，故可在 P0 完全被信任前先行）。
 - **测试**：日报只显示 headline / 不产 summary_zh（确定性面：入选 event 排序不变）；KB 入库生成 summary_zh 写回（weekly 仍零 LLM 复用）；幂等回归（alert / event 各自命名空间互不吞）；断路器 headline denominator；守 VITEST 不触网、不真发。

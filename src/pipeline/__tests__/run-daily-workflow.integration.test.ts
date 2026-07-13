@@ -812,6 +812,16 @@ describe.skipIf(!canRun)('runDailyWorkflow 日报降级回归（组 C 4.2/4.4/4.
       lock: LOCK_OPTS,
       alert: vi.fn(),
       staleness: async () => [],
+      // 注入必失败的 KB 摘要 Agent：令 stage 7 KB 入库确定性地不回写 summary_zh，隔离下方
+      // 「stage 5 不写 summary_zh」断言（否则 KB agent 成功会回写、断言随 KB 桩变化而假失败）。
+      kb: {
+        agent: {
+          generateObjectFn: async () => {
+            throw new Error('KB agent 桩：本测试令 KB 不回写以隔离 stage-5 断言');
+          },
+          maxAttempts: 1,
+        },
+      },
     });
     expect(result.outcome).toBe('pushed');
     // digest 熔断分母 = Top N = 2、headline 全成功 → 0 降级（denominator/口径不因降级路径改变）。
