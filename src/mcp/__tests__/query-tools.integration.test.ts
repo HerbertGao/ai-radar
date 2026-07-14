@@ -82,6 +82,8 @@ async function seedEvent(args: {
       headlineZh: args.headlineZh ?? null,
       importanceScore: args.importance == null ? null : String(args.importance),
       publishedAt: args.publishedAt ?? null,
+      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
+      publishedAtAuthority: args.publishedAt == null ? 0 : 2,
       representativeRawItemId: args.representativeRawItemId ?? null,
       sourceCount: 1,
     })

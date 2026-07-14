@@ -89,11 +89,13 @@ async function insertWeeklyEvent(args: {
 }): Promise<string> {
   const eventId = `${EVENT_PREFIX}${args.id}`;
   await pool!.query(
+    // published_at 与 published_at_authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))。
+    // 非空日期按「程序近似值」记（2），与真实采集源同级。
     `INSERT INTO ai_news_events
        (event_id, representative_title, summary_zh, headline_zh, first_seen_at,
-        last_seen_at, published_at, importance_score, novelty_score,
+        last_seen_at, published_at, published_at_authority, importance_score, novelty_score,
         developer_relevance_score, hype_risk_score, should_push)
-     VALUES ($1,$2,$3,$4,$5,$5,$5,$6,80,80,10,$7)`,
+     VALUES ($1,$2,$3,$4,$5,$5,$5,CASE WHEN $5::timestamptz IS NULL THEN 0 ELSE 2 END,$6,80,80,10,$7)`,
     [
       eventId,
       args.title,

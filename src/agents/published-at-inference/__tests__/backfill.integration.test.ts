@@ -86,10 +86,13 @@ async function seedEvent(args: {
   );
   const rawId = BigInt(rawRows[0]!.id);
   const { rows: evtRows } = await pool!.query<{ event_id: string }>(
+    // published_at 与 published_at_authority 同写（CHECK）；seed 的非空日期记 2（程序近似值），
+    // 1 是 AI 回填专属——由被测的 backfill 自己写。
     `INSERT INTO ai_news_events
        (dedup_key, representative_raw_item_id, representative_title,
-        first_seen_at, published_at, should_push, importance_score)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING event_id`,
+        first_seen_at, published_at, published_at_authority, should_push, importance_score)
+     VALUES ($1, $2, $3, $4, $5, CASE WHEN $5::timestamptz IS NULL THEN 0 ELSE 2 END, $6, $7)
+     RETURNING event_id`,
     [
       `dk-${sid}`,
       rawId,

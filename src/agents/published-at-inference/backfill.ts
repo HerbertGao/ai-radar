@@ -241,7 +241,11 @@ export async function backfillPublishedAt(
       try {
         const updated = await dbh
           .update(aiNewsEvents)
-          .set({ publishedAt: new Date(inferred) })
+          // authority=1（LLM 推断）：低于任何程序取得的值（rss/hn/github 的 2、sitemap 页面提取的 3）。
+          // 推断值是猜的，故后到的真实时间戳必须能覆盖它——精确事实由程序与 DB 保障，绝不交 LLM。
+          // 且 published_at 与 authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))
+          // 会让任何只写其一的路径当场违约。
+          .set({ publishedAt: new Date(inferred), publishedAtAuthority: 1 })
           .where(
             and(
               eq(aiNewsEvents.eventId, candidate.eventId),

@@ -76,9 +76,11 @@ async function seedEvent(args: {
 }): Promise<string> {
   const summaryZh = 'summaryZh' in args ? args.summaryZh : 'seed 摘要';
   const { rows } = await pool!.query<{ event_id: string }>(
+    // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
     `INSERT INTO ai_news_events
-       (dedup_key, representative_title, summary_zh, first_seen_at, last_seen_at, published_at, merged_into)
-     VALUES ($1, $2, $3, now(), now(), $4, $5)
+       (dedup_key, representative_title, summary_zh, first_seen_at, last_seen_at, published_at,
+        published_at_authority, merged_into)
+     VALUES ($1, $2, $3, now(), now(), $4, CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 2 END, $5)
      RETURNING event_id`,
     [args.dedupKey, args.title, summaryZh, args.publishedAt ?? null, args.mergedInto ?? null],
   );

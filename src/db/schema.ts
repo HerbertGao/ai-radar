@@ -24,6 +24,7 @@ import {
   bigint,
   bigserial,
   boolean,
+  check,
   customType,
   date,
   index,
@@ -31,6 +32,7 @@ import {
   jsonb,
   numeric,
   pgTable,
+  smallint,
   text,
   timestamp,
   unique,
@@ -145,6 +147,15 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
   // 代表 raw_item 的发布时间，供 Top N 排序 tiebreaker（published_at DESC NULLS LAST）。
   publishedAt: timestamp('published_at', { withTimezone: true }),
+  // published_at 的可信度等级。塌缩与语义合并按「权威高者胜出」归集，绝不是先到者胜出——
+  // 各源的 published_at 语义不同，只有 sitemap 的页面提取值才是文章自己印的发布日：
+  //   0 = 无日期（不变量：published_at IS NULL ⟺ authority = 0，由下方 CHECK 兜底）
+  //   1 = LLM 推断（published-at-inference 的 AI 回填——它是猜的，故低于任何程序取得的值：
+  //       精确事实由程序与 DB 保障、绝不交 LLM，一个幻觉不得挡住一个真实时间戳）
+  //   2 = 程序取得的近似值（rss 的 pubDate / hacker_news 的投稿时刻 / github 的 push 时刻——
+  //       是真实时间戳，但都不是文章发布日）
+  //   3 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取，全系统唯一的真发布日）
+  publishedAtAuthority: smallint('published_at_authority').notNull().default(0),
   sourceCount: integer('source_count').default(1),
   importanceScore: numeric('importance_score', { precision: 5, scale: 2 }),
   noveltyScore: numeric('novelty_score', { precision: 5, scale: 2 }),
@@ -176,6 +187,13 @@ export const aiNewsEvents = pgTable('ai_news_events', {
 }, (table) => [
   // 硬去重塌缩的 ON CONFLICT 冲突目标（design D1/D3）。
   unique('ai_news_events_dedup_key_key').on(table.dedupKey),
+  // published_at 与其权威等级必须同生同灭：任何只写 published_at 而不写 authority 的
+  // 写路径（塌缩 INSERT / ON CONFLICT / 语义合并 / AI 回填 CAS / 测试 seed）会在此当场违约。
+  // 这正是要的效果——authority 若被默默留在 0，「权威高者胜出」的归集会静默退化成先到者胜出。
+  check(
+    'ai_news_events_published_at_authority_check',
+    sql`(${table.publishedAt} IS NULL) = (${table.publishedAtAuthority} = 0)`,
+  ),
 ]);
 
 /**

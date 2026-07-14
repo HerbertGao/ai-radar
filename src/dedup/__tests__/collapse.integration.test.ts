@@ -84,11 +84,12 @@ async function fetchEventByDedupKey(dedupKey: string) {
     representative_title: string | null;
     first_seen_at: Date | null;
     published_at: Date | null;
+    published_at_authority: number;
     last_seen_at: Date | null;
     source_count: number;
   }>(
     `SELECT event_id, representative_raw_item_id, representative_title,
-            first_seen_at, published_at, last_seen_at, source_count
+            first_seen_at, published_at, published_at_authority, last_seen_at, source_count
      FROM ai_news_events WHERE dedup_key = $1`,
     [dedupKey],
   );
@@ -141,6 +142,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
 
     const out1 = await collapseRawItem({
       id: id1,
+      source: 'rss',
       url: 'https://example.com/news/a?utm_source=tw&id=1',
       title: 'First representative title',
       publishedAt: pub1,
@@ -148,6 +150,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     }, db!);
     const out2 = await collapseRawItem({
       id: id2,
+      source: 'rss',
       url: 'https://example.com/news/a?id=1&ref=hn&spm=x',
       title: 'Second arrival title',
       publishedAt: pub2,
@@ -207,15 +210,15 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       title: 'Anchor title',
       publishedAt: pub,
     });
-    const first = await collapseRawItem({ id: id1, url, title: 'Anchor title', publishedAt: pub, fetchedAt: new Date() }, db!);
+    const first = await collapseRawItem({ id: id1, source: 'rss', url, title: 'Anchor title', publishedAt: pub, fetchedAt: new Date() }, db!);
     const before = (await fetchEventByDedupKey(first.dedupKey!))[0]!;
 
     // 再来两条同 URL（不同发布时间/标题），断言不覆盖首建值。
     const id2 = await seedRawItem({ sourceItemId: `stable-2-${ts}`, url, title: 'Later A', publishedAt: new Date('2026-05-09T00:00:00Z') });
     const id3 = await seedRawItem({ sourceItemId: `stable-3-${ts}`, url, title: 'Later B', publishedAt: new Date('2026-05-10T00:00:00Z') });
     await collapseRawItems([
-      { id: id2, url, title: 'Later A', publishedAt: new Date('2026-05-09T00:00:00Z'), fetchedAt: new Date() },
-      { id: id3, url, title: 'Later B', publishedAt: new Date('2026-05-10T00:00:00Z'), fetchedAt: new Date() },
+      { id: id2, source: 'rss', url, title: 'Later A', publishedAt: new Date('2026-05-09T00:00:00Z'), fetchedAt: new Date() },
+      { id: id3, source: 'rss', url, title: 'Later B', publishedAt: new Date('2026-05-10T00:00:00Z'), fetchedAt: new Date() },
     ], db!);
 
     const after = (await fetchEventByDedupKey(first.dedupKey!))[0]!;
@@ -237,7 +240,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       title: '🚀🚀！！！',
     publishedAt: null,
     });
-    const out = await collapseRawItem({ id, url: null, title: '🚀🚀！！！', publishedAt: null, fetchedAt: new Date() }, db!);
+    const out = await collapseRawItem({ id, source: 'rss', url: null, title: '🚀🚀！！！', publishedAt: null, fetchedAt: new Date() }, db!);
 
     expect(out.unprocessable).toBe(true);
     expect(out.dedupKey).toBeNull();
@@ -260,7 +263,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     const ts = Date.now();
     const title = `OpenAI 发布新模型 ${ts}`;
     const id = await seedRawItem({ sourceItemId: `titlefallback-${ts}`, url: null, title, publishedAt: null });
-    const out = await collapseRawItem({ id, url: null, title, publishedAt: null, fetchedAt: new Date() }, db!);
+    const out = await collapseRawItem({ id, source: 'rss', url: null, title, publishedAt: null, fetchedAt: new Date() }, db!);
 
     expect(out.unprocessable).toBe(false);
     expect(out.dedupKey).not.toBeNull();
@@ -415,7 +418,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       },
     }) as Db;
 
-    await expect(collapseRawItem({ id, url, title: 'Atomic rollback title', publishedAt: null, fetchedAt: new Date() }, dbhProxy)).rejects.toThrow(/markCollapsed boom/);
+    await expect(collapseRawItem({ id, source: 'rss', url, title: 'Atomic rollback title', publishedAt: null, fetchedAt: new Date() }, dbhProxy)).rejects.toThrow(/markCollapsed boom/);
 
     // 回滚后：raw_items.collapsed 仍 false（下轮可被重扫补塌缩）。
     const { rows: flagRows } = await pool!.query<{ collapsed: boolean }>(
@@ -431,7 +434,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     expect(rows).toHaveLength(0);
 
     // 正常路径重做（真实 db）：事务提交后 collapsed=true 且 source_count=1。
-    const out = await collapseRawItem({ id, url, title: 'Atomic rollback title', publishedAt: null, fetchedAt: new Date() }, db!);
+    const out = await collapseRawItem({ id, source: 'rss', url, title: 'Atomic rollback title', publishedAt: null, fetchedAt: new Date() }, db!);
     expect(out.unprocessable).toBe(false);
     rows = await fetchEventByDedupKey(out.dedupKey!);
     expect(rows).toHaveLength(1);
@@ -609,7 +612,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       publishedAt: null,
     });
     const first = await collapseRawItem(
-      { id: id1, url, title: 'Null-first title', publishedAt: null, fetchedAt: new Date() },
+      { id: id1, source: 'rss', url, title: 'Null-first title', publishedAt: null, fetchedAt: new Date() },
       db!,
     );
     const dedupKey = first.dedupKey!;
@@ -627,7 +630,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       publishedAt: knownPub,
     });
     await collapseRawItem(
-      { id: id2, url, title: 'Dated arrival title', publishedAt: knownPub, fetchedAt: new Date() },
+      { id: id2, source: 'rss', url, title: 'Dated arrival title', publishedAt: knownPub, fetchedAt: new Date() },
       db!,
     );
 
@@ -667,7 +670,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       publishedAt: d1,
     });
     const first = await collapseRawItem(
-      { id: id1, url, title: 'Dated-first title', publishedAt: d1, fetchedAt: new Date() },
+      { id: id1, source: 'rss', url, title: 'Dated-first title', publishedAt: d1, fetchedAt: new Date() },
       db!,
     );
     const dedupKey = first.dedupKey!;
@@ -682,7 +685,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
       publishedAt: d2,
     });
     await collapseRawItem(
-      { id: id2, url, title: 'Different-date arrival', publishedAt: d2, fetchedAt: new Date() },
+      { id: id2, source: 'rss', url, title: 'Different-date arrival', publishedAt: d2, fetchedAt: new Date() },
       db!,
     );
 
@@ -691,10 +694,124 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     expect(after.published_at?.toISOString()).toBe(before.published_at?.toISOString());
     // 显式断言不等于后到的 D2（证明确实未被覆盖）。
     expect(after.published_at?.toISOString()).not.toBe(d2.toISOString());
+    // 两条都是程序近似值（authority=2）⇒ 同权威不覆盖 ⇒ 先到者胜出，行为与引入 authority 前一致。
+    expect(after.published_at_authority).toBe(2);
     // 身份/代表/first_seen 仍冻结，source_count 累加为 2。
     expect(after.representative_raw_item_id).toBe(id1.toString());
     expect(after.representative_title).toBe('Dated-first title');
     expect(Number(after.source_count)).toBe(2);
+  });
+
+  it('HN 先到（投稿时刻，authority=2）+ sitemap 后到（页面提取，authority=3）→ 精确日期覆盖近似值', async () => {
+    // 复刻生产里的真实交错：Anthropic 官宣几分钟内上 HN，sitemap 采集滞后。
+    // HN 的 published_at 是【投稿到 HN 的时刻】、不是文章发布日；sitemap 从文章页提取的才是。
+    // 单向 NULL-fill（COALESCE）下先到者永久胜出 ⇒ 精确日期被丢弃 ⇒ 本能力对重大发布静默失效。
+    const ts = Date.now();
+    const url = `https://www.anthropic.com/news/authority-${ts}`;
+    const hnSubmittedAt = new Date('2026-06-30T17:59:52Z'); // HN 投稿时刻（近似）
+    const pageExtracted = new Date('2026-06-30T00:00:00Z'); // 文章页面上印的发布日（精确）
+
+    const idHn = await seedRawItem({
+      sourceItemId: `authority-hn-${ts}`,
+      url,
+      title: 'Anthropic announcement (via HN)',
+      publishedAt: hnSubmittedAt,
+    });
+    const first = await collapseRawItem(
+      {
+        id: idHn,
+        source: 'hacker_news',
+        url,
+        title: 'Anthropic announcement (via HN)',
+        publishedAt: hnSubmittedAt,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+    const dedupKey = first.dedupKey!;
+
+    const beforeRow = (await fetchEventByDedupKey(dedupKey))[0]!;
+    expect(beforeRow.published_at?.toISOString()).toBe(hnSubmittedAt.toISOString());
+    expect(beforeRow.published_at_authority).toBe(2); // 程序近似值
+
+    // sitemap 后到，同一 canonical_url ⇒ 同一 dedup_key ⇒ 塌缩进同一事件。
+    const idSitemap = await seedRawItem({
+      sourceItemId: `authority-sitemap-${ts}`,
+      url,
+      title: 'Anthropic announcement (via sitemap)',
+      publishedAt: pageExtracted,
+    });
+    await collapseRawItem(
+      {
+        id: idSitemap,
+        source: 'sitemap',
+        url,
+        title: 'Anthropic announcement (via sitemap)',
+        publishedAt: pageExtracted,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+
+    const afterRow = (await fetchEventByDedupKey(dedupKey))[0]!;
+    // 页面提取（3）> 程序近似（2）⇒ 覆盖。这一条断言若红，整个能力对重大发布就是 no-op。
+    expect(afterRow.published_at_authority).toBe(3);
+    expect(afterRow.published_at?.toISOString()).toBe(pageExtracted.toISOString());
+    expect(afterRow.published_at?.toISOString()).not.toBe(hnSubmittedAt.toISOString());
+    // 身份/代表/first_seen 仍冻结（只有 published_at 被更权威的值覆盖）。
+    expect(afterRow.representative_raw_item_id).toBe(idHn.toString());
+    expect(afterRow.representative_title).toBe('Anthropic announcement (via HN)');
+    expect(Number(afterRow.source_count)).toBe(2);
+  });
+
+  it('sitemap 先到（authority=3）+ HN 后到（authority=2）→ 精确日期【不】被近似值降级', async () => {
+    const ts = Date.now();
+    const url = `https://www.anthropic.com/news/authority-rev-${ts}`;
+    const pageExtracted = new Date('2026-06-20T00:00:00Z');
+    const hnSubmittedAt = new Date('2026-06-21T09:30:00Z');
+
+    const idSitemap = await seedRawItem({
+      sourceItemId: `authority-rev-sitemap-${ts}`,
+      url,
+      title: 'Announcement (sitemap first)',
+      publishedAt: pageExtracted,
+    });
+    const first = await collapseRawItem(
+      {
+        id: idSitemap,
+        source: 'sitemap',
+        url,
+        title: 'Announcement (sitemap first)',
+        publishedAt: pageExtracted,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+    const dedupKey = first.dedupKey!;
+
+    const idHn = await seedRawItem({
+      sourceItemId: `authority-rev-hn-${ts}`,
+      url,
+      title: 'Announcement (HN second)',
+      publishedAt: hnSubmittedAt,
+    });
+    await collapseRawItem(
+      {
+        id: idHn,
+        source: 'hacker_news',
+        url,
+        title: 'Announcement (HN second)',
+        publishedAt: hnSubmittedAt,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+
+    const row = (await fetchEventByDedupKey(dedupKey))[0]!;
+    // 低权威的后到者不得覆盖高权威的已设值（GREATEST 保证 authority 单调不降）。
+    expect(row.published_at_authority).toBe(3);
+    expect(row.published_at?.toISOString()).toBe(pageExtracted.toISOString());
+    expect(Number(row.source_count)).toBe(2);
 
     await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${dedupKey}`);
   });

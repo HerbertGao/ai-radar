@@ -62,9 +62,12 @@ async function seedEvent(args: {
   publishedAt?: Date | null;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
+    // published_at 与 published_at_authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))
+    // 会让任何只写其一的 seed 当场违约。非空日期按「程序近似值」记（2），与真实采集源同级。
     `INSERT INTO ai_news_events
-       (dedup_key, representative_title, first_seen_at, last_seen_at, source_count, published_at, embedding)
-     VALUES ($1, $2, $3, $3, $4, $5, $6::vector)
+       (dedup_key, representative_title, first_seen_at, last_seen_at, source_count, published_at,
+        published_at_authority, embedding)
+     VALUES ($1, $2, $3, $3, $4, $5, CASE WHEN $5::timestamptz IS NULL THEN 0 ELSE 2 END, $6::vector)
      RETURNING event_id`,
     [
       args.dedupKey,
@@ -181,7 +184,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
     const url = `https://example.com/reroute-${ts}`;
     // 先正常塌缩出事件 B（被吞者），记其 dedup_key。
     const bId = await collapseRawItem(
-      { id: await seedRaw(`reroute-b-${ts}`, url), url, title: 'Event B title', publishedAt: null, fetchedAt: new Date('2026-06-05T00:00:00Z') },
+      { id: await seedRaw(`reroute-b-${ts}`, url), url, source: 'rss', title: 'Event B title', publishedAt: null, fetchedAt: new Date('2026-06-05T00:00:00Z') },
       db!,
     );
     const bDedupKey = bId.dedupKey!;
@@ -209,7 +212,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
 
     // 后到一条同 url（同 dedup_key 命中 B 的 tombstone）的新 raw_item：改投存活者 A、仅 +1、不新建重复、不动 B。
     const out = await collapseRawItem(
-      { id: await seedRaw(`reroute-b2-${ts}`, url), url, title: 'Event B title (dup)', publishedAt: null, fetchedAt: new Date() },
+      { id: await seedRaw(`reroute-b2-${ts}`, url), url, source: 'rss', title: 'Event B title (dup)', publishedAt: null, fetchedAt: new Date() },
       db!,
     );
     expect(out.dedupKey).toBe(bDedupKey); // 同 dedup_key 命中 B（tombstone）
@@ -231,7 +234,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
     const urlB = `https://example.com/chain-b-${ts}`;
     // B：塌缩出，记 dedup_key。
     const bOut = await collapseRawItem(
-      { id: await seedRaw(`chain-b-${ts}`, urlB), url: urlB, title: 'Chain B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
+      { id: await seedRaw(`chain-b-${ts}`, urlB), url: urlB, source: 'rss', title: 'Chain B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
       db!,
     );
     const bDedupKey = bOut.dedupKey!;
@@ -252,7 +255,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
     const cBefore = Number((await fetchEvent(cId))!.source_count);
     // 后到命中 B 的 dedup_key 的 raw_item：必须改投到**终态 C**（沿 B→A→C 链解析），不停在 tombstone A。
     await collapseRawItem(
-      { id: await seedRaw(`chain-b2-${ts}`, urlB), url: urlB, title: 'Chain B dup', publishedAt: null, fetchedAt: new Date() },
+      { id: await seedRaw(`chain-b2-${ts}`, urlB), url: urlB, source: 'rss', title: 'Chain B dup', publishedAt: null, fetchedAt: new Date() },
       db!,
     );
     const c = await fetchEvent(cId);
@@ -334,7 +337,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
       const ts = Date.now();
       const urlB = `https://example.com/concur1-b-${ts}`;
       const bOut = await collapseRawItem(
-        { id: await seedRaw(`concur1-b-${ts}`, urlB), url: urlB, title: 'Concur1 B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
+        { id: await seedRaw(`concur1-b-${ts}`, urlB), url: urlB, source: 'rss', title: 'Concur1 B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
         db!,
       );
       const bDedupKey = bOut.dedupKey!;
@@ -345,7 +348,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
       await mergeEvents(aId, bEventId, { cosineSim: 0.99, tier: 'high-auto', logProvenance: () => {} }, db!);
       // 塌缩后：命中 B 的 tombstone 改投 A（+1 → 3）；B 不被改。
       await collapseRawItem(
-        { id: await seedRaw(`concur1-b2-${ts}`, urlB), url: urlB, title: 'Concur1 B dup', publishedAt: null, fetchedAt: new Date() },
+        { id: await seedRaw(`concur1-b2-${ts}`, urlB), url: urlB, source: 'rss', title: 'Concur1 B dup', publishedAt: null, fetchedAt: new Date() },
         db!,
       );
       const a = await fetchEvent(aId);
@@ -359,7 +362,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
       const ts = Date.now() + 1;
       const urlB = `https://example.com/concur2-b-${ts}`;
       const bOut = await collapseRawItem(
-        { id: await seedRaw(`concur2-b-${ts}`, urlB), url: urlB, title: 'Concur2 B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
+        { id: await seedRaw(`concur2-b-${ts}`, urlB), url: urlB, source: 'rss', title: 'Concur2 B', publishedAt: null, fetchedAt: new Date('2026-06-10T00:00:00Z') },
         db!,
       );
       const bDedupKey = bOut.dedupKey!;
@@ -368,7 +371,7 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
       const aId = await seedEvent({ dedupKey: `${SOURCE}-concur2-a-${ts}`, title: 'Concur2 A', firstSeenAt: new Date('2026-06-01T00:00:00Z'), sourceCount: 1 });
       // 塌缩先：B 尚未 tombstone，命中 B（非 tombstone）→ 正常 DO UPDATE B.sc = 1+1 = 2。
       await collapseRawItem(
-        { id: await seedRaw(`concur2-b2-${ts}`, urlB), url: urlB, title: 'Concur2 B dup', publishedAt: null, fetchedAt: new Date() },
+        { id: await seedRaw(`concur2-b2-${ts}`, urlB), url: urlB, source: 'rss', title: 'Concur2 B dup', publishedAt: null, fetchedAt: new Date() },
         db!,
       );
       expect(Number((await fetchEvent(bEventId))!.source_count)).toBe(2);

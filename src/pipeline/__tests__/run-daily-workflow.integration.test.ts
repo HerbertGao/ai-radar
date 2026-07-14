@@ -866,11 +866,13 @@ describe.skipIf(!canRun)('runDailyWorkflow 日报降级回归（组 C 4.2/4.4/4.
     const { sha256Hex, normalizeUrl } = await import('../../dedup/normalize.js');
     const dedupKey = sha256Hex(normalizeUrl(url)!);
     const { rows: seed } = await pool!.query<{ event_id: string }>(
+      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
       `INSERT INTO ai_news_events
          (dedup_key, representative_title, representative_raw_item_id, should_push,
           importance_score, novelty_score, developer_relevance_score, hype_risk_score,
-          first_seen_at, published_at, is_ai_related, source_count)
-       VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,true,1) RETURNING event_id`,
+          first_seen_at, published_at, published_at_authority, is_ai_related, source_count)
+       VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,
+               CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 2 END,true,1) RETURNING event_id`,
       [
         dedupKey,
         `${TITLE_MARKER} P0 overlap event`,

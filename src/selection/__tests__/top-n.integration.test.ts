@@ -55,11 +55,13 @@ async function seedEvent(args: {
   isAiRelated?: boolean | null;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
+    // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
     `INSERT INTO ai_news_events
        (dedup_key, representative_title, summary_zh, should_push,
         importance_score, novelty_score, developer_relevance_score, hype_risk_score,
-        first_seen_at, published_at, is_ai_related, source_count)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1)
+        first_seen_at, published_at, published_at_authority, is_ai_related, source_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+             CASE WHEN $10::timestamptz IS NULL THEN 0 ELSE 2 END,$11,1)
      RETURNING event_id`,
     [
       `${PREFIX}${args.key}`,
