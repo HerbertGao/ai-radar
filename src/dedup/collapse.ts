@@ -88,16 +88,32 @@ export function derivePublishedAtAuthority(
   publishedAt: Date | null | undefined,
 ): 0 | 1 | 2 {
   if (publishedAt == null) return 0;
-  return PAGE_EXTRACTED_SOURCES[source] ? 2 : 1;
+  // `=== true` 而非 truthy 判定：`toCollectorSource` 会把 DB 里的任意字符串 cast 成 CollectorSource，
+  // 类型系统自此不再兜底。而 `PAGE_EXTRACTED_SOURCES['toString']` 取到的是原型链上的**函数**——
+  // truthy ⇒ 未知源会拿到「页面提取」的覆盖权，恰好在这道守卫要防的那一类上失效。
+  return isPageExtractedSource(source) ? 2 : 1;
+}
+
+/** 该 source 是否为页面确定性提取源。**只认自有属性**（原型链上的 toString/constructor 等不算）。 */
+function isPageExtractedSource(source: string): boolean {
+  return (
+    Object.hasOwn(PAGE_EXTRACTED_SOURCES, source) &&
+    PAGE_EXTRACTED_SOURCES[source as CollectorSource] === true
+  );
 }
 
 /**
  * DB 读出口的边界收敛：`raw_items.source` 是 `varchar(64)` ⇒ drizzle 给 `string`，而权威推导要
- * `CollectorSource`。未知值记一行错误日志（防拼写错静默降级），随后按非页面提取档处理
- * （`PAGE_EXTRACTED_SOURCES[未知]` 为 undefined ⇒ 落 1）——安全侧，不会凭空获得覆盖权。
+ * `CollectorSource`。未知值记一行错误日志（防拼写错静默降级），随后按非页面提取档处理（落 1）
+ * ——安全侧，不会凭空获得覆盖权。
+ *
+ * 日志按 source **去重**：一批塌缩里若有 1000 条同一未知源，只应刷一行、不是一千行。
  */
+const warnedUnknownSources = new Set<string>();
+
 function toCollectorSource(source: string): CollectorSource {
-  if (!(source in PAGE_EXTRACTED_SOURCES)) {
+  if (!Object.hasOwn(PAGE_EXTRACTED_SOURCES, source) && !warnedUnknownSources.has(source)) {
+    warnedUnknownSources.add(source);
     console.error(
       `[collapse] 未知的 raw_items.source「${source}」：按「非页面提取」档（authority=1）处理。` +
         `新增采集源必须在 PAGE_EXTRACTED_SOURCES 显式登记，否则其页面提取日期会被静默降级。`,

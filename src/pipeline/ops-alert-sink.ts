@@ -44,6 +44,8 @@ import { createTelegramSender } from '../push/telegram.js';
 import {
   escapeLarkMdText,
   escapeMarkdownV2,
+  MAX_MESSAGE_LENGTH,
+  truncateByCodePoint,
   type FeishuCard,
 } from '../push/message.js';
 import { getPushDate } from '../push/push-date.js';
@@ -75,6 +77,9 @@ const ALERT_TITLE = '⚠️ AI Radar 运维告警';
 
 /** 单个 detail 字段值的展示上限（防超长 error stack / 大对象撑爆一条告警）。 */
 const DETAIL_VALUE_MAX = 200;
+
+/** Error 的 cause 链最多展开几层（防自引用/深链把消息撑爆）。 */
+const CAUSE_CHAIN_MAX = 3;
 
 /** 认领失败（DB 异常）时附在消息尾部的显式声明——收到的人必须知道这条没经过去重。 */
 const RATE_LIMIT_UNAVAILABLE = '限频不可用（DB 异常）：本条未经 push_records 去重，同日可能重复。';
@@ -114,11 +119,27 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
   }
 }
 
-/** detail 字段值的展示串（Error 取 message；对象 JSON 化；一律截断）。 */
+/**
+ * Error 的展示串——**必须沿 `cause` 链走**，否则告警正文里不会出现真正的故障原因。
+ *
+ * drizzle 把查询错误包成 `DrizzleQueryError`，其 `.message` 是 `Failed query: <SQL>\nparams: …`，
+ * 而**真正的原因（`connect ECONNREFUSED …` / `password authentication failed …`）住在 `.cause`**。
+ * 只取 `.message` 的话，「产品中文化待处理查询失败（系统故障可观测，如 DB 断连）」这条告警发出去的
+ * 正文就是一段 SQL 前缀，一个字都没提数据库连不上——那条告警存在的全部理由就在 `.cause` 里。
+ *
+ * （已实测：pg / drizzle 的 message 与 cause 均**不含** DSN 或口令，故沿链外发无凭据泄漏风险。）
+ */
+function formatError(e: Error, depth = 0): string {
+  const head = `${e.name}: ${e.message}`;
+  if (depth >= CAUSE_CHAIN_MAX || !(e.cause instanceof Error)) return head;
+  return `${head} | cause: ${formatError(e.cause, depth + 1)}`;
+}
+
+/** detail 字段值的展示串（Error 沿 cause 链；对象 JSON 化；一律按 code point 截断）。 */
 function formatDetailValue(v: unknown): string {
   const s =
     v instanceof Error
-      ? v.message
+      ? formatError(v)
       : typeof v === 'object' && v !== null
         ? (() => {
             try {
@@ -128,7 +149,8 @@ function formatDetailValue(v: unknown): string {
             }
           })()
         : String(v);
-  return s.length <= DETAIL_VALUE_MAX ? s : `${s.slice(0, DETAIL_VALUE_MAX - 1)}…`;
+  // 按 code point 截断（复用 push/message.ts 的既有实现）：裸 .slice 会把 emoji 截成孤儿代理对。
+  return truncateByCodePoint(s, DETAIL_VALUE_MAX);
 }
 
 /** 把 detail 摘要成正文行（dedupKey 放最后一行，其余字段按声明序）。 */
@@ -152,7 +174,13 @@ function detailLines(detail: AlertDetail): string[] {
  *   正文经 `escapeLarkMdText`。
  */
 function renderAlert(channel: Channel, lines: readonly string[]): string {
-  const body = lines.join('\n');
+  // 截断必须在转义【之前】、按 code point——escapeMarkdownV2 最坏近乎翻倍（每个保留字前加 `\`），
+  // 先转义再截会把反斜杠截在半路；裸 .slice 又会把 emoji 截成孤儿代理对。两条都是 push/message.ts
+  // 早就踩过并写进注释的坑（`MAX_MESSAGE_LENGTH` 保守取 4000，正是「留余量给 Markdown 转义」）。
+  const body = truncateByCodePoint(
+    lines.join('\n'),
+    MAX_MESSAGE_LENGTH - [...ALERT_TITLE].length - 1,
+  );
   switch (channel) {
     case 'telegram':
       return escapeMarkdownV2(`${ALERT_TITLE}\n${body}`);
@@ -316,20 +344,36 @@ async function setStatus(
  */
 export function buildOpsAlertSink(
   senders?: Partial<Record<Channel, MessageSender>>,
+  now?: () => Date,
 ): AlertSink {
-  if (senders) return createOpsAlertSink({ senders });
+  if (senders) return createOpsAlertSink({ senders, ...(now ? { now } : {}) });
 
   let sink: AlertSink | undefined;
-  return (message, detail) => (sink ??= buildProductionSink())(message, detail);
+  return (message, detail) => {
+    // 惰性构造【必须】兜底：createOpsAlertSink 内部每一层都有 catch（认领 / 发送 / 终态写库），
+    // 唯独构造本身没有。sender 工厂抛错时 throw 会直接穿到调用方——而 product-digest 的
+    // `await alert(...)` 就在 catch 里、其契约是「整步永不向上抛」；run-daily-workflow 的三处
+    // `await alert(...)` 紧接 `throw new WorkflowAbortError(...)`，告警抛错会把熔断错误类型整个换掉。
+    // 「告警绝不向业务路径抛」这条不变量，不能因为多了一层惰性就漏一个口子。
+    if (sink === undefined) {
+      try {
+        sink = buildProductionSink(now);
+      } catch (err) {
+        console.error('[ops-alert] 装配真实通道失败，回落 stderr：', err);
+        sink = consoleAlertSink;
+      }
+    }
+    return sink(message, detail);
+  };
 }
 
 /** 按 env 装配已配置通道的真实 sender（telegram 必配、飞书可选）。 */
-function buildProductionSink(): AlertSink {
+function buildProductionSink(now?: () => Date): AlertSink {
   const senders: Partial<Record<Channel, MessageSender>> = {
     [CHANNEL.telegram]: createTelegramSender(),
   };
   if (isFeishuEnabled()) senders[CHANNEL.feishu] = createFeishuSender();
-  return createOpsAlertSink({ senders });
+  return createOpsAlertSink({ senders, ...(now ? { now } : {}) });
 }
 
 /** 供测试断言 sink 确实经 DB 限频（而非进程内状态）。 */

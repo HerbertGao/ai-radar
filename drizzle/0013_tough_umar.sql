@@ -2,6 +2,13 @@
 --
 -- ⚠️ 本迁移与【上一版镜像不兼容】——回滚必须先删约束，否则整条链路瘫痪。
 --
+-- ⚠️ 本文件在分支内被【原地改写】过（存量回填值由 2 改为 1，因权威阶梯从四级收窄为两级）。
+--    drizzle 的 journal 只记「0013 已应用」，不会因文件内容变化而重跑。故任何在改写【之前】
+--    跑过 0013 的库（本地 dev / CI 缓存），存量行会卡在 authority=2——而新阶梯里 2 = 页面提取
+--    ⇒ 那些 rss/HN 行既免疫真 sitemap 值的覆盖、又持有覆盖别人的权力。
+--    修法：`UPDATE ai_news_events SET published_at_authority = 1 WHERE published_at_authority = 2;`
+--    （或直接重建库）。生产库从未见过 0013，不受影响。
+--
 -- 下面这条 CHECK 的设计目的就是「让任何只写 published_at、不写 authority 的路径当场违约」——
 -- 而旧镜像的塌缩 INSERT 与 published-at-inference 的回填 CAS 正是这样的路径。故：
 --

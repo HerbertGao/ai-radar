@@ -1138,7 +1138,10 @@ export async function run(
       // 生产装配的运维告警出口（这里是真正的注入点——worker.ts 调的是 run(ctx)，自身不拼 options）。
       // 不注入则回落 consoleAlertSink：告警只进 stderr、没人会被叫醒。
       // 真实 sender 惰性构造（首次真告警时才装配），故本行在桩核心单测里不触发任何真实发送器构造。
-      alert: buildOpsAlertSink(),
+      //
+      // `now` 必须与工作流同源：sink 用它算 push_date（告警的当日限频键）。不转发的话，注入 now 的
+      // 运行（回补 / 演练）里工作流按注入日算 push_date、而告警行落到真实今天——两个口径分裂。
+      alert: buildOpsAlertSink(undefined, input.now ? () => input.now! : undefined),
       ...(input.now ? { now: input.now } : {}),
     });
   } catch (err) {

@@ -20,7 +20,7 @@ import type { SelectedEvent } from '../selection/top-n.js';
 import { TARGET_TYPE, type Channel, type TargetType } from './targets.js';
 
 /** Telegram 单条消息长度上限（保守取 4000，留余量给 Markdown 转义）。 */
-const MAX_MESSAGE_LENGTH = 4000;
+export const MAX_MESSAGE_LENGTH = 4000;
 
 /**
  * 代表标题渲染期截断上限（单一常量，含省略号，按 Unicode code point 计）。
@@ -64,7 +64,7 @@ export function escapeMarkdownV2Url(url: string): string {
  * 按 Unicode code point 截断（用 [...str] 展开，非 .slice 的 UTF-16 code unit，防中文/emoji 截半）。
  * 超过 max（含省略号）才截，截后保留 (max-1) 个 code point + 省略号。
  */
-function truncateByCodePoint(text: string, max: number): string {
+export function truncateByCodePoint(text: string, max: number): string {
   const cps = [...text];
   if (cps.length <= max) return text;
   return cps.slice(0, Math.max(0, max - 1)).join('') + ELLIPSIS;
