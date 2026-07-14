@@ -18,7 +18,12 @@
  */
 import { z } from 'zod';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
-import { channelEnum, TARGET_TYPE, type Channel } from '../../push/targets.js';
+import {
+  channelEnum,
+  CONTENT_TARGET_TYPES,
+  TARGET_TYPE,
+  type Channel,
+} from '../../push/targets.js';
 import { aiNewsEvents, aiProducts, pushRecords } from '../../db/schema.js';
 import { getContext } from '../context.js';
 import { getPushDate } from '../lib/push-date.js';
@@ -71,9 +76,14 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     const pushDate = getPushDate(new Date(), env.PUSH_TIMEZONE);
 
     // 1. 当日 success 的推送记录（可按 channel 过滤）。
+    //
+    // **必须按 target_type 收口到业务内容**：push_records 的幂等地基被运维告警（`ops-alert`）复用，
+    // 而运维告警不是业务推送。不过滤时，一条 ops-alert 的 success 行会让 records 非空 ⇒ 本工具
+    // 不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**，且 channels 被污染成告警的通道。
     const whereConds = [
       eq(pushRecords.pushDate, pushDate),
       eq(pushRecords.status, 'success'),
+      inArray(pushRecords.targetType, [...CONTENT_TARGET_TYPES]),
     ];
     if (channelFilter) {
       whereConds.push(eq(pushRecords.channel, channelFilter));

@@ -313,6 +313,46 @@ describe.skipIf(!canRun)('get_today_ai_digest（当日未推空路径）', () =>
       expect(text).toContain('今日尚未推送');
     }
   });
+
+  it('一条 ops-alert 的 success 行【不得】把「今日尚未推送」变成空日报（target_type 命名空间隔离）', async () => {
+    // 运维告警复用 push_records 的幂等地基（UNIQUE(target_type,target_id,channel,push_date)），
+    // 但它不是业务推送。查询若不按 target_type 收口，一条 ops-alert 成功记录会让 records 非空
+    // ⇒ 本工具不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**、channels 被污染成告警通道。
+    const realToday = getPushDate(new Date(), TZ);
+    const alertKey = `${SRC}ops-alert-pollution`;
+
+    await pool!.query(
+      `DELETE FROM push_records
+        WHERE push_date=$1
+          AND (target_id IN (SELECT event_id FROM ai_news_events WHERE dedup_key LIKE $2)
+            OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $3)
+            OR target_id=$4)`,
+      [realToday, `${SRC}%`, `${DOMP}%`, alertKey],
+    );
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('ops-alert', $1, 'feishu', $2, 'success')`,
+      [alertKey, realToday],
+    );
+
+    try {
+      const res = (await getTodayTool.handler({ channel: 'feishu' }, {})) as CallToolResult;
+      const dto = res.structuredContent as {
+        channels: string[];
+        events: unknown[];
+        products: unknown[];
+      };
+      const text = (res.content?.[0] as { text?: string } | undefined)?.text ?? '';
+
+      if (dto.events.length === 0 && dto.products.length === 0) {
+        // 关键：ops-alert 行存在，但业务内容仍为空 ⇒ 必须照旧报「今日尚未推送」、channels 为空。
+        expect(dto.channels).toHaveLength(0);
+        expect(text).toContain('今日尚未推送');
+      }
+    } finally {
+      await pool!.query(`DELETE FROM push_records WHERE target_id=$1`, [alertKey]);
+    }
+  });
 });
 
 describe.skipIf(!canRun)('search_ai_events（关键词/窗/分页/转义）', () => {

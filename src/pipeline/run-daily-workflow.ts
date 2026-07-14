@@ -36,6 +36,7 @@ import {
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
+import { buildOpsAlertSink, consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
 import {
   semanticMergeEvents,
   type SemanticMergeOptions,
@@ -131,10 +132,12 @@ const DEFAULT_DIGEST_LOCK_TTL_MS = 30 * 60 * 1000;
  * 告警 sink：把「系统级故障」与「降级率熔断」以可观测方式上报。
  * 默认 console.error（非静默）。生产可注入 Telegram/PagerDuty 等。
  */
-export type AlertSink = (message: string, detail?: unknown) => void;
+// AlertSink / AlertDetail 的权威定义在 ops-alert-sink（detail.dedupKey 必填，是当日限频键）。
+// 此处 re-export 保持既有 import 路径可用。
+export { type AlertDetail, type AlertSink } from './ops-alert-sink.js';
 
-const defaultAlert: AlertSink = (message, detail) =>
-  console.error(`[pipeline][ALERT] ${message}`, detail ?? '');
+// 未注入真 sink 时回落 stderr。生产装配路径（run()）注入 buildOpsAlertSink()。
+const defaultAlert: AlertSink = consoleAlertSink;
 
 /** 工作流被熔断中止时抛出的信号（编排层据此让 BullMQ job 失败/重试）。 */
 export class WorkflowAbortError extends Error {
@@ -496,7 +499,9 @@ export async function runDailyWorkflow(
     let alerted = false;
     if (sysFailure.alert) {
       console.error(`[pipeline] 告警: 系统级故障 kind=${sysFailure.kind}`);
-      alert(`系统级故障：${sysFailure.reason}`, {
+      await alert(`系统级故障：${sysFailure.reason}`, {
+        // 按 kind 分键：no-collection 与 all-unprocessable 是两种故障，同日各响一次。
+        dedupKey: `system-failure:${sysFailure.kind}`,
         kind: sysFailure.kind,
         collectedCount,
         newsProcessableCount,
@@ -528,9 +533,11 @@ export async function runDailyWorkflow(
         console.error(
           `[pipeline] 告警: 检测到 ${staleSources.length} 个陈旧源（长期零新增）`,
         );
-        alert(
+        // 单键：本判定每天只跑一次（日报链内），一条消息已列出全部陈旧源。
+        // 与 `source-health:<source>` 不同——那是【单源采集失败】的即时告警，天然按源分键。
+        await alert(
           `按源陈旧度告警：${staleSources.length} 个源长期零新增\n${lines}`,
-          { staleSources },
+          { dedupKey: 'source-staleness', staleSources },
         );
       } else {
         console.error('[pipeline] 陈旧度: 全部待监控源新鲜，无陈旧告警');
@@ -638,9 +645,10 @@ export async function runDailyWorkflow(
       console.error(
         `[pipeline] 熔断: Value Judge 降级率超阈值，中止流水线`,
       );
-      alert(
+      // 必须 await：紧接着 throw，不等则告警是个游离 Promise、job 已失败、投递零完成保证。
+      await alert(
         `Value Judge 阶段降级率 ${(rate * 100).toFixed(1)}% 超阈值（${(abortRatio * 100).toFixed(0)}%），中止本次流水线。`,
-        judgeStage,
+        { dedupKey: 'degrade-abort:value-judge', ...judgeStage },
       );
       throw new WorkflowAbortError('value-judge', rate);
     }
@@ -780,9 +788,10 @@ export async function runDailyWorkflow(
     if (stageShouldAbort(digestStage, abortRatio)) {
       const rate = stageDegradeRate(digestStage)!;
       console.error(`[pipeline] 熔断: 中文摘要降级率超阈值，中止流水线`);
-      alert(
+      // 必须 await：理由同上（紧接着 throw）。
+      await alert(
         `中文摘要阶段降级率 ${(rate * 100).toFixed(1)}% 超阈值（${(abortRatio * 100).toFixed(0)}%），中止本次流水线。`,
-        digestStage,
+        { dedupKey: 'degrade-abort:digest', ...digestStage },
       );
       throw new WorkflowAbortError('digest', rate);
     }
@@ -977,7 +986,9 @@ export async function runDailyWorkflow(
       console.error(
         `[pipeline] 租约已失（锁被抢占/过期），中止本次以触发重试，避免静默漏发`,
       );
-      alert(`日报推送前租约已失（锁被抢占/过期），中止本次并触发重试。`, {
+      // 必须 await：理由同上（紧接着 throw）。
+      await alert(`日报推送前租约已失（锁被抢占/过期），中止本次并触发重试。`, {
+        dedupKey: 'digest-lease-lost',
         pushDate,
         topNCount: topN.length,
       });
@@ -1125,6 +1136,9 @@ export async function run(
   try {
     return await core({
       emit: ctx.emit,
+      // 生产装配的运维告警出口（这里是真正的注入点——worker.ts 调的是 run(ctx)，自身不拼 options）。
+      // 不注入则回落 consoleAlertSink：告警只进 stderr、没人会被叫醒。
+      alert: buildOpsAlertSink(),
       ...(input.now ? { now: input.now } : {}),
     });
   } catch (err) {

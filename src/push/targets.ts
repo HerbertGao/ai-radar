@@ -17,13 +17,21 @@
  */
 import { z } from 'zod';
 
-/** 推送目标类型枚举（权威全集）。 */
+/**
+ * 推送目标类型枚举（权威全集）。
+ *
+ * `ops-alert` 与 `alert` 分属两个命名空间：`alert` 是**业务**推送（实时重大发布告警，target_id
+ * 是 event_id）；`ops-alert` 是**运维**告警（源失效 / 熔断 / 租约失守，target_id 是 dedupKey）。
+ * 任何按 push_records 判「今日是否已推送业务内容」的查询 MUST 显式过滤 target_type——否则一条
+ * ops-alert 成功记录会被误读成「日报已发」。
+ */
 export const targetTypeEnum = z.enum([
   'event',
   'product',
   'alert',
   'weekly',
   'experience',
+  'ops-alert',
 ]);
 /** 推送通道枚举（本期权威全集）。 */
 export const channelEnum = z.enum(['telegram', 'feishu']);
@@ -40,7 +48,17 @@ export const TARGET_TYPE = {
   alert: 'alert',
   weekly: 'weekly',
   experience: 'experience',
+  'ops-alert': 'ops-alert',
 } as const satisfies Record<TargetType, TargetType>;
+
+/**
+ * 「业务推送」的 target_type 子集——凡是回答「今日的日报/产品段发了吗」的查询都 MUST 用它收口。
+ * `ops-alert` 不在其内：它是运维告警，与业务推送共用 push_records 的幂等地基，但不是业务内容。
+ */
+export const CONTENT_TARGET_TYPES = [
+  TARGET_TYPE.event,
+  TARGET_TYPE.product,
+] as const satisfies readonly TargetType[];
 
 export const CHANNEL = {
   telegram: 'telegram',
