@@ -241,8 +241,10 @@ export async function backfillPublishedAt(
       try {
         const updated = await dbh
           .update(aiNewsEvents)
-          // authority=1（LLM 推断）：低于任何程序取得的值（rss/hn/github 的 2、sitemap 页面提取的 3）。
-          // 推断值是猜的，故后到的真实时间戳必须能覆盖它——精确事实由程序与 DB 保障，绝不交 LLM。
+          // authority=1：与 rss / hacker_news / github 的日期**同档**（一切非页面确定性提取的值）。
+          // 推断值虽是猜的，但它猜的是【文章的发布日】——正是权威阶梯要排的那件事；而 HN 的投稿
+          // 时刻虽是真实时间戳，测的却是别的事件。故二者同档、互不覆盖（先到者胜出），只有 sitemap
+          // 的页面提取值（2）能覆盖它。见 schema.ts 的列注释。
           // 且 published_at 与 authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))
           // 会让任何只写其一的路径当场违约。
           .set({ publishedAt: new Date(inferred), publishedAtAuthority: 1 })

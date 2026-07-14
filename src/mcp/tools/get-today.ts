@@ -20,8 +20,8 @@ import { z } from 'zod';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import {
   channelEnum,
-  CONTENT_TARGET_TYPES,
   TARGET_TYPE,
+  TODAY_DIGEST_TARGET_TYPES,
   type Channel,
 } from '../../push/targets.js';
 import { aiNewsEvents, aiProducts, pushRecords } from '../../db/schema.js';
@@ -77,13 +77,14 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
 
     // 1. 当日 success 的推送记录（可按 channel 过滤）。
     //
-    // **必须按 target_type 收口到业务内容**：push_records 的幂等地基被运维告警（`ops-alert`）复用，
-    // 而运维告警不是业务推送。不过滤时，一条 ops-alert 的 success 行会让 records 非空 ⇒ 本工具
-    // 不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**，且 channels 被污染成告警的通道。
+    // **必须按 target_type 收口到日报两段**：push_records 的幂等地基被 alert / weekly / experience /
+    // ops-alert 共用，它们都不是日报内容。不过滤时，其中任一条 success 行都会让 records 非空 ⇒ 本工具
+    // 不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**，且 channels 被污染成那条推送的通道
+    // （见 TODAY_DIGEST_TARGET_TYPES 的排除项清单）。
     const whereConds = [
       eq(pushRecords.pushDate, pushDate),
       eq(pushRecords.status, 'success'),
-      inArray(pushRecords.targetType, [...CONTENT_TARGET_TYPES]),
+      inArray(pushRecords.targetType, [...TODAY_DIGEST_TARGET_TYPES]),
     ];
     if (channelFilter) {
       whereConds.push(eq(pushRecords.channel, channelFilter));

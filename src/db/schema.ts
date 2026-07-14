@@ -147,14 +147,21 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
   // 代表 raw_item 的发布时间，供 Top N 排序 tiebreaker（published_at DESC NULLS LAST）。
   publishedAt: timestamp('published_at', { withTimezone: true }),
-  // published_at 的可信度等级。塌缩与语义合并按「权威高者胜出」归集，绝不是先到者胜出——
-  // 各源的 published_at 语义不同，只有 sitemap 的页面提取值才是文章自己印的发布日：
+  // published_at 的权威等级。塌缩与语义合并按「权威高者胜出」归集：
   //   0 = 无日期（不变量：published_at IS NULL ⟺ authority = 0，由下方 CHECK 兜底）
-  //   1 = LLM 推断（published-at-inference 的 AI 回填——它是猜的，故低于任何程序取得的值：
-  //       精确事实由程序与 DB 保障、绝不交 LLM，一个幻觉不得挡住一个真实时间戳）
-  //   2 = 程序取得的近似值（rss 的 pubDate / hacker_news 的投稿时刻 / github 的 push 时刻——
-  //       是真实时间戳，但都不是文章发布日）
-  //   3 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取，全系统唯一的真发布日）
+  //   1 = 一切**不是页面确定性提取**的日期值：rss 的 pubDate、hacker_news / show_hn 的投稿时刻、
+  //       github 的 push 时刻、published-at-inference 的 AI 推断。**互不覆盖，先到者胜出。**
+  //   2 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取的、文章自己印的日期）。覆盖一切。
+  //
+  // 这个阶梯排的是「**这个值离【文章的发布日】有多近**」，**不是**「时间戳的来源有多可信」。
+  // 逐字登记两个反直觉事实：HN 的投稿时刻是**真实**时间戳，但它测的是**错误的事件**（谁在何时
+  // 把链接贴上了 HN）；LLM 的推断是**猜的**，但它猜的是**正确的事件**（文章何时发布）。对错误
+  // 事物的精确测量，比对正确事物的粗略估计更坏——故二者同档，谁都不许覆盖谁。
+  //
+  // 为何只有两级非空、而不在第 1 档内部再排序（**不要「优化」回去**）：任何档内排序都会引入一条
+  // 能把日期**往后推**的覆盖关系（如让 rss 转载时的今日 pubDate 覆盖 LLM 正确推断的 2023 年发布日）
+  // ⇒ 老文看起来是新的 ⇒ 过时效闸被当成今日重大发布推出去。而页面提取读的是文章自己印的日期，
+  // 结构上不可能让老文看起来新——故只有它有资格覆盖。
   publishedAtAuthority: smallint('published_at_authority').notNull().default(0),
   sourceCount: integer('source_count').default(1),
   importanceScore: numeric('importance_score', { precision: 5, scale: 2 }),

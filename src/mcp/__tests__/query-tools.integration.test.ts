@@ -82,8 +82,8 @@ async function seedEvent(args: {
       headlineZh: args.headlineZh ?? null,
       importanceScore: args.importance == null ? null : String(args.importance),
       publishedAt: args.publishedAt ?? null,
-      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
-      publishedAtAuthority: args.publishedAt == null ? 0 : 2,
+      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 1（「非页面确定性提取」档，与 rss/HN/AI 回填同级）。
+      publishedAtAuthority: args.publishedAt == null ? 0 : 1,
       representativeRawItemId: args.representativeRawItemId ?? null,
       sourceCount: 1,
     })
@@ -282,53 +282,70 @@ describe.skipIf(!canRun)('get_today_ai_digest（查已推事实）', () => {
   });
 });
 
-describe.skipIf(!canRun)('get_today_ai_digest（当日未推空路径）', () => {
-  it('当日该 channel 无 success → 空 DTO + 「今日尚未推送」文本（确定性：先清掉真实今天的本套件痕迹）', async () => {
-    // handler 内用 new Date() 取真实「今天」，无法注入固定 now。为确定性命中
-    // 「records.length===0」分支，先删掉真实今天的 push_records（不分 channel——本套件造的行
-    // 全用前缀化 target_id；这里删的是「真实今天 + 本套件前缀 target」的记录，绝不碰生产/其它日）。
-    const realToday = getPushDate(new Date(), TZ);
-    await pool!.query(
-      `DELETE FROM push_records
-        WHERE push_date=$1
-          AND (target_id IN (SELECT event_id FROM ai_news_events WHERE dedup_key LIKE $2)
-            OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $3))`,
-      [realToday, `${SRC}%`, `${DOMP}%`],
-    );
+/** 清掉「真实今天 + 本套件前缀 target」的 push_records（可另带一个字面 target_id）。 */
+async function clearTodayPushes(realToday: string, extraTargetId?: string) {
+  await pool!.query(
+    `DELETE FROM push_records
+      WHERE push_date=$1
+        AND (target_id IN (SELECT event_id FROM ai_news_events WHERE dedup_key LIKE $2)
+          OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $3)
+          OR target_id = $4)`,
+    [realToday, `${SRC}%`, `${DOMP}%`, extraTargetId ?? ''],
+  );
+}
 
-    // 用 feishu channel 过滤：本套件从不在 feishu 造 success（只 telegram），故该 channel 下
-    // 真实今天必无本套件 success。生产可能有 feishu success → 落非空分支；本断言只在空时校验文本。
+/**
+ * 前置断言：今天 feishu 上没有任何**业务**（event/product）success。
+ *
+ * 下面两条钉都以「feishu 是本套件的空通道 / 告警独有通道」为分辨力来源。若这前置不成立，断言无从
+ * 证伪——旧写法用 `if (events.length===0 && products.length===0) { …断言… }` 把它包起来，于是共享
+ * 集成库里只要有一条 feishu 业务 success，整块断言就被静默跳过、用例照样绿。守卫在它最该响的时候
+ * 哑掉就不是守卫。故改为**断言前置**：不成立就让用例红。
+ */
+async function expectNoFeishuDigestToday(realToday: string) {
+  const r = await pool!.query(
+    `SELECT 1 FROM push_records
+      WHERE push_date=$1 AND channel='feishu' AND status='success'
+        AND target_type IN ('event','product') LIMIT 1`,
+    [realToday],
+  );
+  expect(r.rowCount).toBe(0);
+}
+
+/** 取 CallToolResult 的兼容文本段。 */
+function textOf(res: CallToolResult): string {
+  return (res.content?.[0] as { text?: string } | undefined)?.text ?? '';
+}
+
+describe.skipIf(!canRun)('get_today_ai_digest（当日未推空路径）', () => {
+  it('当日该 channel 无 success → 空 DTO + 「今日尚未推送」文本', async () => {
+    // handler 内用 new Date() 取真实「今天」，无法注入固定 now → 先清掉真实今天的本套件痕迹。
+    const realToday = getPushDate(new Date(), TZ);
+    await clearTodayPushes(realToday);
+    await expectNoFeishuDigestToday(realToday);
+
     const res = (await getTodayTool.handler({ channel: 'feishu' }, {})) as CallToolResult;
-    expect(res.isError).not.toBe(true);
-    const dto = res.structuredContent as {
+    const dto = structured<{
       channels: string[];
       events: unknown[];
       products: unknown[];
-    };
-    expect(dto).toBeDefined();
-    const text = (res.content?.[0] as { text?: string } | undefined)?.text ?? '';
-    if (dto.events.length === 0 && dto.products.length === 0) {
-      // 空路径：channels 为空 + 文本含「今日尚未推送」。
-      expect(dto.channels).toHaveLength(0);
-      expect(text).toContain('今日尚未推送');
-    }
+    }>(res);
+
+    expect(dto.channels).toHaveLength(0);
+    expect(dto.events).toHaveLength(0);
+    expect(dto.products).toHaveLength(0);
+    expect(textOf(res)).toContain('今日尚未推送');
   });
 
-  it('一条 ops-alert 的 success 行【不得】把「今日尚未推送」变成空日报（target_type 命名空间隔离）', async () => {
+  it('一条 ops-alert 的 success 行【不得】污染 get_today（target_type 命名空间隔离）', async () => {
     // 运维告警复用 push_records 的幂等地基（UNIQUE(target_type,target_id,channel,push_date)），
-    // 但它不是业务推送。查询若不按 target_type 收口，一条 ops-alert 成功记录会让 records 非空
-    // ⇒ 本工具不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**、channels 被污染成告警通道。
+    // 但它不是日报内容。查询若不按 target_type 收口：① 无业务内容时 records 非空 ⇒ 不再报「今日尚未
+    // 推送」而回一份空日报；② 有业务内容时 channels 被污染成告警的通道。两种库态各钉一次。
     const realToday = getPushDate(new Date(), TZ);
     const alertKey = `${SRC}ops-alert-pollution`;
 
-    await pool!.query(
-      `DELETE FROM push_records
-        WHERE push_date=$1
-          AND (target_id IN (SELECT event_id FROM ai_news_events WHERE dedup_key LIKE $2)
-            OR target_id IN (SELECT product_id FROM ai_products WHERE canonical_domain LIKE $3)
-            OR target_id=$4)`,
-      [realToday, `${SRC}%`, `${DOMP}%`, alertKey],
-    );
+    await clearTodayPushes(realToday, alertKey);
+    await expectNoFeishuDigestToday(realToday); // feishu = 本用例里「告警独有的通道」。
     await pool!.query(
       `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
        VALUES ('ops-alert', $1, 'feishu', $2, 'success')`,
@@ -336,19 +353,38 @@ describe.skipIf(!canRun)('get_today_ai_digest（当日未推空路径）', () =>
     );
 
     try {
-      const res = (await getTodayTool.handler({ channel: 'feishu' }, {})) as CallToolResult;
-      const dto = res.structuredContent as {
+      // ① 无业务内容的库态：ops-alert 行在，但必须照旧「今日尚未推送」、channels 为空。
+      const empty = (await getTodayTool.handler({ channel: 'feishu' }, {})) as CallToolResult;
+      const emptyDto = structured<{
         channels: string[];
         events: unknown[];
         products: unknown[];
-      };
-      const text = (res.content?.[0] as { text?: string } | undefined)?.text ?? '';
+      }>(empty);
+      expect(emptyDto.channels).toHaveLength(0);
+      expect(emptyDto.events).toHaveLength(0);
+      expect(emptyDto.products).toHaveLength(0);
+      expect(textOf(empty)).toContain('今日尚未推送');
 
-      if (dto.events.length === 0 && dto.products.length === 0) {
-        // 关键：ops-alert 行存在，但业务内容仍为空 ⇒ 必须照旧报「今日尚未推送」、channels 为空。
-        expect(dto.channels).toHaveLength(0);
-        expect(text).toContain('今日尚未推送');
-      }
+      // ② 有业务内容的库态：日报走 telegram、告警走 feishu ⇒ channels 只应认业务通道。
+      const evId = await seedEvent({
+        dedupKey: `${SRC}ops-alert-neighbor`,
+        representativeTitle: 'OpsAlertNeighbor',
+        headlineZh: '业务要闻',
+      });
+      await seedPush({ targetType: 'event', targetId: evId, channel: 'telegram' });
+
+      const res = (await getTodayTool.handler({}, {})) as CallToolResult;
+      const dto = structured<{
+        channels: string[];
+        events: Array<{ targetId: string }>;
+        products: Array<{ targetId: string }>;
+      }>(res);
+
+      expect(dto.events.map((e) => e.targetId)).toContain(evId); // 业务内容照常还原。
+      expect(dto.channels).toContain('telegram');
+      expect(dto.channels).not.toContain('feishu'); // feishu 上今天只有那条 ops-alert。
+      // 告警的 target_id 绝不作为一条「已推内容」出现。
+      expect([...dto.events, ...dto.products].map((x) => x.targetId)).not.toContain(alertKey);
     } finally {
       await pool!.query(`DELETE FROM push_records WHERE target_id=$1`, [alertKey]);
     }

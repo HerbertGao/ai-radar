@@ -271,9 +271,14 @@ async function cleanup() {
   if (!pool) return;
   // 全表清空（而非仅删 TITLE_MARKER 行）：scoreUnscoredEvents 扫全表 `importance_score IS NULL`、
   // selectTopN 扫全表候选——都不带本套件 marker 过滤。配合 vitest fileParallelism=false（同进程串行），
-  // TRUNCATE 三张表确保全局表读只看到本用例 seed 的数据，外部残留的未评分/候选行不会混入断言。
+  // TRUNCATE 确保全局表读只看到本用例 seed 的数据，外部残留的未评分/候选行不会混入断言。
+  //
+  // **ai_products 必须一起清**：日报是「要闻段 + 新品段」一条消息，产品段非空就会推送。一行来自
+  // 别的测试文件（或一次崩掉的跑）的残留产品，会让「无候选 → 不推」那组用例全部红——而它们的
+  // 失败信息指向 sender.calls，读起来像代码回归。这是假红，且极难定位：本地库里一行孤儿产品，
+  // 就能让 12 条用例红成一片。
   await pool.query(
-    `TRUNCATE TABLE push_records, ai_news_events, raw_items RESTART IDENTITY`,
+    `TRUNCATE TABLE push_records, ai_news_events, raw_items, ai_products RESTART IDENTITY`,
   );
   if (redisUrl) {
     const r = new Redis(redisUrl);
@@ -485,8 +490,9 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
   it('采集返回 = 0（三源全挂）→ 告警，不推', async () => {
     const sender = okSender();
     const alert = vi.fn();
-    // 本用例不造任何 event；beforeEach 已清库 + 串行执行（vitest fileParallelism=false）
-    // 保证无残留候选，故「无候选 → 不推」确定性成立。
+    // 本用例不造任何 event。beforeEach 的 TRUNCATE 含 ai_products（日报是「要闻段 + 新品段」
+    // 一条消息，产品段非空即推送——漏清产品会让本断言假红），配合串行执行
+    // （vitest fileParallelism=false）保证无残留候选，故「无候选 → 不推」确定性成立。
     const result = await runDailyWorkflow({
       now: NOW,
       dbh: db!,
@@ -866,13 +872,13 @@ describe.skipIf(!canRun)('runDailyWorkflow 日报降级回归（组 C 4.2/4.4/4.
     const { sha256Hex, normalizeUrl } = await import('../../dedup/normalize.js');
     const dedupKey = sha256Hex(normalizeUrl(url)!);
     const { rows: seed } = await pool!.query<{ event_id: string }>(
-      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 2（程序近似值）。
+      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 1（「非页面确定性提取」档，与 rss/HN/AI 回填同级）。
       `INSERT INTO ai_news_events
          (dedup_key, representative_title, representative_raw_item_id, should_push,
           importance_score, novelty_score, developer_relevance_score, hype_risk_score,
           first_seen_at, published_at, published_at_authority, is_ai_related, source_count)
        VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,
-               CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 2 END,true,1) RETURNING event_id`,
+               CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 1 END,true,1) RETURNING event_id`,
       [
         dedupKey,
         `${TITLE_MARKER} P0 overlap event`,
@@ -1797,7 +1803,8 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品段编排（7.3）', () => {
  *   回退 NULL、本轮排除、下轮工作集 is_ai_related IS NULL 再补判自愈）；要闻段照推、judge/digest 统计不受影响。
  *
  * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
- * ai_products 不在 cleanup 的 TRUNCATE 内，故 seed 的产品用唯一前缀、本块 finally 显式清理。
+ * ai_products 已在 cleanup 的 TRUNCATE 内（每个用例前清空）；本块 seed 的产品仍用唯一前缀 +
+ * finally 显式清理，使本块单跑（不经 beforeEach）时也自洽。
  */
 describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，8.6）', () => {
   const PROD_PREFIX = `rdw-zh-${process.pid}-`;

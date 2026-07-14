@@ -533,8 +533,7 @@ export async function runDailyWorkflow(
         console.error(
           `[pipeline] 告警: 检测到 ${staleSources.length} 个陈旧源（长期零新增）`,
         );
-        // 单键：本判定每天只跑一次（日报链内），一条消息已列出全部陈旧源。
-        // 与 `source-health:<source>` 不同——那是【单源采集失败】的即时告警，天然按源分键。
+        // 单键：本判定每天只跑一次（日报链内），一条消息已列出全部陈旧源，无需按源分键。
         await alert(
           `按源陈旧度告警：${staleSources.length} 个源长期零新增\n${lines}`,
           { dedupKey: 'source-staleness', staleSources },
@@ -1138,6 +1137,7 @@ export async function run(
       emit: ctx.emit,
       // 生产装配的运维告警出口（这里是真正的注入点——worker.ts 调的是 run(ctx)，自身不拼 options）。
       // 不注入则回落 consoleAlertSink：告警只进 stderr、没人会被叫醒。
+      // 真实 sender 惰性构造（首次真告警时才装配），故本行在桩核心单测里不触发任何真实发送器构造。
       alert: buildOpsAlertSink(),
       ...(input.now ? { now: input.now } : {}),
     });

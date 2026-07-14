@@ -7,17 +7,31 @@
  *
  * **限频住在 DB 里，不在进程里**：告警经 `push_records` 的
  * `UNIQUE(target_type, target_id, channel, push_date)` 落地——`target_type='ops-alert'`、
- * `target_id=<dedupKey>`。首次告警 INSERT 成功并发送；同日同 dedupKey 的后续告警撞唯一键、
- * `ON CONFLICT DO NOTHING` 返回 0 行，直接跳过。由此白拿三件事：
+ * `target_id=<dedupKey>`。限频的真实语义是「**今天该 dedupKey 该通道已有一条 `status='success'` 行**」
+ * ——与 `hasAlertedToday()` 查的完全是同一个东西，两个口径合一。故认领用
+ * `ON CONFLICT DO UPDATE ... WHERE status <> 'success'`：
+ * - 已有 `success` 行 → setWhere 不满足 → 0 行 → 跳过（这才是真限频）；
+ * - 有 `pending`（进程崩在发送前的残行）/ `failed`（上次发送失败）→ **重新认领 → 重试**；
+ * - 无行 → INSERT → 发送。
  *
- * 1. **零新状态**：不需要 Redis 键、不需要进程内 Map。后者会在每次 redeploy 复位 ⇒「连续 N 轮
- *    失败才告警」永不达标 ⇒ 静默不告警，比刷屏更糟。
- * 2. **跨进程 / 跨重启 / 跨链自动去重**：日报链（每天一次）与高频告警链（每 15 分钟一次）用同一个
- *    dedupKey ⇒ 一条先告了，另一条自动命中唯一键冲突而跳过。sitemap 每轮都 throw 时，96 轮里只响一次。
- * 3. **幂等由 DB 唯一约束保障**，与本仓第一架构原则一致——绝不交给应用层自由发挥。
+ * 若改用 `ON CONFLICT DO NOTHING`，**任何 status** 的残行都会挡住当天全部重试——一条崩溃遗留的
+ * pending 就足以让该告警当天彻底哑火（消息从未发出），而 `hasAlertedToday()` 仍报 false：限频口径
+ * 与可观测口径分裂，连「今天没告成」都看不出来。
  *
- * **发送失败不占当日名额**：sender 抛错时删掉那条 pending 行。否则一次网络抖动 =
- * 当天该告警彻底哑火（下次同 dedupKey 命中 ON CONFLICT DO NOTHING 而跳过）。
+ * **当前接线**：只有日报链注入真 sink——`run-daily-workflow.ts` 5 处 `alert()` +
+ * `product-digest.ts` 3 处。故重复告警的真实来源是 **BullMQ 对同一 daily job 的重试**（同日重跑撞
+ * 唯一键即跳过），这是本 sink 的实际收益。
+ * **待接**：高频链（`alert-scan.ts`）目前零 `alert()` 调用、无 AlertSink 注入口；单源采集失败的
+ * 源级健康告警也尚无告警点（`classifySystemFailure` 只在「整体采集为 0」或「全部不可处理」时才响，
+ * 单源 throw 而其余源正常时不告警）。两者接入前，不要在本文件预支它们的行为。
+ *
+ * **发送失败写 `failed`、不删行**（CLAUDE.md 推送不变量：先 `pending`、成功 `success`、失败 `failed`）。
+ * `failed` 行满足 `status <> 'success'` → 下次同 dedupKey 可被重新认领重试；且 DB 里查得到「告警发送
+ * 失败」这一事实（DELETE 会把它抹掉）。
+ *
+ * **DB 挂了时不哑火**：认领本身抛错 → 降级为**不去重直接发**，并在消息里标注「限频不可用（DB 异常）」。
+ * `product-digest` 那条「待中文化产品查询失败（如 DB 断连）」的告警恰恰在 DB 断连时触发——若认领失败
+ * 即放弃发送，最需要告警的那类故障上通道全哑。宁可重复一条，不可哑火。
  */
 import { and, eq, sql } from 'drizzle-orm';
 
@@ -27,6 +41,11 @@ import { pushRecords } from '../db/schema.js';
 import type { MessageSender } from '../push/dispatcher.js';
 import { createFeishuSender } from '../push/feishu.js';
 import { createTelegramSender } from '../push/telegram.js';
+import {
+  escapeLarkMdText,
+  escapeMarkdownV2,
+  type FeishuCard,
+} from '../push/message.js';
 import { getPushDate } from '../push/push-date.js';
 import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 
@@ -34,9 +53,12 @@ import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
  * 告警明细。`dedupKey` **必填**——它是 `push_records.target_id`（`varchar(128) NOT NULL`），
  * 也是当日限频的键。必填让编译器逼出每一个告警调用方；写成可选时，忘传的调用方会在运行时
  * 违反 NOT NULL、被 sink 的 best-effort catch 吞掉 ⇒ 那条告警连 stderr 都不再有。
+ *
+ * 其余字段是**上下文**（kind / collectedCount / failed / staleSources / error …），会被摘要进消息体
+ * ——运维在通道里收到的不能是一句没有上下文的裸话。
  */
 export interface AlertDetail {
-  /** 当日限频键（每 dedupKey 每通道每天至多一条）。形如 `source-health:sitemap`。 */
+  /** 当日限频键（每 dedupKey 每通道每天至多一条成功告警）。形如 `degrade-abort:value-judge`。 */
   dedupKey: string;
   [key: string]: unknown;
 }
@@ -48,21 +70,121 @@ export type AlertSink = (message: string, detail: AlertDetail) => void | Promise
 export const consoleAlertSink: AlertSink = (message, detail) =>
   console.error(`[pipeline][ALERT] ${message}`, detail);
 
+/** 告警卡片/消息标题。 */
+const ALERT_TITLE = '⚠️ AI Radar 运维告警';
+
+/** 单个 detail 字段值的展示上限（防超长 error stack / 大对象撑爆一条告警）。 */
+const DETAIL_VALUE_MAX = 200;
+
+/** 认领失败（DB 异常）时附在消息尾部的显式声明——收到的人必须知道这条没经过去重。 */
+const RATE_LIMIT_UNAVAILABLE = '限频不可用（DB 异常）：本条未经 push_records 去重，同日可能重复。';
+
+/**
+ * 单条告警的发送超时。telegram 走 grammY（默认 timeoutSeconds=500）、feishu 走
+ * `withRetry(3) × COLLECTOR_FETCH_TIMEOUT_MS`——不设上界时，一个挂起的通道能把熔断中止推迟数分钟。
+ * ponytail: 只做「不再等」的超时，不取消底层请求（grammY 无 signal 缝）；到点即让本通道计为失败、
+ * 写 `failed` 行、下次可重试。
+ */
+const SEND_TIMEOUT_MS = 10_000;
+
 export interface OpsAlertSinkOptions {
   /** 已配置的通道 → sender。空对象 ⇒ 回落 `consoleAlertSink`。 */
   senders: Partial<Record<Channel, MessageSender>>;
   /** 可注入 db 或事务句柄（默认全局 db）。 */
   dbh?: typeof defaultDb;
-  /** 可注入「现在」（默认 `new Date()`）——两条链必须用同一口径算 push_date。 */
+  /** 可注入「现在」（默认 `new Date()`）——各链必须用同一口径算 push_date。 */
   now?: () => Date;
+}
+
+/** 到点即 reject 的超时包装（不取消底层请求；见 SEND_TIMEOUT_MS）。 */
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} 发送超时（${ms}ms）`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** detail 字段值的展示串（Error 取 message；对象 JSON 化；一律截断）。 */
+function formatDetailValue(v: unknown): string {
+  const s =
+    v instanceof Error
+      ? v.message
+      : typeof v === 'object' && v !== null
+        ? (() => {
+            try {
+              return JSON.stringify(v) ?? String(v);
+            } catch {
+              return String(v);
+            }
+          })()
+        : String(v);
+  return s.length <= DETAIL_VALUE_MAX ? s : `${s.slice(0, DETAIL_VALUE_MAX - 1)}…`;
+}
+
+/** 把 detail 摘要成正文行（dedupKey 放最后一行，其余字段按声明序）。 */
+function detailLines(detail: AlertDetail): string[] {
+  const lines = Object.entries(detail)
+    .filter(([k]) => k !== 'dedupKey')
+    .map(([k, v]) => `${k}=${formatDetailValue(v)}`);
+  lines.push(`dedupKey=${detail.dedupKey}`);
+  return lines;
+}
+
+/**
+ * 按通道渲染一条告警——**两个通道的 sender 契约完全不同，绝不能给它们同一个裸文本**：
+ * - telegram：`api.sendMessage(chatId, text, { parse_mode: 'MarkdownV2' })`，**零转义**。告警文案
+ *   含 `.` `-` `(` `)` `!` 等 MarkdownV2 保留字（如「降级率 42.9% 超阈值（30%），中止本次流水线。」），
+ *   不转义 ⇒ Telegram API 400 拒收。整条一次性 `escapeMarkdownV2`（不留任何 markup 标记，
+ *   使「保留字必被反斜杠前导」这条不变量可被测试整体断言）。
+ * - feishu：`send(text)` 的第一件事是 `JSON.parse(text)` 取 `{ card }`。裸文本 ⇒ 当场抛。
+ *   故必须交 `JSON.stringify({ card })`，卡片结构照 `mr/curation/card.ts` 的范式
+ *   （`config.wide_screen_mode` + `header{title, template}` + `elements[{tag:'div', text:{tag:'lark_md'}}]`），
+ *   正文经 `escapeLarkMdText`。
+ */
+function renderAlert(channel: Channel, lines: readonly string[]): string {
+  const body = lines.join('\n');
+  switch (channel) {
+    case 'telegram':
+      return escapeMarkdownV2(`${ALERT_TITLE}\n${body}`);
+    case 'feishu': {
+      const card: FeishuCard = {
+        config: { wide_screen_mode: true },
+        header: {
+          title: { tag: 'plain_text', content: ALERT_TITLE },
+          template: 'red',
+        },
+        elements: [
+          { tag: 'div', text: { tag: 'lark_md', content: escapeLarkMdText(body) } },
+        ],
+      };
+      return JSON.stringify({ card });
+    }
+    default: {
+      // 穷尽性检查：channelEnum 新增成员而本处未加渲染分支时编译期报错（防又一条通道收到裸文本）。
+      const exhaustive: never = channel;
+      throw new Error(`renderAlert: 未知 channel=${String(exhaustive)}`);
+    }
+  }
 }
 
 /**
  * 造一个把运维告警落到真实通道、并由 DB 唯一约束限频的 sink。
  *
  * `push_date` 一律经 `getPushDate()`（`env.PUSH_TIMEZONE`，Asia/Shanghai）——**不可用 UTC 日**：
- * UTC 日界是 08:00 CST，而日报链恰在 08:03 CST 跑，只差 3 分钟。两条链若各算各的日期，
+ * UTC 日界是 08:00 CST，而日报链恰在 08:03 CST 跑，只差 3 分钟。各链若各算各的日期，
  * 唯一键就挡不住跨午夜的那一轮 ⇒ 持续故障期天天双响。
+ *
+ * 多通道**并发**发送（`Promise.allSettled`）：顺序循环下 telegram 挂起会连带饿死 feishu 那条告警。
  */
 export function createOpsAlertSink(options: OpsAlertSinkOptions): AlertSink {
   const { senders, dbh = defaultDb, now = () => new Date() } = options;
@@ -72,66 +194,137 @@ export function createOpsAlertSink(options: OpsAlertSinkOptions): AlertSink {
 
   return async (message, detail) => {
     const pushDate = getPushDate(now());
+    const baseLines = [message, ...detailLines(detail)];
 
-    for (const channel of channels) {
-      const sender = senders[channel];
-      if (!sender) continue;
+    await Promise.allSettled(
+      channels.map(async (channel) => {
+        const sender = senders[channel];
+        if (!sender) return;
 
-      try {
-        // 唯一键冲突 = 今天已就该 dedupKey 告过警 → 0 行 → 跳过。这就是限频。
-        const claimed = await dbh
-          .insert(pushRecords)
-          .values({
-            targetType: TARGET_TYPE['ops-alert'],
-            targetId: detail.dedupKey,
-            channel,
-            pushDate,
-            status: 'pending',
-          })
-          .onConflictDoNothing()
-          .returning({ id: pushRecords.id });
-
-        if (claimed.length === 0) continue;
-
+        // 1. 认领当日名额：只有【未成功】的行可被重新认领（崩溃残 pending / 上次 failed）。
+        //    已有 success 行 → 0 行 → 跳过。这就是限频，且与 hasAlertedToday() 同口径。
+        let claimedId: bigint | null = null;
+        let rateLimitDown = false;
         try {
-          await sender.send(message, 'MarkdownV2');
-          await dbh
-            .update(pushRecords)
-            .set({ status: 'success' })
-            .where(eq(pushRecords.id, claimed[0]!.id));
-        } catch (sendErr) {
-          // 发送失败 ⇒ 删掉 pending 行，不占当日名额（否则一次网络抖动 = 当天该告警彻底哑火）。
-          await dbh.delete(pushRecords).where(eq(pushRecords.id, claimed[0]!.id));
+          const claimed = await dbh
+            .insert(pushRecords)
+            .values({
+              targetType: TARGET_TYPE['ops-alert'],
+              targetId: detail.dedupKey,
+              channel,
+              pushDate,
+              status: 'pending',
+            })
+            .onConflictDoUpdate({
+              target: [
+                pushRecords.targetType,
+                pushRecords.targetId,
+                pushRecords.channel,
+                pushRecords.pushDate,
+              ],
+              set: { status: 'pending', errorMessage: null, updatedAt: sql`now()` },
+              setWhere: sql`${pushRecords.status} <> 'success'`,
+            })
+            .returning({ id: pushRecords.id });
+
+          if (claimed.length === 0) return; // 今天已成功告过 → 真跳过。
+          claimedId = claimed[0]!.id;
+        } catch (claimErr) {
+          // 告警通路不能依赖它要告警的那个子系统：DB 挂了正是最该响的时候。降级为不去重直接发。
+          rateLimitDown = true;
           console.error(
-            `[ops-alert] 发送失败（已释放当日名额，下次同 dedupKey 会重试）：channel=${channel} dedupKey=${detail.dedupKey}`,
-            sendErr,
+            `[ops-alert] 认领当日名额失败（降级为不去重直接发）：channel=${channel} dedupKey=${detail.dedupKey}`,
+            claimErr,
           );
         }
-      } catch (err) {
-        // best-effort：告警自身绝不向上抛错（它是可观测，不是业务路径）。至少留 stderr。
-        console.error(
-          `[ops-alert] 告警落库失败：channel=${channel} dedupKey=${detail.dedupKey} — ${message}`,
-          err,
-        );
-      }
-    }
+
+        // 2. 按通道渲染 + 发送（带超时，防单通道挂起拖死熔断中止）。
+        const lines = rateLimitDown ? [...baseLines, RATE_LIMIT_UNAVAILABLE] : baseLines;
+        try {
+          await withTimeout(
+            Promise.resolve(sender.send(renderAlert(channel, lines), 'MarkdownV2')),
+            SEND_TIMEOUT_MS,
+            `[ops-alert][${channel}]`,
+          );
+        } catch (sendErr) {
+          console.error(
+            `[ops-alert] 发送失败（置 failed，下次同 dedupKey 可重新认领重试）：` +
+              `channel=${channel} dedupKey=${detail.dedupKey}`,
+            sendErr,
+          );
+          const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+          await setStatus(dbh, claimedId, 'failed', msg);
+          return;
+        }
+
+        // 3. 成功 → success + pushed_at（与 dispatcher 终态同口径；否则 ops-alert 行永远
+        //    status='success' AND pushed_at IS NULL）。
+        await setStatus(dbh, claimedId, 'success');
+      }),
+    );
   };
+}
+
+/**
+ * 把认领到的那行置终态。`id` 为 null（认领时 DB 已挂）→ 无行可改，跳过。
+ * best-effort：终态写库再抛错也只留 stderr——告警是可观测，绝不向业务路径抛。
+ */
+async function setStatus(
+  dbh: typeof defaultDb,
+  id: bigint | null,
+  status: 'success' | 'failed',
+  errorMessage?: string,
+): Promise<void> {
+  if (id === null) return;
+  try {
+    await dbh
+      .update(pushRecords)
+      .set(
+        status === 'success'
+          ? {
+              status: 'success',
+              pushedAt: new Date(),
+              errorMessage: null,
+              updatedAt: sql`now()`,
+            }
+          : {
+              status: 'failed',
+              errorMessage: (errorMessage ?? '').slice(0, 1000),
+              updatedAt: sql`now()`,
+            },
+      )
+      .where(eq(pushRecords.id, id));
+  } catch (err) {
+    console.error(`[ops-alert] 终态写库失败（消息已发/已失败，行状态可能滞留）：id=${id}`, err);
+  }
 }
 
 /**
  * 生产装配：已配置通道全集，限频由 `push_records` 的唯一键承载。
  *
- * **VITEST 下回落 stderr**（与 `createTelegramSender` / `createFeishuSender` 自身的守卫同口径）：
- * `run(ctx)` 在 run-lane-wrappers 单测里被直调，若在此构造真实 sender 会真发到生产 chat。
+ * **惰性构造真实 sender**：`run(ctx)` 在 run-lane-wrappers 单测里被以桩核心直调（不会真告警），
+ * 若在此立刻构造真实 sender 会撞上 `createTelegramSender`/`createFeishuSender` 自身的 VITEST 守卫。
+ * 推迟到首次真告警才装配 ⇒ **不需要本函数再加一层 VITEST 短路**——那层短路会让
+ * `createOpsAlertSink → sender.send(...)` 这段接线在测试里从不执行（渲染契约无从被测试证伪）。
+ * 传入 `senders` 即显式注入（测试注入 mock / 带桩 transport 的真实 sender），走同一条接线。
+ *
  * 本函数住在这里而非 run-daily-workflow：后者是 lane 业务模块，受 driver-decoupling 守卫约束、
  * 禁读裸 `process.env`（见 pipeline/__tests__/driver-decoupling.guard.test.ts）。装配属基础设施。
  *
  * 未配置任何通道时 `createOpsAlertSink` 自行回落 `consoleAlertSink`，且**不写** `push_records`
  * ——否则「没通道」会被限频键算成「今天已告过」，真接上通道那天反而不响。
  */
-export function buildOpsAlertSink(): AlertSink {
-  if (process.env.VITEST) return consoleAlertSink;
+export function buildOpsAlertSink(
+  senders?: Partial<Record<Channel, MessageSender>>,
+): AlertSink {
+  if (senders) return createOpsAlertSink({ senders });
 
+  let sink: AlertSink | undefined;
+  return (message, detail) => (sink ??= buildProductionSink())(message, detail);
+}
+
+/** 按 env 装配已配置通道的真实 sender（telegram 必配、飞书可选）。 */
+function buildProductionSink(): AlertSink {
   const senders: Partial<Record<Channel, MessageSender>> = {
     [CHANNEL.telegram]: createTelegramSender(),
   };
@@ -142,7 +335,10 @@ export function buildOpsAlertSink(): AlertSink {
 /** 供测试断言 sink 确实经 DB 限频（而非进程内状态）。 */
 export const OPS_ALERT_TARGET_TYPE = TARGET_TYPE['ops-alert'];
 
-/** 当日某 dedupKey 是否已成功告警（供测试/可观测查询）。 */
+/**
+ * 当日某 dedupKey 是否已**成功**告警（供测试/可观测查询）。
+ * 与认领的 `setWhere status <> 'success'` 是同一个口径：存在 success 行 = 今天已告过 = 不再发。
+ */
 export async function hasAlertedToday(
   dedupKey: string,
   at: Date = new Date(),

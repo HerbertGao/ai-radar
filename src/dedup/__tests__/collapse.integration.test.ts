@@ -694,18 +694,84 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     expect(after.published_at?.toISOString()).toBe(before.published_at?.toISOString());
     // 显式断言不等于后到的 D2（证明确实未被覆盖）。
     expect(after.published_at?.toISOString()).not.toBe(d2.toISOString());
-    // 两条都是程序近似值（authority=2）⇒ 同权威不覆盖 ⇒ 先到者胜出，行为与引入 authority 前一致。
-    expect(after.published_at_authority).toBe(2);
+    // 两条都是非页面提取值（authority=1）⇒ 同档不覆盖 ⇒ 先到者胜出，行为与引入 authority 前一致。
+    expect(after.published_at_authority).toBe(1);
     // 身份/代表/first_seen 仍冻结，source_count 累加为 2。
     expect(after.representative_raw_item_id).toBe(id1.toString());
     expect(after.representative_title).toBe('Dated-first title');
     expect(Number(after.source_count)).toBe(2);
   });
 
-  it('HN 先到（投稿时刻，authority=2）+ sitemap 后到（页面提取，authority=3）→ 精确日期覆盖近似值', async () => {
-    // 复刻生产里的真实交错：Anthropic 官宣几分钟内上 HN，sitemap 采集滞后。
-    // HN 的 published_at 是【投稿到 HN 的时刻】、不是文章发布日；sitemap 从文章页提取的才是。
-    // 单向 NULL-fill（COALESCE）下先到者永久胜出 ⇒ 精确日期被丢弃 ⇒ 本能力对重大发布静默失效。
+  it('AI 回填的真实发布日（authority=1）+ HN 后到（投稿时刻，authority=1）→ 发布日【不被】投稿时刻覆盖', async () => {
+    // 生产里最常见的交错，也是「老文被当成今日重大发布推出去」的直接成因：
+    // sitemap 采到官宣页时 published_at 为 NULL（采集器按设计不写 lastmod），由 AI 回填推断出
+    // 【真实发布日】（authority=1）；此后老文被人翻上 HN，HN 的 published_at 是【投稿时刻】——
+    // 一个真实但测错了事件的时间戳。它绝不可以把回填出的发布日往后推。
+    const ts = Date.now();
+    const url = `https://www.anthropic.com/news/backfilled-${ts}`;
+    const realPublishedAt = new Date('2023-11-02T00:00:00Z'); // AI 从页面内容推断出的发布日
+    const hnSubmittedAt = new Date('2026-07-01T09:30:00Z'); // 老文今天才被投稿到 HN
+
+    const idSitemap = await seedRawItem({
+      sourceItemId: `backfill-sitemap-${ts}`,
+      url,
+      title: 'Old announcement (sitemap, no date)',
+      publishedAt: null, // sitemap 采集器的真实形态：published_at 恒为 NULL，交回填推断
+    });
+    const first = await collapseRawItem(
+      {
+        id: idSitemap,
+        source: 'sitemap',
+        url,
+        title: 'Old announcement (sitemap, no date)',
+        publishedAt: null,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+    const dedupKey = first.dedupKey!;
+    expect((await fetchEventByDedupKey(dedupKey))[0]!.published_at).toBeNull();
+
+    // 模拟 published-at-inference 的回填 CAS（backfill.ts）：写入推断出的真实发布日，authority=1。
+    await pool!.query(
+      `UPDATE ai_news_events SET published_at = $1, published_at_authority = 1
+       WHERE dedup_key = $2 AND published_at IS NULL`,
+      [realPublishedAt, dedupKey],
+    );
+
+    const idHn = await seedRawItem({
+      sourceItemId: `backfill-hn-${ts}`,
+      url,
+      title: 'Old announcement (resurfaced on HN)',
+      publishedAt: hnSubmittedAt,
+    });
+    await collapseRawItem(
+      {
+        id: idHn,
+        source: 'hacker_news',
+        url,
+        title: 'Old announcement (resurfaced on HN)',
+        publishedAt: hnSubmittedAt,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+
+    const row = (await fetchEventByDedupKey(dedupKey))[0]!;
+    // HN 的投稿时刻与 AI 回填同档（都不是页面确定性提取）⇒ 同档不覆盖 ⇒ 先到者胜出。
+    // 这条断言若红：2023 年的老文 published_at 会变成今天 ⇒ 过时效闸 ⇒ 当成今日重大发布推出去。
+    expect(row.published_at_authority).toBe(1);
+    expect(row.published_at?.toISOString()).toBe(realPublishedAt.toISOString());
+    expect(row.published_at?.toISOString()).not.toBe(hnSubmittedAt.toISOString());
+    expect(Number(row.source_count)).toBe(2);
+
+    await db!.delete(schema.aiNewsEvents).where(sql`dedup_key = ${dedupKey}`);
+  });
+
+  it('HN 先到（投稿时刻，authority=1）+ sitemap 后到（页面提取，authority=2）→ 页面提取日期覆盖它', async () => {
+    // 页面提取值是唯一有资格覆盖已设值的日期——它读的是文章自己印的发布日，结构上不可能让老文
+    // 看起来新。此处 seed 的 sitemap raw_item 带非空 published_at，是页面提取采集落地后的形态
+    // （当下的 sitemap 采集器一律写 NULL、交 AI 回填）；这条钉的是塌缩侧的覆盖契约。
     const ts = Date.now();
     const url = `https://www.anthropic.com/news/authority-${ts}`;
     const hnSubmittedAt = new Date('2026-06-30T17:59:52Z'); // HN 投稿时刻（近似）
@@ -732,7 +798,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
 
     const beforeRow = (await fetchEventByDedupKey(dedupKey))[0]!;
     expect(beforeRow.published_at?.toISOString()).toBe(hnSubmittedAt.toISOString());
-    expect(beforeRow.published_at_authority).toBe(2); // 程序近似值
+    expect(beforeRow.published_at_authority).toBe(1); // 非页面提取档
 
     // sitemap 后到，同一 canonical_url ⇒ 同一 dedup_key ⇒ 塌缩进同一事件。
     const idSitemap = await seedRawItem({
@@ -754,8 +820,8 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     );
 
     const afterRow = (await fetchEventByDedupKey(dedupKey))[0]!;
-    // 页面提取（3）> 程序近似（2）⇒ 覆盖。这一条断言若红，整个能力对重大发布就是 no-op。
-    expect(afterRow.published_at_authority).toBe(3);
+    // 页面提取（2）> 非页面提取（1）⇒ 覆盖。这一条断言若红，整个能力对重大发布就是 no-op。
+    expect(afterRow.published_at_authority).toBe(2);
     expect(afterRow.published_at?.toISOString()).toBe(pageExtracted.toISOString());
     expect(afterRow.published_at?.toISOString()).not.toBe(hnSubmittedAt.toISOString());
     // 身份/代表/first_seen 仍冻结（只有 published_at 被更权威的值覆盖）。
@@ -764,7 +830,9 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
     expect(Number(afterRow.source_count)).toBe(2);
   });
 
-  it('sitemap 先到（authority=3）+ HN 后到（authority=2）→ 精确日期【不】被近似值降级', async () => {
+  it('sitemap 先到（页面提取，authority=2）+ HN 后到（投稿时刻，authority=1）→ 发布日【不】被降级', async () => {
+    // 同上一条：sitemap 带非空 published_at 是页面提取采集落地后的形态，这里钉塌缩侧的反向契约
+    // （低档后到者绝不覆盖已设的页面提取值；GREATEST 保证 authority 单调不降）。
     const ts = Date.now();
     const url = `https://www.anthropic.com/news/authority-rev-${ts}`;
     const pageExtracted = new Date('2026-06-20T00:00:00Z');
@@ -809,7 +877,7 @@ describe.skipIf(!databaseUrl)('硬去重塌缩（dedup 不变量）', () => {
 
     const row = (await fetchEventByDedupKey(dedupKey))[0]!;
     // 低权威的后到者不得覆盖高权威的已设值（GREATEST 保证 authority 单调不降）。
-    expect(row.published_at_authority).toBe(3);
+    expect(row.published_at_authority).toBe(2);
     expect(row.published_at?.toISOString()).toBe(pageExtracted.toISOString());
     expect(Number(row.source_count)).toBe(2);
 

@@ -52,10 +52,20 @@ export const TARGET_TYPE = {
 } as const satisfies Record<TargetType, TargetType>;
 
 /**
- * 「业务推送」的 target_type 子集——凡是回答「今日的日报/产品段发了吗」的查询都 MUST 用它收口。
- * `ops-alert` 不在其内：它是运维告警，与业务推送共用 push_records 的幂等地基，但不是业务内容。
+ * **日报**（「AI Radar 每日情报」这一条消息）的 target_type 子集 = 要闻段 + 新品段。凡是回答
+ * 「今日的日报发了吗、发了什么」的查询（get_today_ai_digest）都 MUST 用它收口。
+ *
+ * 排除项各有各的理由——`ops-alert` 只是其中之一，别把它读成唯一排除项：
+ * - `alert`：**业务**推送，但走实时重大发布告警链（06:00 起每 15 分钟一轮），不是日报内容；
+ * - `weekly`：周报，独立幂等命名空间、独立一条消息；
+ * - `experience`：实践锦囊，独立一条消息；
+ * - `ops-alert`：**运维**告警，与业务推送共用 push_records 的幂等地基，压根不是业务内容。
+ *
+ * 收窄到这两个是**根因修复**而非顺手收敛：get_today 从前没有 target_type 过滤，上面四种 target_type
+ * 的 success 行**全都**在污染它——例如告警链 06:00 推了一条 `alert`、而 08:03 的日报还没跑时，它会回
+ * 「channels=[telegram]、events=[]」，而不是照实说「今日尚未推送」。四种同形 bug 一把修掉。
  */
-export const CONTENT_TARGET_TYPES = [
+export const TODAY_DIGEST_TARGET_TYPES = [
   TARGET_TYPE.event,
   TARGET_TYPE.product,
 ] as const satisfies readonly TargetType[];

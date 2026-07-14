@@ -60,14 +60,16 @@ async function seedEvent(args: {
   sourceCount?: number;
   embeddingLiteral?: string | null;
   publishedAt?: Date | null;
+  /** published_at 权威等级；省略则按「非页面确定性提取」档（1）记，与 rss/HN/AI 回填同级。 */
+  publishedAtAuthority?: 0 | 1 | 2;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
     // published_at 与 published_at_authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))
-    // 会让任何只写其一的 seed 当场违约。非空日期按「程序近似值」记（2），与真实采集源同级。
+    // 会让任何只写其一的 seed 当场违约。
     `INSERT INTO ai_news_events
        (dedup_key, representative_title, first_seen_at, last_seen_at, source_count, published_at,
         published_at_authority, embedding)
-     VALUES ($1, $2, $3, $3, $4, $5, CASE WHEN $5::timestamptz IS NULL THEN 0 ELSE 2 END, $6::vector)
+     VALUES ($1, $2, $3, $3, $4, $5, $6, $7::vector)
      RETURNING event_id`,
     [
       args.dedupKey,
@@ -75,6 +77,7 @@ async function seedEvent(args: {
       args.firstSeenAt,
       args.sourceCount ?? 1,
       args.publishedAt ?? null,
+      args.publishedAt == null ? 0 : (args.publishedAtAuthority ?? 1),
       args.embeddingLiteral ?? null,
     ],
   );
@@ -88,8 +91,11 @@ async function fetchEvent(eventId: string) {
     source_count: number;
     representative_title: string | null;
     dedup_key: string | null;
+    published_at: Date | null;
+    published_at_authority: number;
   }>(
-    `SELECT event_id, merged_into, source_count, representative_title, dedup_key
+    `SELECT event_id, merged_into, source_count, representative_title, dedup_key,
+            published_at, published_at_authority
      FROM ai_news_events WHERE event_id = $1`,
     [eventId],
   );
@@ -266,6 +272,99 @@ describe.skipIf(!databaseUrl)('语义去重 + 确定性合并 + tombstone 改投
     expect(c!.merged_into).toBeNull();
     expect(Number(aAfter!.source_count)).toBe(Number(a!.source_count)); // A 不变
     expect(bAfter!.merged_into).toBe(aId); // B 仍指向 A（路径未压缩，但解析穿透到 C）
+  });
+
+  it('改投携带页面提取日期：命中 tombstone 的 sitemap raw_item（authority=2）覆盖存活者的已设日期', async () => {
+    // tombstone 改投是该 raw_item 的**唯一**写入路径（ON CONFLICT 的 setWhere 因命中 tombstone 不执行）。
+    // 若改投分支不归集 published_at，一条页面提取日期会在其事件恰好被语义合并吞掉时静默丢失。
+    const ts = Date.now();
+    const url = `https://example.com/reroute-pub-${ts}`;
+    const hnSubmittedAt = new Date('2026-06-28T11:00:00Z'); // 存活者持有的投稿时刻（authority=1）
+    const pageExtracted = new Date('2026-06-20T00:00:00Z'); // 后到 sitemap 从文章页提取的发布日
+
+    // B（被吞者）：由 rss 塌缩出，持有 feed 的 pubDate（authority=1）。
+    const bOut = await collapseRawItem(
+      {
+        id: await seedRaw(`reroute-pub-b-${ts}`, url),
+        url,
+        source: 'rss',
+        title: 'Reroute B',
+        publishedAt: new Date('2026-06-27T00:00:00Z'),
+        fetchedAt: new Date('2026-06-27T00:00:00Z'),
+      },
+      db!,
+    );
+    const bDedupKey = bOut.dedupKey!;
+    const { rows: bRows } = await pool!.query<{ event_id: string }>(
+      `SELECT event_id FROM ai_news_events WHERE dedup_key = $1`,
+      [bDedupKey],
+    );
+    const bEventId = bRows[0]!.event_id;
+
+    // A（存活者，更早）：已持有 HN 的投稿时刻（authority=1）——它必须能被页面提取值覆盖。
+    const aId = await seedEvent({
+      dedupKey: `${SOURCE}-reroute-pub-a-${ts}`,
+      title: 'Reroute A',
+      firstSeenAt: new Date('2026-06-01T00:00:00Z'),
+      publishedAt: hnSubmittedAt,
+    });
+    await mergeEvents(aId, bEventId, { cosineSim: 0.99, tier: 'high-auto', logProvenance: () => {} }, db!);
+    expect((await fetchEvent(bEventId))!.merged_into).toBe(aId);
+    expect((await fetchEvent(aId))!.published_at_authority).toBe(1);
+
+    // 后到同 url 的 sitemap raw_item（页面提取日期）→ 命中 B 的 tombstone → 改投存活者 A。
+    await collapseRawItem(
+      {
+        id: await seedRaw(`reroute-pub-sitemap-${ts}`, url),
+        url,
+        source: 'sitemap',
+        title: 'Reroute B (sitemap)',
+        publishedAt: pageExtracted,
+        fetchedAt: new Date(),
+      },
+      db!,
+    );
+
+    const a = await fetchEvent(aId);
+    // 存活者继承页面提取值：authority 升到 2，published_at 被覆盖成文章自己印的发布日。
+    expect(a!.published_at_authority).toBe(2);
+    expect(a!.published_at?.toISOString()).toBe(pageExtracted.toISOString());
+    expect(a!.published_at?.toISOString()).not.toBe(hnSubmittedAt.toISOString());
+  });
+
+  it('语义合并：被吞者持页面提取日期（authority=2）、存活者持投稿时刻（1）→ 存活者继承被吞者的发布日', async () => {
+    const ts = Date.now();
+    const hnSubmittedAt = new Date('2026-06-29T08:00:00Z');
+    const pageExtracted = new Date('2026-06-15T00:00:00Z');
+
+    // 存活者（first_seen 更早）持低档日期；被吞者持页面提取日期。
+    const survivorId = await seedEvent({
+      dedupKey: `${SOURCE}-inherit-survivor-${ts}`,
+      title: 'Inherit survivor',
+      firstSeenAt: new Date('2026-06-01T00:00:00Z'),
+      publishedAt: hnSubmittedAt,
+      publishedAtAuthority: 1,
+    });
+    const absorbedId = await seedEvent({
+      dedupKey: `${SOURCE}-inherit-absorbed-${ts}`,
+      title: 'Inherit absorbed',
+      firstSeenAt: new Date('2026-06-02T00:00:00Z'),
+      publishedAt: pageExtracted,
+      publishedAtAuthority: 2,
+    });
+
+    const outcome = await mergeEvents(
+      survivorId,
+      absorbedId,
+      { cosineSim: 0.99, tier: 'high-auto', logProvenance: () => {} },
+      db!,
+    );
+    expect(outcome.survivorId).toBe(survivorId);
+
+    const survivor = await fetchEvent(survivorId);
+    // 一次语义合并绝不可以把全系统唯一的真发布日丢掉：存活者必须继承被吞者更权威的日期。
+    expect(survivor!.published_at_authority).toBe(2);
+    expect(survivor!.published_at?.toISOString()).toBe(pageExtracted.toISOString());
   });
 
   it('②a 灰区注入桩判 same → 合并；②b 灰区桩判不同/降级 → 不合并', async () => {
