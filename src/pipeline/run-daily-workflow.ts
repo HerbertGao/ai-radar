@@ -509,6 +509,55 @@ export async function runDailyWorkflow(
       alerted = true;
     }
 
+    // ── 源级健康告警（fix-sitemap-published-at）：对本轮 perSource.ok=false 的**每一个源**各发一条告警。
+    //    `perSource` 由 registry 产出、此前**无任何消费者**（源失败只落 logError）——这是「throw →
+    //    perSource.ok=false → 计入告警」这条链路的落地点（含 sitemap 的 loc_count=0 与「窗内有候选零发射」两种 throw）。
+    //    dedupKey='source-health:<source>' **per-source**（多源同时坏不塌成一条）+ push_records 唯一键
+    //    ⇒ 同源当天至多一响。**仅日报链**（本段本就只在日报链跑）。
+    for (const [source, ps] of Object.entries(collected.perSource)) {
+      if (ps && ps.ok === false) {
+        console.error(`[pipeline] 告警: 采集源失败 source=${source}`);
+        await alert(`采集源失败：${source}`, {
+          dedupKey: `source-health:${source}`,
+          source,
+          error: ps.error, // sink 沿 cause 链摘要真正的故障原因。
+        });
+      }
+    }
+
+    // ── 改版静默死亡形态①（文章页还在、但日期没了：h1 数变了 / 日期格式变了）：判据 MUST 为**日报链
+    //    对 DB 的复算**，MUST NOT 读本轮采集结果——sitemap 若进高频链，高频链会先采走新文并入库 ⇒ 日报链
+    //    本轮 emitted 恒 0 ⇒ 读本轮结果的谓词永不触发；raw_items 是两条链共同的事实源，DB 复算与「谁采的」无关。
+    //    `emitted > 0 且 date_extracted = 0` → 一次**独立**的 alert（MUST NOT 塞进 classifySystemFailure——
+    //    后者入参是「本轮采集统计」，用它就把判据绑回「谁采的」）。**emitted=0 时 MUST NOT 告警**：彼时
+    //    「提取率跌零」与「今天没新文」不可区分，会天天误报。今日 00:00 按 PUSH_TIMEZONE。
+    const sitemapDayStart = startOfDayInTimeZone(now, 0);
+    const [sitemapDateStats] = await dbh
+      .select({
+        emitted: sql<number>`count(*)::int`,
+        dateExtracted: sql<number>`count(*) FILTER (WHERE ${rawItems.publishedAt} IS NOT NULL)::int`,
+      })
+      .from(rawItems)
+      .where(
+        and(eq(rawItems.source, 'sitemap'), gte(rawItems.fetchedAt, sitemapDayStart)),
+      );
+    const sitemapEmitted = sitemapDateStats?.emitted ?? 0;
+    const sitemapDateExtracted = sitemapDateStats?.dateExtracted ?? 0;
+    if (sitemapEmitted > 0 && sitemapDateExtracted === 0) {
+      console.error(
+        `[pipeline] 告警: sitemap 页面日期提取归零（emitted=${sitemapEmitted}, date_extracted=0）`,
+      );
+      await alert(
+        `sitemap 页面日期提取归零：当日入库 ${sitemapEmitted} 条 sitemap raw_item 但 published_at 全为 NULL` +
+          `（站点改版致唯一 h1 消失 / 日期格式变化？提取失败永久不可恢复，须人工核对）`,
+        {
+          dedupKey: 'sitemap-date-extraction-zero',
+          emitted: sitemapEmitted,
+          dateExtracted: sitemapDateExtracted,
+        },
+      );
+    }
+
     // ── 阶段 2.4（best-effort、可观测）：按源陈旧度检测（add-per-source-staleness-alert，design D1/D4）。
     //    **位置钉死**：紧接系统级故障告警块之后、judge/digest 熔断 throw **之前**——保证熔断日 / 无候选
     //    早退日照常检测（陈旧度与今日有无新闻正交，design 理由②）。此刻本轮采集已完成：健康源的

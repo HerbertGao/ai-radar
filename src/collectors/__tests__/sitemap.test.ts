@@ -382,6 +382,51 @@ describe('collectSitemaps loc_count=0 判源失败（M-A）', () => {
   });
 });
 
+describe('collectSitemaps 窗内有候选却零发射判源失败（支路 2：文章页整体没了）', () => {
+  it('window_candidate_count>0 且 per-article 全 fetch 失败（emitted=0）→ 整源抛出', async () => {
+    const fetchArticle = vi.fn(async (_url: string) => {
+      // 文章 URL 改版 → per-article fetch 全 404（逐篇 continue、不拖垮该源）→ emitted=0。
+      throw new Error('article 404');
+    });
+    await expect(
+      mod.collectSitemaps({
+        sources: [ANTHROPIC_CONFIG],
+        // 单条窗内未见 /news/ 候选 → window_candidate_count=1。
+        fetchText: async () =>
+          `<urlset><url><loc>https://www.anthropic.com/news/claude-opus-4-launch</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url></urlset>`,
+        fetchArticle,
+        querySeenCanonicalUrls: async () => new Set(),
+        now: NOW,
+        windowDays: WINDOW_DAYS,
+        maxAttempts: 1,
+        logError: () => {},
+      }),
+    ).rejects.toThrow(/emitted_count=0/);
+    // 候选确实被 fetch 过（证明 window_candidate_count>0），只是全失败。
+    expect(fetchArticle).toHaveBeenCalled();
+  });
+
+  it('window_candidate_count=0（无窗内候选）→ 不抛（正常空轮，MUST NOT 误伤）', async () => {
+    // loc_count>0 但 lastmod 窗外（30 天前）→ 无窗内候选 → 正常「无新文」空轮，绝不 throw。
+    const oldLastmod = new Date(NOW.getTime() - 30 * MS_PER_DAY).toISOString();
+    const fetchArticle = vi.fn(articleRouter());
+    const items = await mod.collectSitemaps({
+      sources: [ANTHROPIC_CONFIG],
+      fetchText: async () =>
+        `<urlset><url><loc>https://www.anthropic.com/news/old-post</loc><lastmod>${oldLastmod}</lastmod></url></urlset>`,
+      fetchArticle,
+      querySeenCanonicalUrls: async () => new Set(),
+      now: NOW,
+      windowDays: WINDOW_DAYS,
+      maxAttempts: 1,
+      logError: () => {},
+    });
+    // 窗外候选 → 无窗内候选 → 不 fetch、不抛、返空。
+    expect(fetchArticle).not.toHaveBeenCalled();
+    expect(items).toEqual([]);
+  });
+});
+
 describe('collectSitemaps 已见集查询失败 → 整源抛出（F-4）', () => {
   it('querySeen 抛错 → 整源抛出，不降级空集致全量 fetch', async () => {
     const fetchArticle = vi.fn(articleRouter());
@@ -504,22 +549,31 @@ describe('collectSitemaps XML 实体解码（FIX-1：数字字符引用先解、
 // ── FIX-5：og content 空串 → null（M-1 双缺 guard 对 content="" 也触发） ──────────
 
 describe('collectSitemaps og content="" 视同缺失（FIX-5）', () => {
-  it('og:title 与 og:description 均 content="" → 该篇被跳过不发射（M-1）', async () => {
-    const html = `<!DOCTYPE html><html><head>
+  it('og:title 与 og:description 均 content="" → 该篇被跳过不发射（M-1，另有健康篇发射）', async () => {
+    // 需一个健康共存候选使 emitted>0——否则「唯一候选被 M-1 跳过 → emitted=0」会触支路 2 整源失败。
+    // 本用例只验证 M-1 对 content="" 双缺篇的跳过，故隔离到「跳该篇、健康篇照发」。
+    const emptyHtml = `<!DOCTYPE html><html><head>
       <meta property="og:title" content="" />
       <meta property="og:description" content="" />
     </head><body></body></html>`;
+    const degenerateUrl = 'https://www.anthropic.com/news/empty-og';
+    const healthyUrl = 'https://www.anthropic.com/news/claude-opus-4-launch';
     const items = await mod.collectSitemaps({
       sources: [ANTHROPIC_CONFIG],
       fetchText: async () =>
-        `<urlset><url><loc>https://www.anthropic.com/news/claude-opus-4-launch</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url></urlset>`,
-      fetchArticle: async () => html,
+        `<urlset>
+          <url><loc>${degenerateUrl}</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+          <url><loc>${healthyUrl}</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+        </urlset>`,
+      fetchArticle: async (url: string) =>
+        url === degenerateUrl ? emptyHtml : fixture('anthropic-article.html'),
       querySeenCanonicalUrls: async () => new Set(),
       now: NOW,
       windowDays: WINDOW_DAYS,
       logError: () => {},
     });
-    expect(items).toEqual([]);
+    // M-1：content="" 双缺篇被跳过、不发射；健康篇正常发射（唯一一条）。
+    expect(items.map((i) => i.url)).toEqual([healthyUrl]);
   });
 });
 
@@ -886,23 +940,31 @@ describe('parseSitemap ReDoS（indexOf 线性扫描：未闭合 <url> 大畸形 
 // ── FIX-A2：extractOgTag 开标签 ReDoS（文章 HTML 含 ~1MB 未闭合 <meta spam，无 >） ──────
 
 describe('extractOgTag 开标签 ReDoS（经 collectSitemaps：~1MB 未闭合 <meta 无 > → 线性、不二次方）', () => {
-  it('文章 HTML 含 ~1MB 未闭合 <meta spam（无 >）→ < 500ms、og 取不到 → M-1 跳过该篇（0 条）', async () => {
+  it('文章 HTML 含 ~1MB 未闭合 <meta spam（无 >）→ < 500ms、og 取不到 → M-1 跳过该篇（另有健康篇发射）', async () => {
     // 第 3 轮 finding：旧 `<meta\b[^>]*>` 在「无 '>' 的 <meta 重复」上 O(n²)（实测 <meta×40000 → 3698ms）。
     // 新 indexOf：第一个 <meta 找不到 '>' 立即 return null，线性。
     // spam 在前且无 '>' → extractOgTag 对 og:title/og:description 均立即 null（碰到第一个无 '>' 的 <meta 即 bail）
-    // → M-1 双缺跳过该篇 → 0 条。load-bearing 断言：无 '>' spam 不致二次方（< 500ms）。
+    // → M-1 双缺跳过该篇。load-bearing 断言：无 '>' spam 不致二次方（< 500ms）。
+    // 需一个健康共存候选使 emitted>0——否则「唯一候选被 M-1 跳过 → emitted=0」会触支路 2 整源失败，
+    // 掩盖本用例要测的 ReDoS 线性时限。
     const metaSpam = '<meta'.repeat(220_000); // >1MB，全是无 '>' 的 <meta。
-    const html =
+    const spamHtml =
       `<!DOCTYPE html><html><head>${metaSpam}` +
       `<meta property="og:description" content="Never reached past the no-'>' spam." />` +
       `</head><body></body></html>`;
-    expect(html.length).toBeGreaterThan(1024 * 1024);
+    expect(spamHtml.length).toBeGreaterThan(1024 * 1024);
+    const spamUrl = 'https://www.anthropic.com/news/meta-spam';
+    const healthyUrl = 'https://www.anthropic.com/news/claude-opus-4-launch';
     const t0 = Date.now();
     const items = await mod.collectSitemaps({
       sources: [ANTHROPIC_CONFIG],
       fetchText: async () =>
-        `<urlset><url><loc>https://www.anthropic.com/news/claude-opus-4-launch</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url></urlset>`,
-      fetchArticle: async () => html,
+        `<urlset>
+          <url><loc>${spamUrl}</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+          <url><loc>${healthyUrl}</loc><lastmod>2026-06-13T10:00:00Z</lastmod></url>
+        </urlset>`,
+      fetchArticle: async (url: string) =>
+        url === spamUrl ? spamHtml : fixture('anthropic-article.html'),
       querySeenCanonicalUrls: async () => new Set(),
       now: NOW,
       windowDays: WINDOW_DAYS,
@@ -910,8 +972,8 @@ describe('extractOgTag 开标签 ReDoS（经 collectSitemaps：~1MB 未闭合 <m
     });
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(500); // 严格时限；旧 <meta\b[^>]* scan-to-EOF 在此二次方卡死。
-    // 无 '>' spam → og 取不到 → M-1 双缺跳过该篇。
-    expect(items).toEqual([]);
+    // 无 '>' spam → 该篇 og 取不到 → M-1 双缺跳过；健康篇正常发射（emitted>0，不触支路 2）。
+    expect(items.map((i) => i.url)).toEqual([healthyUrl]);
   });
 
   it('正常 <meta> + 尾随 ~1MB 未闭合 <meta spam（无 >）→ < 500ms 且正常提取 og（FIX-A2 不破坏正向）', async () => {

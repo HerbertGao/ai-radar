@@ -22,7 +22,7 @@
  *   ——超窗老 NULL 事件不纳入（推断出来也必出窗），超出上限者下轮补填。
  * - **回填阶段不计入降级率熔断**（编排组职责，本模块只返回统计、不在此熔断）。
  */
-import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, isNull, ne, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
 import { aiNewsEvents, rawItems } from '../../db/schema.js';
@@ -176,6 +176,13 @@ export async function backfillPublishedAt(
         // P3 tombstone 排除（合并核心闭环）：候选 SELECT 加 `merged_into IS NULL`——不浪费推断预算在
         // 被吞 tombstone 上、不在 tombstone 落 published_at（spec「tombstone 对所有下游消费者不可见」）。
         isNull(aiNewsEvents.mergedInto),
+        // 确定性提取源豁免（spec「确定性提取源豁免 AI 发布日推断」）：sitemap 已有页面确定性提取
+        // （见 collectors/sitemap.ts extractPublishedAt），且该源【无任何页面外日期线索】——URL 无日期、
+        // 标题无日期、og:description 是全站样板 ⇒ LLM 唯一的输入是训练记忆（认得老文、对新公告永远沉默，
+        // 且失效模式与「日期子串搜索」同构：猜错的日期天然落在合理范围内，范围校验/时效窗/基线水位一道
+        // 都挡不住 ⇒ 老文当今日突发）。故 sitemap 提取失败即保持 NULL、绝不回落 LLM 推断。
+        // raw_items.source 为 .notNull() + innerJoin 保证行存在 ⇒ ne 无三值逻辑陷阱、不会漏排。
+        ne(rawItems.source, 'sitemap'),
         lowerBound !== null
           ? gte(aiNewsEvents.firstSeenAt, lowerBound)
           : undefined,

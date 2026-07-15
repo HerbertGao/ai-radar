@@ -682,6 +682,24 @@ async function collectOneSitemap(
     { sitemapUrl, pathPrefix },
   );
 
+  // ── 改版静默死亡形态②（文章页整体没了：文章 URL 改版 → per-article fetch 全 404）：
+  // `window_candidate_count > 0 且 emitted_count = 0`（窗内有候选、却一篇都没发射）→ logError + throw
+  // 使整源失败（与上面 loc_count=0 的 throw 同款）⇒ perSource.ok=false ⇒ 由日报链源级健康告警响。
+  // **该 throw 不丢弃任何东西**：emitted_count=0 意味着本轮该源本来就一条都没发射，throw 丢的是空集合。
+  // 边界（绝不误伤）：window_candidate_count=0（今天没新文）是正常空轮、绝不 throw——只有「窗内有候选、
+  // 却零发射」才是文章页整体没了。
+  if (windowCandidateCount > 0 && emittedCount === 0) {
+    ctx.logError(
+      `sitemap[${vendor}] 窗内有候选（window_candidate_count=${windowCandidateCount}）却零发射` +
+        `（emitted_count=0），文章 URL 疑似改版致 per-article fetch 全失败，判源失败（防静默死亡）`,
+      { sitemapUrl, pathPrefix },
+    );
+    throw new Error(
+      `sitemap[${vendor}] window_candidate_count=${windowCandidateCount} 但 emitted_count=0：` +
+        `窗内有候选却一篇都没发射（per-article 全失败），判源失败`,
+    );
+  }
+
   return items;
 }
 

@@ -1069,6 +1069,127 @@ describe.skipIf(!canRun)('runDailyWorkflow 按源陈旧度告警阶段（组 B 4
 });
 
 /**
+ * runDailyWorkflow「改版静默死亡」两条告警支路集成测试（fix-sitemap-published-at）：
+ * - 支路 1：日报链对 raw_items 的 DB 复算（source='sitemap' 且 fetched_at>=今日 00:00）判
+ *   `emitted>0 且 date_extracted=0` → alert（dedupKey='sitemap-date-extraction-zero'）。判据是 DB 复算、
+ *   与「本轮谁采的」无关（故用直接 seed raw_items 而非经采集器）。
+ * - 源级健康告警：本轮某源 perSource.ok=false（注入采集器桩让 sitemap throw）→ alert
+ *   （dedupKey='source-health:sitemap'）。这是支路 2 的 throw 变成告警的通道。
+ *
+ * 均用「rss 采到健康新闻」使系统级/熔断告警都不触发 + `staleness:[]` 静默陈旧度 → alert 的调用可精确断言。
+ * seed 的 sitemap 行置 collapsed=true（不进事件塌缩/判分/摘要，隔离到本断言）；beforeEach 全表 TRUNCATE 清理。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 改版静默死亡告警支路（fix-sitemap-published-at）', () => {
+  /** 直接 seed 一条 source='sitemap' 的 raw_item（collapsed=true，仅供支路 1 的 DB 复算计数）。 */
+  async function seedSitemapRow(id: string, publishedAt: Date | null): Promise<void> {
+    await db!.insert(schema.rawItems).values({
+      source: 'sitemap',
+      sourceItemId: `sitemap-b1-${id}`,
+      rawType: 'news',
+      title: `${TITLE_MARKER} seeded sitemap ${id}`,
+      publishedAt,
+      fetchedAt: NOW, // >= 今日 00:00（startOfDayInTimeZone(NOW,0)），落入复算窗。
+      collapsed: true, // 不进 collapse/judge/digest，隔离到支路 1 计数。
+    });
+  }
+
+  /** alert 是否被以某 dedupKey 调用过。 */
+  function alertedWith(alert: ReturnType<typeof vi.fn>, dedupKey: string): boolean {
+    return alert.mock.calls.some(
+      (c) => (c[1] as { dedupKey?: string } | undefined)?.dedupKey === dedupKey,
+    );
+  }
+
+  const healthyNews = () => [
+    item({ id: 'sd-news', url: 'https://ex.com/sd-news', title: 'Silent-death healthy news' }),
+  ];
+
+  it('支路 1：sitemap 当日入库 emitted>0 且 date_extracted=0 → 告警 sitemap-date-extraction-zero', async () => {
+    await seedSitemapRow('a', null);
+    await seedSitemapRow('b', null);
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(result.outcome).toBe('pushed');
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(true);
+  });
+
+  it('支路 1 反例：有至少一条 published_at IS NOT NULL（date_extracted>0）→ 不告警', async () => {
+    await seedSitemapRow('a', null);
+    await seedSitemapRow('b', new Date('2000-01-01T00:00:00Z')); // date_extracted=1>0。
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(false);
+  });
+
+  it('支路 1 反例：emitted=0（无今日 sitemap 行）→ 不告警（提取率跌零与今天没新文不可区分）', async () => {
+    // 不 seed 任何 sitemap 行 → 复算 emitted=0 → MUST NOT 告警。
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(false);
+  });
+
+  it('源级健康告警：本轮 sitemap 源 throw（perSource.ok=false）→ 告警 source-health:sitemap', async () => {
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          // 支路 2 的 throw 在采集器内部；此处直接让 sitemap 源 throw 模拟其效果 → perSource.ok=false。
+          sitemap: async () => {
+            throw new Error('sitemap window candidate but zero emit');
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    // rss 健康新闻使系统级/熔断不触发；sitemap 失败 → 源级健康告警恰好为此 dedupKey。
+    expect(result.outcome).toBe('pushed');
+    expect(alertedWith(alert, 'source-health:sitemap')).toBe(true);
+  });
+});
+
+/**
  * runDailyWorkflow 正文补全阶段编排集成测试（harden-daily-push-relevance-and-grounding 组 G，
  * tasks 2.4/5.2/7.1，spec source-content-enrichment / daily-intel-pipeline）。
  *
