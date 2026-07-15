@@ -349,7 +349,8 @@ export async function runAlertScan(
   emit('stage.score');
   const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
   log(
-    `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条`,
+    `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条` +
+      `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}`,
   );
 
   // ── 阶段 3.5：发布时间回填（published-at-inference，realtime-alerts spec / design D2/D4）。
@@ -420,9 +421,8 @@ export async function runAlertScan(
           canonicalUrl: candidate.canonicalUrl,
           // grounding（与日报 loadRepresentativeFields 同源）：喂正文 + 来源，避免生成 title-only
           // 摘要被日报「已摘要守卫」复用而降级日报摘要质量；缺失仍走防幻觉护栏、不报错。
-          // ponytail: 只接 raw_items.content 原始正文，高频告警链不跑 og:description enrichment（保持
-          // 精简车道）；极少的空正文 P0 若被告警链先摘要，日报复用其 title-only 摘要——比修复前全体
-          // title-only 已是净改善。upgrade: 若空正文 P0 变常见，再在此链补 enrichment。
+          // 正文补全已折进上面的评分阶段（scoreUnscoredEvents 内联补全）——告警链与日报链同口径补全，
+          // 空正文候选在评分阶段即被补全写回 raw_items.content，此处 grounding 随之受益。
           content: candidate.content,
           source: candidate.source,
         },

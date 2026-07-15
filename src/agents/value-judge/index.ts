@@ -11,6 +11,7 @@
  * 使 vitest 可在不依赖真实 key 的前提下覆盖成功/失败路径。
  */
 import { createOpenAI } from '@ai-sdk/openai';
+import { JUDGE_MAX_ATTEMPTS } from '../../config/env.js';
 import { buildModel, defaultGenerateObject } from '../llm-client.js';
 import { valueJudgeOutputSchema, type ValueJudgeOutput } from './schema.js';
 
@@ -63,7 +64,7 @@ export interface JudgeOptions {
   logError?: (message: string, detail: unknown) => void;
 }
 
-const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_MAX_ATTEMPTS = JUDGE_MAX_ATTEMPTS;
 
 function buildPrompt(input: JudgeRawItemInput): string {
   const parts = [

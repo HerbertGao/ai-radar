@@ -45,11 +45,6 @@ import {
   type SemanticMergeResult,
 } from '../dedup/semantic-merge.js';
 import {
-  enrichCandidateContent,
-  type EnrichContentOptions,
-  type EnrichContentResult,
-} from './content-enrichment.js';
-import {
   runKbIngestion,
   type RunKbIngestionOptions,
   type KbIngestionResult,
@@ -179,11 +174,10 @@ export interface RunDailyWorkflowOptions {
   /** 采集层选项（注入 mock collector / RSS 源等）。 */
   collect?: CollectAllOptions;
   /**
-   * 正文补全阶段选项（source-content-enrichment，组 G 2.4）。注入 `fetchImpl`/`resolve` 桩使
-   * 集成测在补全阶段**不触网**（对空 content + 可抓 URL 的候选，默认真实 fetch 会外发请求）。
+   * Value Judge 阶段选项（注入 mock generateObject 等）。**正文补全已折进判分入口**，其无网桩经
+   * `judge.enrich` 注入（`ScoreEventsOptions.enrich`）——本层不再有独立的 `enrich` 字段（补全不再由日报链
+   * 单独编排，避免「桩还在传、转发被删、测试仍绿」的绊线失手）。
    */
-  enrich?: EnrichContentOptions;
-  /** Value Judge 阶段选项（注入 mock generateObject 等）。 */
   judge?: ScoreEventsOptions;
   /** 中文摘要阶段选项（注入 mock generateObject 等）。 */
   digest?: SummarizeOptions;
@@ -294,12 +288,6 @@ export interface RunDailyWorkflowResult {
    * 未执行回填（如未抢到锁提前返回）时为 undefined。
    */
   publishedAtBackfill?: BackfillPublishedAtResult;
-  /**
-   * 正文补全阶段统计（**仅可观测**，绝不影响 outcome / 熔断；组 G 2.4）。
-   * `hit`=成功抓 og:description 并原子写回数，`fail`=失败数（含被 SSRF 守卫拒绝数）。
-   * 整阶段 try/catch、永不向上抛、不进熔断分母。未执行（如未抢到锁提前返回）时为 undefined。
-   */
-  enrichment?: EnrichContentResult;
   /**
    * 语义去重阶段统计（**仅可观测**，绝不影响 outcome / 熔断；P3 语义层，6.1）。
    * 语义降级（embedding/检索/LLM judge/合并冲突）一律「不合并」、不抛断、不计入 judge/digest
@@ -673,32 +661,9 @@ export async function runDailyWorkflow(
       console.error('[pipeline] 语义去重: SEMANTIC_DEDUP_ENABLED=off，跳过语义层（退回纯硬去重）');
     }
 
-    // ── 阶段 2.6：正文补全（source-content-enrichment，spec / design D1）——链序钉死
-    //    「塌缩 → 语义合并 → 补全 → 判分」：**语义合并之后**（只富化存活代表、不对随即 tombstone 者
-    //    浪费抓取；语义合并判维持仅标题、有意取舍见 design D1）、**Value Judge 之前**（judge 与摘要都
-    //    需正文 grounding，补全先行才能一次 grounding 两者）。工作集与 scoreUnscoredEvents 判分集同口径
-    //    （importance_score IS NULL AND merged_into IS NULL，空 content + 可抓 URL）。
-    //    **补全默认串行 best-effort**：每条以 COLLECTOR_FETCH_TIMEOUT_MS 为上限、逐条 try/catch 隔离
-    //    （enrichCandidateContent 内部实现），量级数十条可接受；整体在 digest 锁内、watchdog 续租使延迟
-    //    有界非致命。**整阶段 try/catch 永不向上抛、不进熔断分母**（沿用回填/产品/KB 失败不进熔断的既有
-    //    先例；熔断分母仍只含 judge + digest 两阶段）；补全失败 content 仍空时判分/摘要按各自仅标题回退。
-    let enrichResult: EnrichContentResult | undefined;
-    try {
-      enrichResult = await enrichCandidateContent(dbh, options.enrich);
-      console.error(
-        `[pipeline] 正文补全: 命中 ${enrichResult.hit} 条, 失败 ${enrichResult.fail} 条` +
-          `（失败含被 SSRF 守卫拒绝数；best-effort、逐条隔离、不计入熔断）`,
-      );
-    } catch (error) {
-      // 防御性兜底：enrichCandidateContent 内部已逐条 try/catch、整阶段不抛；此处再兜一层（如工作集
-      // SELECT 异常），任何异常仅记日志、不抛断、不进熔断分母、不影响判分/摘要 outcome。
-      console.error(
-        `[pipeline] 正文补全阶段异常（已隔离，不影响判分/摘要 outcome、不进熔断分母）`,
-        error,
-      );
-    }
-
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。
+    //    **正文补全已折进判分入口**（scoreUnscoredEvents 在 claim 之后、judge 之前逐条补全并把正文送入本次
+    //    判分）——日报链不再有独立的补全阶段；补全命中/失败数由 judgeResult 返回、并入下面这条日志。
     emit('stage.score');
     const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
     const judgeStage: StageDegrade = {
@@ -706,7 +671,9 @@ export async function runDailyWorkflow(
       degraded: judgeResult.degradedCount,
     };
     console.error(
-      `[pipeline] Value Judge: 送判 ${judgeStage.processed} 条, 降级 ${judgeStage.degraded} 条`,
+      `[pipeline] Value Judge: 送判 ${judgeStage.processed} 条, 降级 ${judgeStage.degraded} 条` +
+        `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}` +
+        `（补全失败含被 SSRF 守卫拒绝/命中样板数；fail-open、不计入熔断分母）`,
     );
     // judge 阶段独立熔断：分母 > 0 且降级率严格 > 阈值 → 中止 + 告警，不推残缺日报。
     if (stageShouldAbort(judgeStage, abortRatio)) {
@@ -1039,7 +1006,6 @@ export async function runDailyWorkflow(
         topNCount: topN.length,
         alerted,
         publishedAtBackfill: backfillStats,
-        ...(enrichResult ? { enrichment: enrichResult } : {}),
         ...(semanticResult ? { semantic: semanticResult } : {}),
         experienceMining: experienceMiningResult,
         experienceKb: experienceKbResult,
@@ -1177,7 +1143,6 @@ export async function runDailyWorkflow(
       topNCount: topN.length,
       alerted,
       publishedAtBackfill: backfillStats,
-      ...(enrichResult ? { enrichment: enrichResult } : {}),
       ...(semanticResult ? { semantic: semanticResult } : {}),
       ...(kbResult ? { kb: kbResult } : {}),
       experienceMining: experienceMiningResult,
