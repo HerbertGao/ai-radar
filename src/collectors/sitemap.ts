@@ -82,6 +82,43 @@ export const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** og: meta content 内容字符上界（正则加界，同上防回溯）；真 og 内容 ~数百字符，10k 远够。 */
 const MAX_OG_CONTENT_CHARS = 10_000;
 
+/**
+ * 页面发布日的合理下限（常量 `2015-01-01` UTC 零点）。早于此的提取值判越界置 null。
+ * 与 now 上界一道把「提取到明显不合理的年份」变干净失败（宁可漏，绝不把老/错日期当发布日）。
+ */
+const MIN_PUBLISHED_MS = Date.UTC(2015, 0, 1);
+
+/**
+ * `</h1>` 之后「紧邻元素文本」的有界扫描窗口（字符）。真实结构里日期元素紧跟 h1、几十字符内即达，
+ * 4KB 远够；有界 slice 是 ReDoS 防护的一环——锚定正则只在此小串上跑，绝不跨整张 5MB HTML。
+ */
+const H1_ADJACENT_SCAN_CHARS = 4096;
+
+/** 英文月份缩写 → 0..11（`Date.UTC` 的 month 口径）；非月份缩写（如 `Xyz`）查不到 → 提取失败。 */
+const MONTH_ABBR: Readonly<Record<string, number>> = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
+
+/**
+ * 已知**全站样板** `og:description` 集合（精确匹配 trim 后全文）。命中即视同缺失（`content=null`）。
+ * 见 spec「③ 全站样板 og:description 视同缺失」：Anthropic News 实测 14 篇最新文章中 6 篇逐字相同此串，
+ * 落进 content 会构造性击穿三道下游护栏（摘要防幻觉 / 正文补全工作集 / 语义合并灰区），比无正文更糟。
+ * 串用**实体解码后**的形态（og content 经 decodeXmlEntities 才到判定，故 `that's` 用真撇号）。
+ */
+const SITE_BOILERPLATE_DESCRIPTIONS: ReadonlySet<string> = new Set([
+  "Anthropic is an AI safety and research company that's working to build reliable, interpretable, and steerable AI systems.",
+]);
+
+/**
+ * 是否为已知全站样板 og:description（精确匹配 trim 后全文）。
+ * **导出**：`content-enrichment.ts` 的正文补全阶段共享同一判定（单一定义、两处引用），
+ * 防两份样板集漂移致「采集器视同缺失、补全阶段又当有效正文」的口径不一致。
+ */
+export function isSiteBoilerplate(desc: string): boolean {
+  return SITE_BOILERPLATE_DESCRIPTIONS.has(desc.trim());
+}
+
 /** sitemap XML 文本抓取契约（默认 global fetch + 超时；可注入 mock）。 */
 export type FetchTextFn = (url: string) => Promise<string>;
 
@@ -368,6 +405,83 @@ export function deriveTitleFromUrl(canonicalUrl: string): string {
     .join(' ');
 }
 
+/**
+ * 定位一个**真** `<h1` 开标签起点（`indexOf` 线性，从 `from` 起）；无则 -1。
+ * 边界校验（`<h1` 后须为 `>`/空白/`/`）排除 `<h10>`/`<h1foo>`；沿用本采集器 `indexOf` 切块范式（防 ReDoS）。
+ * 大小写敏感（同 parseSitemap 的 `<url`、extractOgTag 的 `<meta`）——`<H1>` 判 0 个 h1 → 干净失败置 null。
+ */
+function findH1TagStart(html: string, from: number): number {
+  let pos = from;
+  while (true) {
+    const i = html.indexOf('<h1', pos);
+    if (i === -1) return -1;
+    const b = html[i + 3];
+    if (b === '>' || b === ' ' || b === '\t' || b === '\n' || b === '\r' || b === '/') return i;
+    pos = i + 3; // 非标签边界（<h10>/<h1x）：跳过继续找。
+  }
+}
+
+/**
+ * 取 `</h1>` 之后**紧邻第一个元素**的文本内容（跳过前导标签与空白，取到下一个 `<` 为止）。
+ * 真实结构 `<h1>…</h1><div class="body-3 agate">Jun 30, 2026</div>` → 剥掉那一个 `<div…>` 标签、
+ * 返回其内文本 `Jun 30, 2026`。有界 slice + `indexOf` 线性（不用 `[\s\S]*?` 跨整张 HTML，防 ReDoS）。
+ */
+function h1AdjacentText(slice: string): string | null {
+  let i = 0;
+  while (i < slice.length) {
+    const c = slice[i]!;
+    if (c === '<') {
+      const gt = slice.indexOf('>', i);
+      if (gt === -1) return null; // 未闭合标签 → 干净失败（线性 bail）。
+      i = gt + 1;
+      continue;
+    }
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v') {
+      i += 1;
+      continue;
+    }
+    const lt = slice.indexOf('<', i); // 文本起点 → 下一个 '<' 为止即该元素文本。
+    return lt === -1 ? slice.slice(i) : slice.slice(i, lt);
+  }
+  return null;
+}
+
+/**
+ * 从文章 HTML **确定性提取**真实发布日 → `published_at`（见 spec「时效正确性 ②」）。任何失败 → `null`（干净失败）。
+ *
+ * - **锚定 = 「文档有且仅有一个 `<h1>`」**（`indexOf` 计数：找第一个、再找第二个；第二个存在 ⇒ >1 ⇒ null）。
+ *   **不**以「og:title 文本相等」作锚（实测仅 18/30，会丢 40% 有日期的页面）。
+ * - 取唯一 h1 的**紧邻元素文本**，**整串全匹配** `^\s*([A-Z][a-z]{2} \d{1,2}, \d{4})\s*$`（如 `Nov 2, 2023`）。
+ *   整串（非子串）：`Updated Jan 5, 2024` / `By Jane · Mar 2, 2025 · 5 min` 一律不中（把「提取到错的」变「什么都没提取到」）。
+ * - **`Date.UTC(y, m, d)` 显式构造 UTC 零点**（不用 `new Date(str)`——V8 按运行时本地时区解析非 ISO 串致边界漂）。
+ * - 校验：日历有效（拒 `Feb 30` 类越月回绕）且 `2015-01-01 <= d <= now`；越界 → null。
+ * - ReDoS：`<h1` 定位与计数用 `indexOf`；锚定正则只在**有界**紧邻文本小串上跑，绝不跨整张 5MB HTML。
+ */
+export function extractPublishedAt(html: string, nowMs: number): Date | null {
+  const first = findH1TagStart(html, 0);
+  if (first === -1) return null; // 0 个 h1 → 干净失败。
+  if (findH1TagStart(html, first + 3) !== -1) return null; // >1 个 h1 → 干净失败（站点加了 nav/卡片 h1）。
+
+  const closeIdx = html.indexOf('</h1>', first + 3);
+  if (closeIdx === -1) return null; // 唯一 h1 但无闭合 → 干净失败。
+  const afterH1 = closeIdx + 5; // 越过 '</h1>'。
+  const text = h1AdjacentText(html.slice(afterH1, afterH1 + H1_ADJACENT_SCAN_CHARS));
+  if (text === null) return null;
+
+  const m = /^\s*([A-Z][a-z]{2}) (\d{1,2}), (\d{4})\s*$/.exec(text);
+  if (!m) return null; // 整串不匹配（含额外文本 / 格式不符）→ 干净失败。
+  const month = MONTH_ABBR[m[1]!];
+  if (month === undefined) return null; // 形如 `Xyz` 匹配了字符类但非真月份。
+  const day = Number(m[2]);
+  const year = Number(m[3]);
+  const ms = Date.UTC(year, month, day);
+  const d = new Date(ms);
+  // 日历有效性（拒 Feb 30 / Nov 31 类越月回绕——Date.UTC 会静默进位到下月）。
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month || d.getUTCDate() !== day) return null;
+  if (ms < MIN_PUBLISHED_MS || ms > nowMs) return null; // 越界（过老 / 未来）→ 干净失败。
+  return d;
+}
+
 /** 计算时间窗下界（now 往前 windowDays 天）；lastmod >= 此下界才算窗内。 */
 function windowLowerBoundMs(now: Date, windowDays: number): number {
   return now.getTime() - windowDays * MS_PER_DAY;
@@ -496,6 +610,7 @@ async function collectOneSitemap(
 
   // ── ③ 对每个窗内未见 URL fetch HTML、提 og:，映射；单篇失败跳过不拖垮该源。
   const items: CollectedItem[] = [];
+  let dateExtractedCount = 0; // 成功页面提取到发布日的篇数（可观测契约；下一子片支路 1 由 DB 复算，此处入日志）。
   for (const cand of windowCandidates) {
     try {
       const html = await withRetry(() => ctx.fetchArticle(cand.canonical), {
@@ -517,7 +632,16 @@ async function collectOneSitemap(
       // og:title 缺失但有 og:description → URL slug 派生回退（绝不空 title）。
       const title =
         ogTitle && ogTitle.length > 0 ? ogTitle : deriveTitleFromUrl(cand.canonical);
-      const content = ogDescription;
+      // ② 全站样板 og:description 视同缺失（content=null），条目照常发射（仅 content 空）。
+      // **顺序 MUST**：样板判定在上面 M-1「og 双缺跳过」之后作用于 og:description——反序会把
+      // 「缺 og:title + 样板 og:description」从「发 slug-title 条目」翻成「整篇跳过」（未授权的行为变化）。
+      const content =
+        ogDescription !== null && isSiteBoilerplate(ogDescription) ? null : ogDescription;
+
+      // ① published_at 由页面确定性提取（唯一 h1 + 紧邻元素整串日期）；失败→null（干净失败）。
+      // 时区口径用 ctx.nowMs（采集器现有取时方式），越界/提取失败一律置 null。
+      const publishedAt = extractPublishedAt(html, ctx.nowMs);
+      if (publishedAt !== null) dateExtractedCount += 1;
 
       // ④ source_item_id（F-6）：c 已非 null；c.length>255 → contentHash(title,content)（既有函数），否则 c。
       const sourceItemId =
@@ -531,9 +655,9 @@ async function collectOneSitemap(
         url: cand.canonical, // 文章 URL（=已规范化 canonical，store 会再算 canonical_url 等值）。
         title,
         content,
-        // M-C：lastmod 绝不进 published_at（改版老文会被 Top-N 误当今天发布；inference 只纠 NULL）。
-        // 置 null、走既有 published-at-inference 从 og: 内容推断真实发布日；lastmod 仅入 metadata。
-        publishedAt: null,
+        // 时效正确性①/②：published_at 由 per-article 页面确定性提取（extractPublishedAt）产出；
+        // 提取失败→null（干净失败，本源不回落 AI 推断）。lastmod 绝不进 published_at（仅入 metadata）。
+        publishedAt,
         rawType: 'news',
         metadata: { vendor, feed_url: sitemapUrl, lastmod: cand.lastmod },
       });
@@ -548,10 +672,13 @@ async function collectOneSitemap(
   }
 
   const emittedCount = items.length;
-  // 可观测计数器（M-A）：loc_count>0 && window_candidate_count=0 是正常「无窗内新文」。
+  const dateMissingCount = emittedCount - dateExtractedCount;
+  // 可观测计数器（M-A + 时效正确性可观测契约）：loc_count>0 && window_candidate_count=0 是正常「无窗内新文」；
+  // date_extracted_count/date_missing_count 供下一子片（支路 1 提取归零告警）观测（该支路判据用 DB 复算）。
   ctx.logError(
     `sitemap[${vendor}] 计数：loc_count=${locCount} path_match_count=${pathMatchCount} ` +
-      `window_candidate_count=${windowCandidateCount} emitted_count=${emittedCount}`,
+      `window_candidate_count=${windowCandidateCount} emitted_count=${emittedCount} ` +
+      `date_extracted_count=${dateExtractedCount} date_missing_count=${dateMissingCount}`,
     { sitemapUrl, pathPrefix },
   );
 
