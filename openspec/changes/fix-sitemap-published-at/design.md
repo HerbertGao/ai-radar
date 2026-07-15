@@ -112,7 +112,7 @@ collapse.ts     onConflictDoUpdate.set 【不含】representativeRawItemId（sch
 
 **③ 而验收 SQL 只读 `raw_items` ⇒ 恒绿，看不见事件层的损坏。**
 
-> 早前这里还有第三条理由：「`published_at` 是单向 NULL-fill ⇒ 那 10 条已带 AI 推断日期的事件会丢掉新提取的页面日期」。**D8 已把该口径改为「权威高者胜出」，故这条理由不再成立**（重采的页面提取值 authority=2 会正确覆盖 authority=1 的推断值）。**结论不变**——①②③ 里任何一条都足以枪毙重采，而可挽回价值本就是 0。
+> 还有一条曾被列出的理由：「`published_at` 是单向 NULL-fill ⇒ 那 10 条已带 AI 推断日期的事件会丢掉新提取的页面日期」。**D8 已把该口径改为「权威高者胜出」，故这条理由不再成立**（重采的页面提取值 authority=2 会正确覆盖 authority=1 的推断值）。**结论不变**——①②③ 里任何一条都足以枪毙重采，而可挽回价值本就是 0。
 
 **提取器的正确性由 tasks 3.1 的【线上字节 fixture 单测】证明**（在真实生产 HTML 上断言 `== 2026-07-09 / 2023-09-19 / 2023-03-08`）——重采不提供任何额外证据，只提供风险。
 
@@ -175,22 +175,24 @@ Inference Optimization for MiMo v2.5    hn=2026-07-07  rss=2026-07-11    -5 天
 
 #### 采用的口径（收窄且确定）
 
-不是源级权威排序，只有两条覆盖关系：**页面提取 > 一切**；**程序取得的时间戳 > LLM 猜的日期**。近似源之间**不判高下**。
+不是源级权威排序，只有**一条**覆盖关系：**页面提取 > 一切**。其余日期值之间**一律不判高下**。
 
 ```sql
 -- schema（迁移 drizzle/0013）
 published_at_authority smallint NOT NULL DEFAULT 0
 -- 0 无日期
--- 1 LLM 推断值（published-at-inference 的 AI 回填——【猜】的）
--- 2 程序取得的近似值（rss pubDate / hacker_news 投稿时刻 / github push 时刻——【真实时间戳】，只是不是发布日）
--- 3 页面确定性提取的发布日（sitemap——文章自己印的）
+-- 1 一切【不是页面确定性提取】的日期值：
+--     rss 的 pubDate / hacker_news 与 show_hn 的投稿时刻 / github 的 push 时刻 / AI 推断
+--     —— 同档互不覆盖，先到者胜出 = 与引入本列之前的 COALESCE 完全一致，零回归
+-- 2 页面确定性提取的发布日（sitemap——文章自己印的那个日期）—— 覆盖一切
 CHECK ((published_at IS NULL) = (published_at_authority = 0))
 
 -- 推导（由 raw_items.source 得出，不给 raw_items 加列）
 authority = CASE WHEN raw_items.published_at IS NULL THEN 0
-                 WHEN raw_items.source = 'sitemap'   THEN 3   -- 恒为页面提取值（lastmod 已被禁止写入）
-                 ELSE                                     2 END
--- 等级 1 不由塌缩产出：只有 published-at-inference 的 CAS 回填写它。
+                 WHEN raw_items.source = 'sitemap'   THEN 2   -- 恒为页面提取值（lastmod 已被禁止写入）
+                 ELSE                                     1 END
+-- published-at-inference 的 CAS 回填同样写 1（与 rss/hn/github 同档）。
+-- 「是否页面提取源」MUST 用 Object.hasOwn(表, source) && 表[source] === true —— 见下「落地陷阱 3」。
 
 -- 归集（塌缩的 DO UPDATE、tombstone 改投、语义合并 —— 三处同口径）
 published_at = CASE WHEN EXCLUDED.published_at_authority > ai_news_events.published_at_authority
@@ -198,17 +200,42 @@ published_at = CASE WHEN EXCLUDED.published_at_authority > ai_news_events.publis
 published_at_authority = GREATEST(ai_news_events.published_at_authority, EXCLUDED.published_at_authority)
 ```
 
-**为何必须是四级、不能三级（LLM 推断绝不能与程序取得的事实同级）**：三级方案里 AI 回填置 `authority = 1`，**与 rss `pubDate` / HN 投稿时刻 / github push 时刻同级**；而口径又定死「同等级不覆盖」⇒
+##### 这个阶梯排的是【离文章发布日有多近】，不是【时间戳来源有多可信】
+
+这是全 D8 唯一需要真正想明白的一句。按后一条轴排会得到一个**错误**的阶梯（「程序 > LLM」的四级方案），它排的是「谁不是 LLM」，而不是「谁更接近文章的发布日」：
+
+| 值 | 精确性 | 它测的是哪个事件 |
+|---|---|---|
+| `hacker_news` 的 `item.time`（`hacker-news.ts:74`） | **真实时间戳** | **投稿到 HN**——错误的事件 |
+| `show_hn` 的 `created_at_i` / `github` 的 `pushed_at` | **真实时间戳** | **投稿 / push**——错误的事件 |
+| `rss` 的 `parseDate(item)` | feed **声明**值（转载/重生成会漂） | 近似 |
+| **AI 推断**（`published-at-inference`） | **猜的** | **文章的发布日**——**正确的事件** |
+| **`sitemap` 的页面提取** | **确定性提取** | **文章的发布日** |
+
+⇒ **对错误事物的精确测量，比对正确事物的粗略估计更坏。**
+
+##### 四级阶梯造成的真实 bug（生产数据可验证）
+
+`sitemap.ts:535` 明写「置 null、**走既有 published-at-inference 从 og: 内容推断真实发布日**」⇒ **sitemap 那一族文章的日期，按设计就住在第 1 档**。生产实测：28 个 sitemap 事件里 10 个有日期，其 `raw_item.published_at` **全为 NULL** ⇒ **那 10 个日期全部来自 AI 回填。**
+
+四级阶梯下：
 
 ```
-第 1 天  某事件 published_at = NULL（0）→ AI 回填猜一个日期 → 1
-第 2 天  该文上了 HN → 塌缩进同一 dedup_key，HN 的【真实投稿时间戳】亦为 1
-        1 > 1 不成立 → 不覆盖 ⇒ 【HN 的真实时间戳输给了 LLM 的猜测】
+1. sitemap 采到 anthropic.com/news/x   → published_at=NULL, authority=0
+2. AI 回填推断出【真实发布日】(2023)   → authority=1
+3. 同一 URL 被发上 HN → 同 dedup_key ⇒ 塌缩
+   → EXCLUDED.authority=2 > 1 ⇒ published_at := 【HN 投稿时刻】= 今天
+⇒ 2023 年的老文 published_at 变成今天 ⇒ 过时效闸 ⇒ 当成今日重大发布推出去
+⇒ 直接违反 policy-push-timeliness
 ```
 
-⇒ **一个 LLM 猜出来的日期会永久挡住一个真实的时间戳**，直接违反第一架构原则（「精确事实由程序与 DB 保障，绝不交 LLM」）。**故 LLM 推断独占最低的非零级：程序 > LLM。**
+**而引入本列【之前】的 `COALESCE(已有, 来者)` 单向 NULL-fill 会保住第 2 步的真日期 ⇒ 四级阶梯是【相对现状的净回归】。**
 
-**为何这个排序是对的（三句话）**：真实时间戳（2）覆盖 LLM 猜测（1）——**程序 > LLM**；页面提取（3）覆盖一切——它是全系统唯一的真发布日；**近似值之间（2 vs 2）仍不覆盖** ⇒ rss / hn / github 三者之间**行为零变化**。
+##### 三条 MUST（缺一条，下一个人就会「优化」回四级）
+
+1. **排的是「离文章发布日有多近」，不是「时间戳来源有多可信」**（上表）。
+2. **MUST NOT 在第 1 档内部再排序**：任何档内排序都会引入一条**能把日期往后推**的覆盖关系——例如让转载 RSS 的今日 `pubDate` 覆盖 LLM 正确推断出的 2023 年发布日 ⇒ 老文又看起来是新的 ⇒ 正是要防的方向。而**页面提取读的是文章自己印的日期，结构上不可能让老文看起来新**——故只有它有资格覆盖。
+3. **「一个 LLM 猜出来的日期会永久挡住一个真实的时间戳」这条反对意见被显式驳回**（它正是四级阶梯的原始理由）：那个「真实的时间戳」测的是**投稿 / push**，不是**发表**。它挡住的不是「真相」，是**另一个近似值**。而放它进来的代价是把老文推成今日突发。
 
 **为何这两行就够（不是漏了 NULL-fill）**：不变量 `published_at IS NULL ⟺ authority = 0` 使 **NULL-fill 成为「权威高者胜出」的一个特例**——已有 NULL ⇒ authority=0 ⇒ 任何非空来者（≥1）> 0 ⇒ 自动填入。归集运算取**上确界**（幂等、与顺序无关）⇒ 塌缩与合并的并发两序皆自洽（不需新锁）。
 
@@ -216,21 +243,26 @@ published_at_authority = GREATEST(ai_news_events.published_at_authority, EXCLUDE
 
 ```sql
 ALTER TABLE ai_news_events ADD COLUMN published_at_authority smallint NOT NULL DEFAULT 0;
-UPDATE ai_news_events SET published_at_authority = 2 WHERE published_at IS NOT NULL;  -- 存量统一标【程序近似】
+UPDATE ai_news_events SET published_at_authority = 1 WHERE published_at IS NOT NULL;  -- 存量统一标【非页面提取】
 ALTER TABLE ai_news_events ADD CONSTRAINT ai_news_events_published_at_authority_check
   CHECK ((published_at IS NULL) = (published_at_authority = 0));                      -- 【最后】才加约束
 ```
 
 drizzle-kit 从 schema 生成时会把 `ADD COLUMN` 与 `ADD CONSTRAINT` **一起**吐出，而手工插 `UPDATE` 的自然位置是**文件末尾** ⇒ 得到「先加 CHECK、再回填」⇒ 加约束的瞬间存量**每一行**（`published_at IS NOT NULL AND authority = 0`，列的 DEFAULT）**全部违反** ⇒ **迁移 abort、容器起不来**。**空库 CI 恒绿——只在生产炸。**
 
-**存量回填值取 2（不是 1）**：存量的非空 `published_at` 里**确实混有** AI 推断写入的值（`backfill.ts` 已在生产跑），而该列不区分来源 ⇒ **无法把它们与程序值分开** ⇒ 保守统一置 **2**。**登记这个不精确性**：这些行会被误标为「程序近似」，代价是它们不会被真实的 rss/hn 日期覆盖——**与今天的 `COALESCE` 行为完全一致，零回归**。要修的那一格（页面提取 3 > 一切）不受影响。
+**存量回填值 MUST 为 1，MUST NOT 为 2**：页面确定性提取这条采集路径**在本变更之前根本不存在**（sitemap 采集器一律置 `published_at = NULL`），故存量的**一切**非空 `published_at` 必然来自 rss / hn / show_hn / github / AI 推断——**全部落在第 1 档**。回填 1 是**精确的**，不是保守近似。回填 2 会给存量行一个它们没有的覆盖权：一条被误标为「页面提取」的存量行会让后到的**真**页面提取值（亦为 2）因「同档不覆盖」被丢弃，正好废掉本变更要修的那一格。而「存量里 AI 推断值与程序时间戳分不开」**不构成问题**——第 1 档内部本就不排序、互不覆盖，**与今天的 `COALESCE` 行为完全一致，零回归**。
 
 **语义合并那半 MUST 一并改**：存活者按 `first_seen_at` 定，与「谁的日期更精确」毫无关系——HN 先塌缩出的事件吞掉一条带页面提取日期的事件时，旧口径会把精确值丢弃。**只改塌缩 = 修一半。**
 
 #### 塌缩侧的两个落地陷阱（钉死）
 
-1. **塌缩的 raw_item 视图没有 `source`**（候选 SELECT 也不投影它），而 authority 推导的**全部依据**就是 `raw_items.source`。字段 MUST 为 **required**（`source: string`）——写成 `source?: string | null`（与既有的 `publishedAt?: Date | null` 同风格）会让全部既有调用点/测试 seed **不改就编译通过** ⇒ `source` 为 `undefined` ⇒ sitemap 恒推导为 2 ⇒ **页面提取的日期永不覆盖 HN 的投稿时刻** ⇒ **整个变更对「上了 HN 的重大发布」是 no-op**，而 `CHECK` 满足、迁移正常、手工构造 item 的单测**全绿**。故验收 MUST 走**读真库的塌缩集成测试**。
-2. **tombstone 改投分支今天完全不写 `published_at`**（只累加 `source_count` + 更新 `last_seen_at`），而它是那条 raw_item 的**唯一**写入路径 ⇒ 不改就把 authority=3 的精确日期整个丢掉。改投函数签名 MUST 加 `publishedAt` + `authority` 两参，按同一口径归集。
+1. **塌缩的 raw_item 视图没有 `source`**（候选 SELECT 也不投影它），而 authority 推导的**全部依据**就是 `raw_items.source`。字段 MUST 为 **required**（`source: string`）——写成 `source?: string | null`（与既有的 `publishedAt?: Date | null` 同风格）会让全部既有调用点/测试 seed **不改就编译通过** ⇒ `source` 为 `undefined` ⇒ sitemap 恒推导为第 1 档 ⇒ **页面提取的日期永不覆盖 HN 的投稿时刻** ⇒ **整个变更对「上了 HN 的重大发布」是 no-op**，而 `CHECK` 满足、迁移正常、手工构造 item 的单测**全绿**。故验收 MUST 走**读真库的塌缩集成测试**。
+2. **tombstone 改投分支今天完全不写 `published_at`**（只累加 `source_count` + 更新 `last_seen_at`），而它是那条 raw_item 的**唯一**写入路径 ⇒ 不改就把 authority=2 的页面提取日期整个丢掉。改投函数签名 MUST 加 `publishedAt` + `authority` 两参，按同一口径归集。
+3. **「是否页面提取源」的判定 MUST NOT 走原型链**。推导入参是 `raw_items.source`（`varchar`，DB 读出口没有类型兜底，运行时可为任意字符串）。登记两个都会中招的写法：
+   - `source in PAGE_EXTRACTED_SOURCES` 判「未知源」⇒ `'toString' in {…}` 为 **`true`**（来自 `Object.prototype`）⇒ **不告警**；
+   - `PAGE_EXTRACTED_SOURCES[source]` 做 truthy 判定 ⇒ `{…}['toString']` 取到的是一个**函数** ⇒ **truthy** ⇒ **拿到「页面提取」的覆盖权**。
+
+   ⇒ `toString` / `constructor` / `valueOf` / `hasOwnProperty` 这些键**既不触发未知源告警、又拿到最高档**——恰好在这道守卫要防的那一类输入上失效。**MUST**：`Object.hasOwn(表, source) && 表[source] === true`；未知源记一行去重的错误日志 + 按第 1 档处理（安全侧）。
 
 ### D9 — 告警必须有一个出口：`AlertSink` 接真通道，限频交给 DB
 

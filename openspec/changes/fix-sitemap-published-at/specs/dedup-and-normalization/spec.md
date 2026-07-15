@@ -10,34 +10,44 @@
 
 塌缩的 `INSERT` 分支必须**省略 `event_id`**，由数据库默认值 `gen_random_uuid()::text` 生成不透明身份；首次创建时必须写入 `representative_raw_item_id`、`representative_title`（取代表 `raw_item` 的**原始 title**——非归一化标题，保证 `NOT NULL`，供摘要降级时回退展示；原始 title 通常可读，极个别为空串 `''` 的情形由摘要降级兜底到 canonical_url）、`first_seen_at`、`published_at`（取代表 `raw_item` 的发布时间）与 `published_at_authority`（见下「发布日权威等级」），并初始化 `source_count=1`。`ON CONFLICT DO UPDATE` 分支必须累加 `source_count`、更新 `last_seen_at`，并按**权威等级高者胜出**归集 `published_at`（见下）。`ON CONFLICT DO UPDATE` 分支**禁止**覆盖 `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at`——否则事件身份与「首建代表原文」语义被后到的 `raw_item` 破坏。
 
-**发布日权威等级（`published_at_authority`，本需求修改点）**：`published_at` 的归集**不得**再是无条件的单向 NULL-fill（`COALESCE(已有, EXCLUDED)`，「先到者永久胜出」）。原口径下**任何**先到的非 NULL 值——包括**近似值**、乃至 **LLM 猜出来的值**——都会把后到的**精确值**挡在门外，而各来源写入 `published_at` 的语义并不等价：
+**发布日权威等级（`published_at_authority`，本需求修改点）**：`published_at` 的归集**不得**再是无条件的单向 NULL-fill（`COALESCE(已有, EXCLUDED)`，「先到者永久胜出」）。原口径下任何先到的非 NULL 值都会把后到的**页面提取值**挡在门外——而页面提取是全系统唯一一个「文章自己印的发布日」。
 
-| 来源 | 值的语义 | 等级 |
-|---|---|---|
-| AI 推断回填（published-at-inference） | 模型**猜**的日期 | **1（LLM 推断）** |
-| `hacker_news` | 投稿到 HN 的时刻 | 2（程序近似） |
-| `rss` | feed 的 `pubDate`（可能是重新生成/转载时刻） | 2（程序近似） |
-| `github` | 仓库 `pushed_at` | 2（程序近似） |
-| `sitemap` | **文章页面上自己印的发布日**（确定性页面提取，见 source-collectors） | **3（页面提取）** |
+**这个阶梯排的是「这个值离【文章的发布日】有多近」，绝不是「这个时间戳的来源有多可信」。** 二者是两条不同的轴，按后者排会得到一个**错误的**阶梯（见下「MUST NOT 在第 1 档内部再排序」）：
 
-故系统必须为 `ai_news_events` 维护一列 `published_at_authority smallint NOT NULL DEFAULT 0`（见 platform-foundation「published_at 权威等级列可迁移」），取值为**四级**：
+| 来源 | 值测的是哪个事件 | 精确性 | 是文章的发布日吗 |
+|---|---|---|---|
+| `hacker_news` / `show_hn` | **投稿到站点的时刻** | 真实时间戳 | ❌ **测的是错误的事件** |
+| `github` | 仓库 `pushed_at`（push 时刻） | 真实时间戳 | ❌ **测的是错误的事件** |
+| `rss` | feed **声明**的 `pubDate`（转载 / 重新生成时会漂） | 声明值 | ❌ 近似 |
+| AI 推断回填（published-at-inference） | **文章的发布日** | **猜的** | ✅ **猜的是正确的事件** |
+| `sitemap` | **文章页面上自己印的发布日**（确定性页面提取，见 source-collectors） | 确定性提取 | ✅ |
+
+**两个反直觉事实 MUST 逐字读到**：HN 的投稿时刻是一个**真实**的时间戳，但它测的是**错误的事件**（谁在何时把链接贴上了 HN）；AI 推断是**猜**的，但它猜的是**正确的事件**（文章何时发布）。⇒ **对错误事物的精确测量，比对正确事物的粗略估计更坏。**
+
+故系统必须为 `ai_news_events` 维护一列 `published_at_authority smallint NOT NULL DEFAULT 0`（见 platform-foundation「published_at 权威等级列可迁移」），取值为**两级非空**：
 
 ```
 0 = 无日期
-1 = LLM 推断值（AI 回填——它是【猜】的）
-2 = 程序取得的近似值（rss pubDate / hacker_news 投稿时刻 / github push 时刻——是【真实时间戳】，只是不是发布日）
-3 = 页面确定性提取的发布日（sitemap——文章自己印的日期）
+1 = 一切【不是页面确定性提取】的日期值
+    （rss 的 pubDate / hacker_news 与 show_hn 的投稿时刻 / github 的 push 时刻 / AI 推断）
+    —— 【同档互不覆盖】，先到者胜出 = 与引入本列之前的 COALESCE 完全一致的行为，零回归
+2 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取的、文章自己印的那个日期）
+    —— 覆盖一切
 ```
 
-**为何 LLM 推断（1）MUST 严格低于程序近似值（2）——这是第一架构原则的直接推论，不是口味**：若二者同级，而本口径又规定「**同等级不覆盖**」，则：
+**MUST NOT 在第 1 档内部再排序**——**任何**档内排序（含「程序取得的时间戳 > LLM 推断」这一种）都会引入一条**能把日期往后推**的覆盖关系：例如让一条转载 RSS 的**今日** `pubDate` 覆盖 LLM 已正确推断出的 2023 年发布日 ⇒ 老文又看起来是新的 ⇒ 过时效闸 ⇒ 被当成今日重大发布推出去，直接违反 `policy-push-timeliness`。而**页面提取读的是文章自己印的日期，结构上不可能让老文看起来新**——**故只有它有资格覆盖**。
+
+**「一个 LLM 猜出来的日期会永久挡住一个真实的时间戳」这条反对意见 MUST 被显式驳回**：那个「真实的时间戳」测的是**投稿 / push**，不是**发表**。它挡住的不是「真相」，是**另一个近似值**。而放它进来的代价是把老文推成今日突发：
 
 ```
-第 1 天  某事件 published_at = NULL（0）→ AI 回填猜一个日期 → 1
-第 2 天  该文上了 HN，塌缩进同一 dedup_key，HN 的【真实投稿时间戳】亦为 1
-        1 > 1 不成立 → 不覆盖 ⇒ 【HN 的真实时间戳输给了 LLM 的猜测】
+1. sitemap 采到 anthropic.com/news/x（2023 年老文）→ 无页面提取日期 ⇒ published_at = NULL、authority = 0
+2. AI 回填推断出它【真实的发布日】(2023) ⇒ authority = 1
+3. 同一 URL 被发上 HN ⇒ 同 dedup_key ⇒ 塌缩命中该事件
+   若「程序时间戳」被排在「LLM 推断」之上：EXCLUDED 更高 ⇒ published_at := 【HN 投稿时刻】= 今天
+⇒ 2023 年的老文 published_at 变成【今天】⇒ 过时效闸 ⇒ 当成今日重大发布推出去
 ```
 
-⇒ 一个 LLM 猜出来的日期会**永久挡住**一个真实的时间戳，直接违反「精确事实由程序与 DB 保障，绝不交 LLM」。故排序 MUST 为 **程序 > LLM**。而**程序近似值之间（2 vs 2）仍不覆盖** ⇒ rss / hacker_news / github 三者之间的既有「先到者胜出」**行为零变化**；页面提取（3）覆盖一切。
+**这不是理论风险，而是相对现状的净回归**：引入本列**之前**的 `COALESCE(已有, 来者)` 单向 NULL-fill 会**保住**第 2 步的真日期。且「AI 回填的值住在第 1 档」是**当前生产的真实形状**——sitemap 采集器在页面提取上线前一律置 `published_at = NULL` 交 AI 回填，生产实测 28 个 sitemap 事件里 10 个有日期、其 `raw_item.published_at` **全为 NULL** ⇒ **那 10 个日期全部来自 AI 回填**。（本变更给 sitemap 源加了推断豁免，故此后**新**的 sitemap 事件不再走这条路；但那 10 条存量、以及**所有非豁免源**的回填值仍住在第 1 档，覆盖关系一旦引入即刻生效。）
 
 **不变量（MUST）**：`(published_at IS NULL) = (published_at_authority = 0)`（须由 DB `CHECK` 约束兜底）。
 
@@ -46,12 +56,14 @@
 ```
 authority = CASE
   WHEN raw_items.published_at IS NULL   THEN 0
-  WHEN raw_items.source = 'sitemap'     THEN 3   -- 恒为页面提取值
-  ELSE                                       2   -- 程序取得的近似时间戳
+  WHEN raw_items.source = 'sitemap'     THEN 2   -- 恒为页面提取值
+  ELSE                                       1   -- 非页面提取（rss / hacker_news / show_hn / github …）
 END
 ```
 
-（等级 1 不由塌缩产出——它**只**由 `published-at-inference` 的 CAS 回填写入，见下。）
+（`published-at-inference` 的 CAS 回填同样写等级 **1**——它与 rss / hn / github **同档、互不覆盖**，见下与 published-at-inference。）
+
+**「页面提取源」的判定 MUST 是一张显式登记表（`source → boolean`），且 MUST 只认自有属性**：本判定的入参是 `raw_items.source`（DB 里的 `varchar`，运行时可为**任意字符串**），故 MUST 用 `Object.hasOwn(表, source) && 表[source] === true`。**MUST NOT** 用 `source in 表` 判「未知源」、**MUST NOT** 用 truthy 判「是否页面提取」——**两者都走原型链**：`'toString' in {…}` 为 `true`（来自 `Object.prototype`），而 `{…}['toString']` 取到的是一个**函数**（truthy）⇒ `toString` / `constructor` / `valueOf` / `hasOwnProperty` 这些键**既不触发「未知源」告警、又拿到「页面提取」的覆盖权**（实测：修复前该推导对 source=`'toString'` 返回最高档）。恰好在这道守卫要防的那一类输入上失效。未知源 MUST 记一行错误日志（按 source 去重，不刷屏）并按**非页面提取档**（1）处理——安全侧，不凭空获得覆盖权。
 
 **塌缩的 raw_item 视图 MUST 携带 `source`，且该字段 MUST 为必填（非可选）**：上式的**全部依据**就是 `raw_items.source`，而塌缩今天读出的 raw_item 视图**不含 `source`**、其候选 SELECT 也**不投影 `source`**。故：
 
@@ -72,17 +84,17 @@ published_at_authority = GREATEST(ai_news_events.published_at_authority,
                                   EXCLUDED.published_at_authority)
 ```
 
-**这两行就是全部——不需要再补一个 NULL-fill 分支**（易被后人误读为「漏了」）：不变量 `published_at IS NULL ⟺ authority = 0` 使 **NULL-fill 成为「权威高者胜出」的一个特例**——事件已有 NULL ⇒ 其 authority = 0 ⇒ 任何非 NULL 来者（authority ≥ 1）严格大于 0 ⇒ 自动填入。而**同等级不覆盖**（2 vs 2 ⇒ 保留已有）⇒ **程序近似值之间维持既有的「先到者胜出」，行为零变化**；程序近似（2）> LLM 推断（1）⇒ 真实时间戳取代猜测（**程序 > LLM**）；页面提取（3）> 一切 ⇒ 覆盖，这正是本条要修的那一格。
+**这两行就是全部——不需要再补一个 NULL-fill 分支**（易被后人误读为「漏了」）：不变量 `published_at IS NULL ⟺ authority = 0` 使 **NULL-fill 成为「权威高者胜出」的一个特例**——事件已有 NULL ⇒ 其 authority = 0 ⇒ 任何非 NULL 来者（authority ≥ 1）严格大于 0 ⇒ 自动填入。而**同等级不覆盖**（1 vs 1 ⇒ 保留已有）⇒ **非页面提取的日期值之间维持既有的「先到者胜出」，行为零变化**；页面提取（2）> 一切 ⇒ 覆盖，这正是本条要修的那一格、也是**唯一**新增的覆盖关系。
 
 多条同 `dedup_key` 但日期不同的 `raw_item` 并发塌缩时，**同权威等级**内取**先抢到行锁那条**的值：取哪条依到达序、非全序确定，但**始终是某条真实 `raw_item` 的发布时间**（不丢、不臆造）；契约只承诺「同等级内填入某个真实值、更高等级到来时以之取代」，不承诺同等级内选最早/最晚，故无需 per-dedup 序列化锁或聚合子查询。
 
-**存量 `published_at` MUST NOT 被触碰**（迁移只加列 + 回填 `authority`，见 platform-foundation）：同一 `canonical_url` 下 HN 与 RSS 的日期实测可差 ±12 天且**方向不定**（HN 常**早于** RSS），**哪个是文章真正的发布日，数据里根本没有**。任何「按源权威性排序去清洗存量」都是猜，且猜错的方向会把老事件的 `published_at` 往后推 ⇒ **让老文看起来更新** ⇒ 正是时效性红线要防的方向。本能力**只**引入「页面提取 > 近似」这一条覆盖关系，**不**引入任何近似源之间的排序（`rss` 与 `hacker_news` 谁更权威**没有依据**，故不判）。
+**存量 `published_at` MUST NOT 被触碰**（迁移只加列 + 回填 `authority`，见 platform-foundation）：同一 `canonical_url` 下 HN 与 RSS 的日期实测可差 ±12 天且**方向不定**（HN 常**早于** RSS），**哪个是文章真正的发布日，数据里根本没有**。任何「按源权威性排序去清洗存量」都是猜，且猜错的方向会把老事件的 `published_at` 往后推 ⇒ **让老文看起来更新** ⇒ 正是时效性红线要防的方向。本能力**只**引入「页面提取 > 其余一切」这一条覆盖关系，**不**引入第 1 档内部的任何排序（`rss` / `hacker_news` / `github` / AI 推断 谁更接近发布日**没有依据**，故不判——而任何一种判法都会引入一条能把日期往后推的覆盖关系）。
 
 **tombstone 改投（P3 新增）**：当塌缩的 `ON CONFLICT (dedup_key)` 命中的既有事件已被语义合并置 `merged_into` 非空（tombstone，见 semantic-dedup「确定性事件合并」），系统必须把该 `raw_item` 改塌缩进 `merged_into` 指向的存活事件，禁止新建重复事件、也禁止把 `source_count` 累加到 tombstone 行。**改投必须沿 `merged_into` 链递归/迭代到终态存活者**（`merged_into IS NULL`）——存活者本身可能在后续轮次再被合并而成 tombstone，单跳改投可能仍落在 tombstone 上；解析须带环路保护（已访问集合，命中环即报错告警，绝不无限循环）。`source_count` 仅对真正新到的 `raw_item` `+1`，绝不重加被吞事件已冻结的 `source_count`（见 semantic-dedup「source_count 不重复计数」）。
 
-**改投的并发原子性（关键：塌缩与语义合并跨链并发）**：塌缩入口 `collapseUncollapsedRawItems` **日报链与实时告警高频链共用**，而告警链**不持日报单例锁**（`alert-scan.ts` 每 20min 跑塌缩、`acquireAlertLock` 只裹分发不裹塌缩），故告警链塌缩会与日报链语义合并**并发**。因此 tombstone 改投**不可**用裸 `ON CONFLICT (dedup_key) DO UPDATE SET source_count = source_count + 1`——该写会落在被命中行上，若该行刚被合并置 tombstone，就把已冻结的 tombstone `source_count` 误加（违反冻结不变量）、且不改投。改投必须：①增量目标是**链解析后的终态存活者**而非被命中行——对命中行的 `DO UPDATE` 加 `WHERE ai_news_events.merged_into IS NULL` 守卫（命中 tombstone 时该 `DO UPDATE` 不动 tombstone），命中行为 tombstone 时改在**同一事务内**对命中行取行锁（`ON CONFLICT` 对冲突行本就持行锁，或显式 `SELECT ... FOR UPDATE`）读 `merged_into`、链解析到存活者后 `UPDATE 存活者 SET source_count = source_count + 1, last_seen_at = ...`；②靠**冲突 `dedup_key` 那一行的行锁**与并发的语义合并（合并对被吞行 `FOR UPDATE`）串行化——两侧争同一行锁，故无论谁先提交都自洽：合并先提交→塌缩读到 `merged_into` 非空→改投存活者（+1 落存活者）；塌缩先提交（+1 落尚未 tombstone 的命中行）→合并随后 `源count += 被吞`（把这 +1 一并吸收进存活者）。两序皆不丢不重。**改投到存活者时 `published_at` / `published_at_authority` MUST 同样按「权威高者胜出 + `GREATEST`」归集**（与 `DO UPDATE` 分支同口径，绝不因走改投分支而退回单向 NULL-fill）。**这是本需求修改点，不是重申**：改投函数今天**完全不写 `published_at`**（只累加 `source_count` + 更新 `last_seen_at`），而**改投分支是那条 `raw_item` 的唯一写入路径**——不改则一条 authority=3 的页面提取日期在命中 tombstone 时被**整个丢弃**，且无任何后续路径会补。故改投函数的签名 MUST 携带该 raw_item 的 `published_at` 与推导出的 `published_at_authority` 两个参数，对终态存活者按同一口径归集。
+**改投的并发原子性（关键：塌缩与语义合并跨链并发）**：塌缩入口 `collapseUncollapsedRawItems` **日报链与实时告警高频链共用**，而告警链**不持日报单例锁**（`alert-scan.ts` 每 20min 跑塌缩、`acquireAlertLock` 只裹分发不裹塌缩），故告警链塌缩会与日报链语义合并**并发**。因此 tombstone 改投**不可**用裸 `ON CONFLICT (dedup_key) DO UPDATE SET source_count = source_count + 1`——该写会落在被命中行上，若该行刚被合并置 tombstone，就把已冻结的 tombstone `source_count` 误加（违反冻结不变量）、且不改投。改投必须：①增量目标是**链解析后的终态存活者**而非被命中行——对命中行的 `DO UPDATE` 加 `WHERE ai_news_events.merged_into IS NULL` 守卫（命中 tombstone 时该 `DO UPDATE` 不动 tombstone），命中行为 tombstone 时改在**同一事务内**对命中行取行锁（`ON CONFLICT` 对冲突行本就持行锁，或显式 `SELECT ... FOR UPDATE`）读 `merged_into`、链解析到存活者后 `UPDATE 存活者 SET source_count = source_count + 1, last_seen_at = ...`；②靠**冲突 `dedup_key` 那一行的行锁**与并发的语义合并（合并对被吞行 `FOR UPDATE`）串行化——两侧争同一行锁，故无论谁先提交都自洽：合并先提交→塌缩读到 `merged_into` 非空→改投存活者（+1 落存活者）；塌缩先提交（+1 落尚未 tombstone 的命中行）→合并随后 `源count += 被吞`（把这 +1 一并吸收进存活者）。两序皆不丢不重。**改投到存活者时 `published_at` / `published_at_authority` MUST 同样按「权威高者胜出 + `GREATEST`」归集**（与 `DO UPDATE` 分支同口径，绝不因走改投分支而退回单向 NULL-fill）。**这是本需求修改点，不是重申**：改投函数今天**完全不写 `published_at`**（只累加 `source_count` + 更新 `last_seen_at`），而**改投分支是那条 `raw_item` 的唯一写入路径**——不改则一条 authority=2（页面提取）的日期在命中 tombstone 时被**整个丢弃**，且无任何后续路径会补。故改投函数的签名 MUST 携带该 raw_item 的 `published_at` 与推导出的 `published_at_authority` 两个参数，对终态存活者按同一口径归集。
 
-流水线下游对同一事件行的后续写入（Value Judge 写 `*_score`/`should_push`、中文摘要写 `summary_zh`、published-at-inference 在所有关联 raw_item 均无发布时间时回填 `published_at`）必须以 `UPDATE ... WHERE event_id = ?` 定位、`set` 中**只含本阶段目标列**（published-at-inference 的回填须附 `AND published_at IS NULL` 的 CAS 守卫，且**必须同时把 `published_at_authority` 置 1**——**1 = LLM 推断，是四级里最低的非零等级**：它既不能留在 0 而破坏 `published_at IS NULL ⟺ authority = 0` 不变量，也**绝不可**与程序取得的时间戳（2）同级——否则一个猜出来的日期会永久挡住后到的真实 rss / hn 时间戳；豁免源不进回填域，见 published-at-inference），禁止用 `INSERT ... ON CONFLICT` 模板（P0 `persistEventScores` 的全列覆盖式 `set` 是反面模板），以免把 `published_at`/`representative_*`/`first_seen_at` 覆盖回 NULL 而使 Top N 排序静默退化。
+流水线下游对同一事件行的后续写入（Value Judge 写 `*_score`/`should_push`、中文摘要写 `summary_zh`、published-at-inference 在所有关联 raw_item 均无发布时间时回填 `published_at`）必须以 `UPDATE ... WHERE event_id = ?` 定位、`set` 中**只含本阶段目标列**（published-at-inference 的回填须附 `AND published_at IS NULL` 的 CAS 守卫，且**必须同时把 `published_at_authority` 置 1**——**1 = 非页面提取档**，与 rss `pubDate` / hn 投稿时刻 / github push 时刻**同档、互不覆盖**：它既不能留在 0 而破坏 `published_at IS NULL ⟺ authority = 0` 不变量，也**绝不可**被排到那些时间戳之下——AI 推断猜的是**发布日**（正确的事件），而那些时间戳测的是**投稿 / push**（错误的事件），让后者覆盖前者会把老文的日期推成今天；豁免源不进回填域，见 published-at-inference），禁止用 `INSERT ... ON CONFLICT` 模板（P0 `persistEventScores` 的全列覆盖式 `set` 是反面模板），以免把 `published_at`/`representative_*`/`first_seen_at` 覆盖回 NULL 而使 Top N 排序静默退化。
 
 去重判定的**最终事实**必须全程由程序与 DB 唯一约束保障，禁止交给 LLM。本需求只规定**硬去重层**（第一层硬去重 + 第二层 `title_hash`）行为；embedding 相似度（第三层）与 LLM 二次判断（第四层）在硬去重塌缩**之后**由 semantic-dedup capability 承接——其 LLM 仅产语义判断（结构见 semantic-dedup「LLM 二次判断」，`{same_event, same_product, reason}`），是否合并的最终落库仍由程序 + DB 单事务执行（见 semantic-dedup）。本需求不再禁止后续期次引入 embedding/LLM 语义层（原 P1/P2「本期仅做硬去重层、禁止引入 embedding 相似度或 LLM 二次判断」的期次限制随 P3 解除）。
 
@@ -96,28 +108,32 @@ published_at_authority = GREATEST(ai_news_events.published_at_authority,
 
 #### 场景:首建记录代表原文与时间列
 - **当** 某 `dedup_key` 首次创建事件
-- **那么** 该事件的 `representative_raw_item_id` 与 `representative_title` 记录为第一条命中的 `raw_item`，`first_seen_at` 与 `published_at` 被写入、`published_at_authority` 按代表 raw_item 的 `source` 推导（无日期 → 0、`sitemap` → 3、其余程序源 → 2），`event_id` 为数据库生成的 UUID 文本
+- **那么** 该事件的 `representative_raw_item_id` 与 `representative_title` 记录为第一条命中的 `raw_item`，`first_seen_at` 与 `published_at` 被写入、`published_at_authority` 按代表 raw_item 的 `source` 推导（无日期 → 0、`sitemap`（页面确定性提取）→ 2、其余源 → 1），`event_id` 为数据库生成的 UUID 文本
 
 #### 场景:再次塌缩不覆盖身份与代表原文
 - **当** 第二条同 `dedup_key` 的 `raw_item` 经 `ON CONFLICT DO UPDATE` 命中已存在事件
-- **那么** `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at` 保持首建值不变，仅 `source_count` 累加、`last_seen_at` 更新；`published_at` 在后到者**权威等级不高于**已有值时保持不变（程序近似值之间 2 vs 2「先到者胜出」，行为与本需求修改前一致）
+- **那么** `event_id`、`representative_raw_item_id`、`representative_title`、`first_seen_at` 保持首建值不变，仅 `source_count` 累加、`last_seen_at` 更新；`published_at` 在后到者**权威等级不高于**已有值时保持不变（第 1 档内部 1 vs 1「先到者胜出」，行为与本需求修改前的 `COALESCE` 一致）
 
 #### 场景:后到 raw_item 的确定发布时间补空（确定性优先于 AI）
 - **当** 某事件首建时 `published_at` 为 NULL（首条 raw_item 无发布时间、`published_at_authority = 0`），后到的同 `dedup_key` raw_item 带确定 `published_at`
 - **那么** 后到者的 authority（≥ 1）**严格大于** 0 ⇒ 经「权威高者胜出」把该值补入、`published_at_authority` 取 `GREATEST` —— NULL-fill 是本口径的一个特例，不需另设分支；该事件不再进入 AI 推断阶段（确定性事实优先、不交 LLM）
 
-#### 场景:程序取得的真实时间戳取代 LLM 推断值
-- **当** 某事件的 `published_at` 由 AI 推断回填写入（`published_at_authority = 1`，模型**猜**的），随后同 `dedup_key` 的 `hacker_news` / `rss` raw_item 带**真实时间戳**（投稿时刻 / feed `pubDate`，authority = 2）塌缩命中该事件
-- **那么** 2 > 1 ⇒ `published_at` 被**取代**为程序取得的真实时间戳、`published_at_authority` 升为 2。**绝不可**把 AI 推断与程序时间戳并列为同一等级——同级不覆盖，那样一个 LLM 猜出来的日期会**永久挡住**一个真实的时间戳，直接违反「精确事实由程序与 DB 保障，绝不交 LLM」
+#### 场景:程序时间戳与 LLM 推断同档、互不覆盖
+- **当** 某事件的 `published_at` 由 AI 推断回填写入（`published_at_authority = 1`，猜的是**文章的发布日**——正确的事件、粗略的估计），随后同 `dedup_key` 的 `hacker_news` / `rss` raw_item 带**投稿时刻 / feed `pubDate`**（亦为 authority = 1——它们是真实时间戳，但测的是**投稿**、不是**发表**）塌缩命中该事件
+- **那么** `1 > 1` 不成立 ⇒ **不覆盖**，`published_at` 保持推断值不变（第 1 档内先到者胜出 = 引入本列之前 `COALESCE` 的行为，零回归）。**绝不可**把程序取得的时间戳排到 AI 推断之上**——那个「真实的时间戳」测的是投稿 / push，不是发表；它挡住的不是「真相」，是另一个近似值**。而放它进来会把一篇 2023 年的老文（其发布日由 AI 正确推断出）在被发上 HN 的当天改写成**今天** ⇒ 过时效闸 ⇒ 当成今日重大发布推出去，违反 `policy-push-timeliness`
 
 #### 场景:页面提取的发布日覆盖已有的近似日期
-- **当** 某事件已由 `hacker_news`（投稿时刻，authority=2）或 `rss`（feed `pubDate`，authority=2）先塌缩并写入 `published_at`，随后同 `canonical_url` 的 `sitemap` raw_item（页面确定性提取的发布日，authority=3）塌缩命中该事件
-- **那么** `published_at` 被**覆盖**为页面提取值、`published_at_authority` 升为 3（`GREATEST`）——**绝不可**因「已有值非 NULL」而按旧的 `COALESCE` 口径丢弃它。这条正是「上了 HN 的重大模型发布」在旧口径下拿不到真实发布日的原因（HN 先到、值已非 NULL ⇒ 页面提取值被静默丢弃）
+- **当** 某事件已由 `hacker_news`（投稿时刻，authority=1）或 `rss`（feed `pubDate`，authority=1）先塌缩并写入 `published_at`，随后同 `canonical_url` 的 `sitemap` raw_item（页面确定性提取的发布日，authority=2）塌缩命中该事件
+- **那么** `published_at` 被**覆盖**为页面提取值、`published_at_authority` 升为 2（`GREATEST`）——**绝不可**因「已有值非 NULL」而按旧的 `COALESCE` 口径丢弃它。这条正是「上了 HN 的重大模型发布」在旧口径下拿不到真实发布日的原因（HN 先到、值已非 NULL ⇒ 页面提取值被静默丢弃）。**页面提取是唯一有资格覆盖的档**——它读的是文章自己印的日期，结构上不可能让老文看起来新
 
 #### 场景:塌缩候选未投影 source 时权威推导失效（必填而非可选）
 - **当** 塌缩的 raw_item 视图把 `source` 写成**可选**字段、或候选 SELECT 未投影 `raw_items.source`
-- **那么** 该实现**不合规**：`source` 为 `undefined` 时权威推导退化为「有日期即程序近似（2）」⇒ `sitemap` 恒为 2 ⇒ 页面提取的日期**永远覆盖不了** HN 的投稿时刻 ⇒ 本需求对「上了 HN 的重大发布」完全无效，而 `CHECK` 满足、迁移正常、手工构造 item 的单测**全绿**（假绿）。故视图的 `source` MUST 为**必填**（让每个外部构造点编译报错）、候选 SELECT MUST 投影它，且该项 MUST 由**读真库的塌缩集成测试**验收
+- **那么** 该实现**不合规**：`source` 为 `undefined` 时权威推导退化为「有日期即第 1 档」⇒ `sitemap` 恒为 1 ⇒ 页面提取的日期**永远覆盖不了** HN 的投稿时刻 ⇒ 本需求对「上了 HN 的重大发布」完全无效，而 `CHECK` 满足、迁移正常、手工构造 item 的单测**全绿**（假绿）。故视图的 `source` MUST 为**必填**（让每个外部构造点编译报错）、候选 SELECT MUST 投影它，且该项 MUST 由**读真库的塌缩集成测试**验收
+
+#### 场景:原型链上的键不得拿到「页面提取」的覆盖权
+- **当** `raw_items.source` 的值恰为 `toString` / `constructor` / `valueOf` / `hasOwnProperty` 等 `Object.prototype` 上的键名（该列是 `varchar`，运行时可为任意字符串，类型系统在 DB 读出口不再兜底）
+- **那么** 权威推导 MUST 把它判为**未知源** ⇒ 记一行错误日志（按 source 去重）+ 按**非页面提取档（1）**处理。**MUST NOT** 用 `source in 表` 判未知、**MUST NOT** 用 truthy 判页面提取——**两者都走原型链**：`'toString' in {…}` 为 `true`、且 `{…}['toString']` 取到的是一个**函数**（truthy）⇒ 这些键**既不触发未知源告警、又拿到最高档的覆盖权**（实测：修复前该推导对 `'toString'` 返回最高档）。MUST 用 `Object.hasOwn(表, source)` + `=== true`
 
 #### 场景:塌缩命中 tombstone 改投存活事件
 - **当** 一条新闻类 `raw_item` 的 `dedup_key` 命中的既有事件已被语义合并置 `merged_into` 非空
-- **那么** 该 `raw_item` 改塌缩进 `merged_into` 指向的存活事件，不新建重复事件、不向 tombstone 行累加 `source_count`；其 `published_at` / `published_at_authority` 对存活者按「权威高者胜出 + `GREATEST`」归集（与 `DO UPDATE` 分支同口径）——改投分支今天**完全不写 `published_at`**，而它是该 raw_item 的**唯一**写入路径，故不改则一条 authority=3 的页面提取日期在命中 tombstone 时被整个丢弃、且无任何后续路径会补
+- **那么** 该 `raw_item` 改塌缩进 `merged_into` 指向的存活事件，不新建重复事件、不向 tombstone 行累加 `source_count`；其 `published_at` / `published_at_authority` 对存活者按「权威高者胜出 + `GREATEST`」归集（与 `DO UPDATE` 分支同口径）——改投分支今天**完全不写 `published_at`**，而它是该 raw_item 的**唯一**写入路径，故不改则一条 authority=2 的页面提取日期在命中 tombstone 时被整个丢弃、且无任何后续路径会补

@@ -622,7 +622,7 @@
       | 源子集归属（正文末段） | `MUST NOT 纳入 REALTIME_NEWS_SOURCES`（per-article fetch 较重） | **`MUST 纳入`** + 「实时子集归属」段（成本 / 延迟收益 / 「买到的是采集延迟不是告警资格」/ 重渲染风暴落点 / arxiv·PH 仍排除） |
       | 场景「sitemap 源不进实时告警/产品子集」正文 | 不在 `REALTIME_NEWS_SOURCES`/`PRODUCT_SOURCES` | **在** `REALTIME_NEWS_SOURCES`、**不在** `PRODUCT_SOURCES`（场景名按归档守卫要求保留原样） |
       **在基线之上【只增不减】的两处**：① 源级健康告警**扩到两条链**（基线的「日报链 MUST …」逐字保留，追加高频链 + 共用 `dedupKey` + DB 唯一约束限频 + 「回滚即 `ALERT_SCAN_ENABLED=false`，只放高频链则出口消失」）；② 场景「源级健康告警对每个失败源各响一条」追加一条 `**且**` 覆盖高频链。
-      **`published_at_authority` 已随基线取到【四级】**（`sitemap → 3` / 其余程序源 → **2** / AI 推断 → **1** / 无日期 → 0）——p0 旧副本里的 2/1 两级已作废。
+      **`published_at_authority` 的基线是【两级非空】**（`sitemap` 的页面确定性提取 → **2**；**其余一切非页面提取的日期值**——rss 的 `pubDate`、hacker_news 与 show_hn 的投稿时刻、github 的 push 时刻、AI 推断——一律 → **1**，同档互不覆盖；无日期 → 0）。**MUST NOT 在第 1 档内部再排序**：档内任何排序都会引入一条能把日期**往后推**的覆盖关系（如让转载 RSS 的今日 pubDate 覆盖 LLM 正确推断出的 2023 年发布日）⇒ 老文又看起来是新的。
       **三个新场景已在 delta 内**（归档守卫要求 MODIFIED 块是主规范场景名的**超集**，fix-sitemap 先归档 ⇒ 缺一即 throw）：`日期提取归零由 DB 复算触发告警（与哪条链采的无关）` / `窗内有候选却零发射时整源失败并告警` / `源级健康告警对每个失败源各响一条`。
       **本条的根因就是 p0 自己**：`sitemap` 进 `REALTIME_NEWS_SOURCES` 后，高频链每 15–20min 先采走新文入库 ⇒ 已见集（`raw_items WHERE source='sitemap'`，**不分链**）已含该文 ⇒ 日报链跑 sitemap 时 `emitted = 0` **每天恒成立** ⇒ 旧版那条「`emitted>0 ∧ date_extracted=0`」的告警**永不触发**。基线已把支路①改为 **DB 复算**、支路②改为**采集器内 throw**，二者都与「谁采的」无关。
 - [x] 5.2 **`specs/published-at-inference/spec.md` 的基线 = 当前主规范，已核：无碰撞**（2026-07-14）。`fix-sitemap-published-at` 在该 capability 下走的是 **`## ADDED Requirements`**、需求名为**`确定性提取源豁免 AI 发布日推断`**（另一条需求），而 p0 MODIFY 的是 **`缺失发布时间的 AI 语义推断`** ⇒ 两者**不同名、不碰撞**。p0 delta 已多处引用该豁免需求（A3.3 / D3.2b / 回填域的「豁免源排除」合取项），**MUST NOT 删除**。

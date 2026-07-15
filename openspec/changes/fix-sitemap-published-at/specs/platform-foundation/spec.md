@@ -4,31 +4,24 @@
 
 系统必须以 forward-only 迁移（追加新迁移序号、不重写既有迁移，`drizzle-kit migrate` journal 级幂等）为 `ai_news_events` 新增 `published_at_authority` 列，承载「该行 `published_at` 的来源精确性」，使硬去重塌缩与语义合并的 `published_at` 归集可从「先到者永久胜出」改为「权威等级高者胜出」（见 dedup-and-normalization「基于 dedup_key 的硬去重塌缩」与 semantic-dedup「确定性事件合并」，二者为权威）。
 
-**取值域 MUST 为四级**（三级不够——见下「为何 LLM 推断必须低于程序近似值」）：
+**取值域 MUST 为两级非空**：
 
 ```
 0 = 无日期
-1 = LLM 推断值（published-at-inference 的 AI 回填——它是【猜】的）
-2 = 程序取得的近似值（rss pubDate / hacker_news 投稿时刻 / github push 时刻——是【真实时间戳】，只是不是发布日）
-3 = 页面确定性提取的发布日（sitemap——全系统唯一一个「文章自己印的发布日」）
+1 = 一切【不是页面确定性提取】的日期值
+    （rss 的 pubDate / hacker_news 与 show_hn 的投稿时刻 / github 的 push 时刻 / AI 推断回填）
+    —— 同档互不覆盖，先到者胜出 = 与引入本列之前的 COALESCE 完全一致的行为，零回归
+2 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取的、文章自己印的那个日期）—— 覆盖一切
 ```
 
-**为何 LLM 推断（1）MUST 严格低于程序近似值（2）**：本项目第一架构原则为「精确事实由程序与 DB 保障，**绝不交 LLM**」。若把 AI 推断值与 rss/hn/github 的时间戳并列为同一等级，而本口径又规定「**同等级不覆盖**」，则出现：
-
-```
-第 1 天  某事件 published_at = NULL（authority 0）→ AI 回填猜出一个日期 → authority = 1
-第 2 天  该文上了 HN，塌缩进同一 dedup_key，HN 的【真实投稿时间戳】authority 亦为 1
-        1 > 1 不成立 → 不覆盖 → 【LLM 的猜测永久挡住了一个真实时间戳】
-```
-
-⇒ 直接违反第一架构原则。故 LLM 推断 MUST 独占最低的非零等级：**程序 > LLM**。而近似值之间（2 vs 2）仍不覆盖 ⇒ rss / hacker_news / github 三者之间**行为零变化**；页面提取（3）覆盖一切。
+**这个阶梯排的是「这个值离【文章的发布日】有多近」，不是「这个时间戳的来源有多可信」**：HN 的投稿时刻是**真实**时间戳，但它测的是**错误的事件**（投稿，不是发表）；AI 推断是**猜**的，但它猜的是**正确的事件**（发表）——**对错误事物的精确测量，比对正确事物的粗略估计更坏**。**MUST NOT 在第 1 档内部再排序**（含「程序时间戳 > LLM 推断」）：任何档内排序都会引入一条**能把日期往后推**的覆盖关系（如让转载 RSS 的今日 `pubDate` 覆盖 LLM 已正确推断出的 2023 年发布日）⇒ 老文看起来是新的 ⇒ 过时效闸 ⇒ 当成今日重大发布推出去。而**页面提取读的是文章自己印的日期，结构上不可能让老文看起来新**——故只有它有资格覆盖。完整论证以 dedup-and-normalization「基于 dedup_key 的硬去重塌缩」为权威。
 
 **迁移语句顺序 MUST 逐字钉死（顺序错则生产迁移当场中止）**：
 
 ```sql
 ALTER TABLE ai_news_events ADD COLUMN published_at_authority smallint NOT NULL DEFAULT 0;
 
-UPDATE ai_news_events SET published_at_authority = 2 WHERE published_at IS NOT NULL;
+UPDATE ai_news_events SET published_at_authority = 1 WHERE published_at IS NOT NULL;
 
 ALTER TABLE ai_news_events ADD CONSTRAINT ai_news_events_published_at_authority_check
   CHECK ((published_at IS NULL) = (published_at_authority = 0));
@@ -36,22 +29,23 @@ ALTER TABLE ai_news_events ADD CONSTRAINT ai_news_events_published_at_authority_
 
 **`CHECK` MUST 是最后一条语句。** drizzle-kit 从 schema 生成迁移时会把 `ADD COLUMN` 与 `ADD CONSTRAINT` 一起吐出，而手工插入 `UPDATE` 的自然位置是文件末尾 ⇒ 得到「先加 CHECK、再回填」的顺序 ⇒ 加 CHECK 的瞬间，存量**每一行** `published_at IS NOT NULL AND published_at_authority = 0`（列的 DEFAULT）**全部违反约束** ⇒ **迁移 abort、容器起不来**。**空库 CI 恒绿——该顺序错误只在生产炸。**
 
-**存量回填值 MUST 为 2（程序近似），MUST NOT 触碰任何一行的 `published_at`**：
+**存量回填值 MUST 为 1（非页面提取档），MUST NOT 触碰任何一行的 `published_at`**：
 
-- **登记一处已知的不精确性**：存量的非空 `published_at` 里**确实混有** AI 推断写入的值（`published-at-inference` 已在生产运行），而该列不区分值的来源 ⇒ **无法把它们与程序取得的值分开**。故保守统一置 **2**。代价是：这些被 AI 推断过的存量行会被误标为「程序近似」，从而**不会**被后到的真实 rss / hn 日期覆盖——**与今天的 `COALESCE`（先到者永久胜出）行为完全一致，零回归**。真正要修的那一格（页面提取 3 > 一切）不受影响。
-- **为何不清洗存量 `published_at`**：同一 `canonical_url` 下 HN 与 RSS 的日期实测可差 ±12 天且**方向不定**（HN 常**早于** RSS），**哪个是文章真正的发布日，数据里没有**；任何「按源权威性排序清洗存量」都是猜，而猜错的方向会把老事件的 `published_at` 往后推 ⇒ **让老文看起来更新** ⇒ 正是时效性红线要防的方向。存量事件的日期正确与否**不影响**新口径的正确性（新口径只保证「未来到来的更高权威值能覆盖更低权威值」）。
+- **回填 1 不是保守近似，而是精确的**：存量的**一切**非空 `published_at` 都**不是页面提取值**——页面确定性提取这条采集路径**在本变更之前根本不存在**（`sitemap` 采集器此前一律把 `published_at` 置 NULL）。故存量的每一个非空值必然来自 rss `pubDate` / hn 与 show_hn 的投稿时刻 / github 的 push 时刻 / AI 推断回填，**全部落在第 1 档**。**MUST NOT 回填 2**——那会给存量行一个它们没有的覆盖权：一条被误标为「页面提取」的存量行，会让后到的真页面提取值（亦为 2）因「同档不覆盖」而被丢弃，正好废掉本变更要修的那一格。
+- **档内不区分来源是设计，不是妥协**：第 1 档内部**本来就不排序、互不覆盖**（先到者胜出），故「存量里的 AI 推断值与程序时间戳分不开」**不构成问题**——它们本就同档。行为与今天的 `COALESCE`（先到者永久胜出）**完全一致，零回归**。
+- **为何不清洗存量 `published_at`**：同一 `canonical_url` 下 HN 与 RSS 的日期实测可差 ±12 天且**方向不定**（HN 常**早于** RSS），**哪个是文章真正的发布日，数据里没有**；任何「按源权威性排序清洗存量」都是猜，而猜错的方向会把老事件的 `published_at` 往后推 ⇒ **让老文看起来更新** ⇒ 正是时效性红线要防的方向。存量事件的日期正确与否**不影响**新口径的正确性（新口径只保证「未来到来的页面提取值能覆盖第 1 档的值」）。
 
 **不变量（MUST）**：`(published_at IS NULL) = (published_at_authority = 0)`。该不变量是「权威高者胜出」口径能同时承载 NULL-fill 的**全部依据**（authority=0 严格小于任何非空来者的等级 ⇒ NULL-fill 自动成立、不需另设分支），故 MUST 由 DB `CHECK` 约束兜底，不得只靠应用层自觉。
 
-**该 `CHECK` 会打挂既有测试 seed（MUST 一并纳入工作量）**：任何写入非空 `published_at` 却不写 `published_at_authority` 的 INSERT 都会当场违约。生产写路径由本变更覆盖，但**集成测试的 seed helper 亦须同步**——seed MUST 把 `(published_at, published_at_authority)` 当作**二元组**写入（非空 → 2、NULL → 0）。失败方向是对的（fail-loud，不会静默漏），但它不是零成本。
+**该 `CHECK` 会打挂既有测试 seed（MUST 一并纳入工作量）**：任何写入非空 `published_at` 却不写 `published_at_authority` 的 INSERT 都会当场违约。生产写路径由本变更覆盖，但**集成测试的 seed helper 亦须同步**——seed MUST 把 `(published_at, published_at_authority)` 当作**二元组**写入（非空且非页面提取源 → 1、非空且为 `sitemap` 页面提取 → 2、NULL → 0）。失败方向是对的（fail-loud，不会静默漏），但它不是零成本。
 
 #### 场景:迁移按「加列 → 回填 → 加 CHECK」顺序执行
 - **当** 对**已有存量数据**的生产库执行本迁移
-- **那么** 语句顺序为 `ADD COLUMN`（`NOT NULL DEFAULT 0`）→ `UPDATE ... SET published_at_authority = 2 WHERE published_at IS NOT NULL` → `ADD CONSTRAINT ... CHECK`；**绝不可**把 `CHECK` 排在 `UPDATE` 之前——那样加约束的瞬间存量每一行「有日期但等级为 0」全部违反、迁移 abort、服务起不来（**空库 CI 恒绿，只在生产炸**）
+- **那么** 语句顺序为 `ADD COLUMN`（`NOT NULL DEFAULT 0`）→ `UPDATE ... SET published_at_authority = 1 WHERE published_at IS NOT NULL` → `ADD CONSTRAINT ... CHECK`；**绝不可**把 `CHECK` 排在 `UPDATE` 之前——那样加约束的瞬间存量每一行「有日期但等级为 0」全部违反、迁移 abort、服务起不来（**空库 CI 恒绿，只在生产炸**）
 
 #### 场景:迁移加列并回填权威等级、不动 published_at
 - **当** 对已上线数据库执行本迁移
-- **那么** `ai_news_events` 含 `published_at_authority smallint NOT NULL DEFAULT 0`，所有 `published_at IS NOT NULL` 的存量行 `published_at_authority = 2`（程序近似——存量中被 AI 推断过的行无法与程序值区分，保守统一置 2，代价是它们不会被真实的 rss/hn 日期覆盖，**与今天的 `COALESCE` 行为一致、零回归**）、`published_at IS NULL` 的行为 0，且**没有任何一行的 `published_at` 被修改**（迁移中不含任何写 `published_at` 的语句）
+- **那么** `ai_news_events` 含 `published_at_authority smallint NOT NULL DEFAULT 0`，所有 `published_at IS NOT NULL` 的存量行 `published_at_authority = **1**`（非页面提取档——页面确定性提取这条采集路径**在本变更之前不存在**，故存量的每一个非空值必然来自 rss / hn / show_hn / github / AI 推断，**全部落在第 1 档**；**MUST NOT 回填 2**，那会给存量行一个它们没有的覆盖权、使后到的真页面提取值因「同档不覆盖」被丢弃）、`published_at IS NULL` 的行为 0，且**没有任何一行的 `published_at` 被修改**（迁移中不含任何写 `published_at` 的语句）
 
 #### 场景:CHECK 约束兜死「有日期 ⟺ 等级非 0」
 - **当** 任何写路径试图写入 `published_at IS NULL AND published_at_authority > 0`，或 `published_at IS NOT NULL AND published_at_authority = 0`
