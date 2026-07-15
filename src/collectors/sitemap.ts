@@ -114,6 +114,10 @@ const SITE_BOILERPLATE_DESCRIPTIONS: ReadonlySet<string> = new Set([
  * 是否为已知全站样板 og:description（精确匹配 trim 后全文）。
  * **导出**：`content-enrichment.ts` 的正文补全阶段共享同一判定（单一定义、两处引用），
  * 防两份样板集漂移致「采集器视同缺失、补全阶段又当有效正文」的口径不一致。
+ *
+ * ponytail: 精确匹配单串是有意的保守选择（模糊匹配会误杀真正文）。已知天花板：Anthropic 若改动样板
+ * 文案一个字（如末尾少个句点），此判定静默失配 → 样板重新入 content → 再次击穿 digest hasContent 护栏，
+ * 【无告警、静默退回修复前的坏状态】。升级路径：命中已知样板时打计数日志，命中数骤降即漂移信号。
  */
 export function isSiteBoilerplate(desc: string): boolean {
   return SITE_BOILERPLATE_DESCRIPTIONS.has(desc.trim());
@@ -432,52 +436,32 @@ function h1AdjacentText(slice: string): string | null {
   while (i < slice.length && /\s/.test(slice[i]!)) i += 1;
   if (i >= slice.length) return null;
 
-  // 紧邻的必须是一个元素的开标签。日期直接裸露在 </h1> 之后（无包裹元素）也接受：取到下一个 '<'。
+  // 日期直接裸露在 </h1> 之后（无包裹元素）：取到下一个 '<'。
   if (slice[i] !== '<') {
     const lt = slice.indexOf('<', i);
     return (lt === -1 ? slice.slice(i) : slice.slice(i, lt)).trim() || null;
   }
 
-  // 取【紧邻元素】的完整边界（开标签 → 其配对闭标签，同名嵌套按深度计数），再汇集其**全部**后代文本。
+  // 取紧邻元素的【直接文本】：开标签 '>' 之后、到下一个 '<' 为止。只认「扁平元素 `<tag …>DATE</tag>`」
+  // ——真实 Anthropic 结构即此（`<div class="body-3 agate">Jun 30, 2026</div>`，实测多页）。
   //
-  // 绝不「跳过标签直到第一个文本节点」——那会 ① 跳过空的紧邻元素、够到【非紧邻】兄弟的日期
-  // （`<div></div><p>Jul 15, 2026</p>` 抓成第二个兄弟）；② 只取第一个文本节点、忽略元素内后续文本
-  // （`<span>Jul 15</span> · Updated` 抠出纯日期、绕过整串匹配）。二者都让「错的日期」提取成功、
-  // 落在 authority=2（最高、不可纠），直接打穿本提取器「只能干净失败、绝不提取到错的」这条核心安全属性。
+  // **绝不做正则深度计数配对闭标签**（上一版如此，被两类输入骗到、产生【错误提取】）：
+  //   ① 连字符自定义元素：`<div-card></div-card>` 的标签名被前缀正则截成 `div`，配对到外层 `</div>`，
+  //      越过这个空的紧邻元素、够到后续兄弟 `<p>` 的日期；
+  //   ② 注释里的 tag 文本：`<div><!-- <div --></div>` 里注释内的 `<div` 被当成嵌套开标签、depth 不归零，
+  //      同样越界够到兄弟。
+  // 二者都让「错的日期」提取成功、落在 authority=2（最高、不可纠）——本提取器最严重的失效。
+  //
+  // 扁平取直接文本对两者天然免疫：空紧邻元素（`<div></div>` / `<div-card></div-card>`）与「开标签后
+  // 紧接注释/子元素」的直接文本都是空串 → 整串匹配失败 → null（干净失败、绝不够到兄弟）。代价：日期
+  // 若嵌在子元素里（`<div><span>DATE</span></div>`）也 null——但真实页面是扁平的，这是安全方向的漏，
+  // 不是错误提取。含 `>` 的属性值让 openGt 取偏 → 直接文本变垃圾 → 整串不中 → null，同样干净失败。
   const openGt = slice.indexOf('>', i);
   if (openGt === -1) return null; // 开标签未闭合 → 干净失败。
-  if (slice[openGt - 1] === '/') return null; // 自闭合 `<tag/>` → 空元素、无文本。
-
-  const nameMatch = /^<([a-zA-Z][a-zA-Z0-9]*)/.exec(slice.slice(i, openGt + 1));
-  if (!nameMatch) return null; // 非规范开标签 → 干净失败。
-  const tag = nameMatch[1]!.toLowerCase();
-
-  // 深度计数找配对闭标签（同名嵌套 +1/-1）；有界 slice + indexOf 线性，不用跨串懒惰捕获（防 ReDoS）。
-  let depth = 1;
-  let scan = openGt + 1;
-  let closeStart = -1;
-  const openRe = new RegExp(`<${tag}(?=[\\s/>])`, 'gi');
-  const closeRe = new RegExp(`</${tag}\\s*>`, 'gi');
-  while (depth > 0) {
-    closeRe.lastIndex = scan;
-    const close = closeRe.exec(slice);
-    if (!close) return null; // 紧邻元素在窗口内未闭合 → 干净失败。
-    openRe.lastIndex = scan;
-    let nestedOpens = 0;
-    let o = openRe.exec(slice);
-    while (o && o.index < close.index) {
-      nestedOpens += 1;
-      o = openRe.exec(slice);
-    }
-    depth += nestedOpens - 1;
-    scan = close.index + close[0].length;
-    if (depth === 0) closeStart = close.index;
-  }
-
-  // 紧邻元素的完整内部 → 剥掉所有内层标签 → 汇集全部文本。空 → null（绝不够到下一个兄弟）。
-  const inner = slice.slice(openGt + 1, closeStart);
-  const textOnly = inner.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-  return textOnly || null;
+  if (slice[openGt - 1] === '/') return null; // 自闭合 `<tag/>` → 无直接文本。
+  const nextLt = slice.indexOf('<', openGt + 1);
+  const text = (nextLt === -1 ? slice.slice(openGt + 1) : slice.slice(openGt + 1, nextLt)).trim();
+  return text || null;
 }
 
 /**

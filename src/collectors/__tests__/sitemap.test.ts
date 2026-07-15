@@ -688,18 +688,35 @@ describe('extractPublishedAt 纯函数（唯一 h1 + 紧邻元素整串日期）
     expect(d?.toISOString()).toBe('2023-11-02T00:00:00.000Z');
   });
 
+  // ⚠️ 以下「应 null」的反例日期【必须 in-range】（NOW=2026-06-14，用 `May 2, 2026`）。
+  // 用未来日期（如 `Jul 15, 2026`）会被 extractPublishedAt 的日期上界 `ms > nowMs → null` 先毙掉，
+  // 与 h1 邻接逻辑无关 ⇒ 断言变【空断言】：撤掉 h1 修复也照样绿、守不住「绝不提取到错的日期」。
   it('①b 紧邻元素【为空】+ 后续兄弟元素含日期 → null（绝不够到非紧邻兄弟）', () => {
-    // 只取「紧邻元素」的完整文本；紧邻元素为空 ⇒ 干净失败，绝不跳过它去抓第二个兄弟的日期
+    // 只取紧邻元素的直接文本；紧邻元素为空 ⇒ 干净失败，绝不跳过它去抓第二个兄弟的日期
     // （否则一个非发布日的邻近日期会以 authority=2 覆盖正确近似值、永久不可纠）。
-    const html = `<article><h1>T</h1><div></div><p>Jul 15, 2026</p></article>`;
+    const html = `<article><h1>T</h1><div></div><p>May 2, 2026</p></article>`;
     expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
   });
 
-  it('①c 紧邻元素内「日期 + 后缀」（`<span>date</span> · Updated`）→ null（整串匹配作用于元素全部文本）', () => {
-    // 汇集紧邻元素的【全部】后代文本（"Jul 15, 2026 · Updated"）再整串匹配 ⇒ 不中 ⇒ null。
-    // 若只取第一个文本节点会抠出纯日期、绕过整串匹配——那正是「提取到错的」失效模式。
+  it('①c 紧邻元素内「日期 + 后缀」（`<span>date</span> · Updated`）→ null', () => {
+    // 紧邻元素 <div> 的直接文本（开标签后到首个 '<'）为空（<span> 紧接开标签）⇒ null。
+    // 绝不能抠出 <span> 里的纯日期而忽略「· Updated」——那正是「提取到错的」失效模式。
     const html =
-      `<article><h1>T</h1><div><span>Jul 15, 2026</span> · Updated</div></article>`;
+      `<article><h1>T</h1><div><span>May 2, 2026</span> · Updated</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①d 连字符自定义元素为空 + 兄弟日期 → null（标签名截断不得配到外层闭标签、够到兄弟）', () => {
+    // <div-card> 若被前缀正则截成 div，会配到外层 </div>、越过空的紧邻元素抓 <p> 的日期。in-range 日期。
+    const html =
+      `<section><h1>T</h1><div-card></div-card><p>May 2, 2026</p></section>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①e 注释内含 `<div` + 兄弟日期 → null（注释里的 tag 文本不得被当嵌套标签、够到兄弟）', () => {
+    // 注释内的 `<div` 若被当成嵌套开标签会让越界扫描够到 <p> 的日期。in-range 日期。
+    const html =
+      `<section><h1>T</h1><div><!-- <div --></div><p>May 2, 2026</p></section>`;
     expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
   });
 
