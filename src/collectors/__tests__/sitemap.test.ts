@@ -706,18 +706,166 @@ describe('extractPublishedAt 纯函数（唯一 h1 + 紧邻元素整串日期）
     expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
   });
 
-  it('①d 连字符自定义元素为空 + 兄弟日期 → null（标签名截断不得配到外层闭标签、够到兄弟）', () => {
-    // <div-card> 若被前缀正则截成 div，会配到外层 </div>、越过空的紧邻元素抓 <p> 的日期。in-range 日期。
+  it('①d 连字符自定义元素为空 + 兄弟日期 → null（连字符标签名完整入名、空元素干净失败）', () => {
+    // 紧邻元素 <div-card> 为空 ⇒ 直接文本为空 → null；绝不越过它抓后续兄弟 <p> 的日期。in-range 日期。
     const html =
       `<section><h1>T</h1><div-card></div-card><p>May 2, 2026</p></section>`;
     expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
   });
 
-  it('①e 注释内含 `<div` + 兄弟日期 → null（注释里的 tag 文本不得被当嵌套标签、够到兄弟）', () => {
-    // 注释内的 `<div` 若被当成嵌套开标签会让越界扫描够到 <p> 的日期。in-range 日期。
+  it('①e 注释紧接开标签 + 兄弟日期 → null（注释不是直接文本、绝不够到非紧邻兄弟）', () => {
+    // <div> 的直接文本为空（紧接注释）⇒ null；注释里的 `<div` 也绝不被当嵌套标签越界抓 <p> 的日期。
     const html =
       `<section><h1>T</h1><div><!-- <div --></div><p>May 2, 2026</p></section>`;
     expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  // Codex 抓到的三类【错误提取】——扁平取直接文本（首个 '<' 截断）会把它们当成合法日期。整体锚定
+  // 正则「起始标签 + 无子元素 + 同名闭标签」结构性拒绝之。反例日期 in-range，撤掉修复即变红（已证伪）。
+  it('①f 闭标签被当开标签 `</article>DATE<footer>` → null（`<` 后非字母不作起始标签）', () => {
+    const html = `<article><h1>T</h1></article>May 2, 2026<footer>x</footer>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①g 日期在前、后缀在子元素 `<div>DATE<span> · Updated</span></div>` → null（配不到同名闭标签）', () => {
+    // ①c 的镜像：日期是直接文本、后缀在子元素里。直接文本后紧跟 <span> 而非 </div> ⇒ 拒绝。
+    const html =
+      `<article><h1>T</h1><div>May 2, 2026<span> · Updated</span></div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①h 4096 窗口内无闭标签（紧邻元素超长）→ null（窗内找不到 </tag> ⇒ 拒绝，不把窗口末端当文本终点）', () => {
+    // 闭标签落在 afterH1+4096 之外：扁平取直接文本会把日期后一整片空白 trim 掉、误当纯日期发射。
+    const html = `<article><h1>T</h1><div>May 2, 2026${' '.repeat(4090)}<span> · Updated</span></div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①i 注释内 `>DATE<` 被当紧邻元素文本 → null（`<!` 起始不作起始标签）', () => {
+    const html = `<article><h1>T</h1><!-- >May 2, 2026< --><div>x</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  // ①j–①m：Codex/RC 抓到的另一批【错误提取】——不在 flat 正则、在其上游的裸文本分支与 h1 锚定。
+  it('①j 裸文本紧邻 + 窗口内无终止 `<`（4096 截断）→ null（不把截断边界当文本终点、丢弃窗外真日期）', () => {
+    // 裸日期后一大片空白填满 4096，真日期 `<div>` 落在窗外；信任截断会把 May 2 当发布日、丢弃真值。
+    const html = `<article><h1>T</h1>May 2, 2026${' '.repeat(4085)} · Updated<div class="body-3 agate">Jun 5, 2024</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①k 注释里藏假 `</h1>` 在真闭标签之前 → 锚到真 h1、提取真紧邻日期（剥注释后 indexOf 不再被骗）', () => {
+    // 上下文无关 indexOf('</h1>') 会选中注释里的假闭标签、把 slice 起点挪到假日期。剥注释后锚到真 </h1>。
+    const html =
+      `<article><h1>Title<!-- </h1>Jan 1, 2020<div> --></h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①l 紧邻元素是自闭合 `<svg />DATE</svg>` → null（`>` 前是 `/` 不作容器开标签、绝不把兄弟 DATE 当内容）', () => {
+    const html =
+      `<article><h1>T</h1><svg />May 2, 2026</svg><div class="body-3 agate">Jun 5, 2024</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①m 注释里藏假 `<h1>…DATE…</h1>` + 全页无真 h1 → null（剥注释后 0 个 h1、干净失败）', () => {
+    const html = `<!-- <h1></h1><div>Jun 30, 2020</div> --><main><p>无真 h1</p></main>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①n 属性值含闭合引号里的 `>`（`<div title="a>b">DATE</div>`，合法 HTML）→ 引号感知正确提取', () => {
+    // 引号感知属性段：`title="a>b"` 里的 `>` 不再被当开标签结束，DATE 是 div 的真实内容 → 正确提取。
+    const html = `<article><h1>T</h1><div title="a>b">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①o h1 与日期之间夹注释/脚本 → 仍提取（剥非内容区只改善提取、不破坏真实页面）', () => {
+    const html =
+      `<article><h1>T</h1><!-- ad slot --><script>var a="<h1>x</h1>";</script><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  // ①p–①s：自闭合/void 元素与未闭合非内容区——都会把兄弟 DATE 错误提取，均已堵死。反例 in-range。
+  it('①p 自闭合元素带空格 `<svg / >DATE</svg>` → null（`>` 前跨空白见 `/` 即拒，兄弟 DATE 非其内容）', () => {
+    const html =
+      `<article><h1>T</h1><svg / >May 2, 2026</svg><div class="body-3 agate">Jun 5, 2024</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①q void 元素 `<br>DATE</br>` → null（void 元素不能有内容，DATE 是兄弟节点）', () => {
+    const html =
+      `<article><h1>T</h1><br>May 2, 2026</br><div class="body-3 agate">Jun 5, 2024</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①r 未闭合注释（页面截断）+ 无真 h1 → null（未闭合区按浏览器语义吞到文末，假 token 不漏进锚定）', () => {
+    const html = `<!-- <h1></h1><div>Jun 30, 2020</div>`; // 无 --> 终止
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①s raw-text 元素 `<textarea>`/CDATA 内的裸 `<h1>` + 无真 h1 → null（这些上下文里 `<h1` 是文本非标签）', () => {
+    expect(mod.extractPublishedAt(`<textarea><h1></h1><div>Jun 30, 2020</div></textarea>`, NOW_MS)).toBeNull();
+    expect(mod.extractPublishedAt(`<svg><![CDATA[<h1></h1><div>Jun 30, 2020</div>]]></svg>`, NOW_MS)).toBeNull();
+  });
+
+  // ①t–①x：Codex 抓到的、【有一个真 h1、不受「>1 → null」保护】的 mis-anchor 错误提取，及自定义元素过剥。
+  // 陷阱日期用 in-range 的 `May 5, 2026`（真日期 `May 2, 2026`）：回归时提取到 in-range 的【错误日期】而非被
+  // 时间窗上界毙成 null——把断言的鉴别力落在锚定逻辑本身、不靠 range-check 兜底（同 ①b–①e 的 in-range 纪律）。
+  it('①t 闭标签 `</h1>` 藏在 h1 自己的属性值里 → h1AdjacentStart 状态感知跳过、提取真日期', () => {
+    const html =
+      `<article><h1 data-note="</h1><div>May 5, 2026</div>x">Release</h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①u 闭标签 `</h1>` 藏在 `<iframe>` RAWTEXT 里 → 剥 iframe 后锚到真 h1、提取真日期', () => {
+    const html =
+      `<article><h1>Release<iframe></h1>May 5, 2026<div>x</div></iframe></h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①v 连字符自定义元素 `<title-text>` 内嵌 h1 → 不被当 `<title>` 过剥到文末（真标签边界 `(?=[\\s/>])`）', () => {
+    const html =
+      `<article><h1><title-text>Release</title-text></h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①w 字面 `</h1>` 藏在【嵌套元素】的引号属性里（合法 HTML）→ 状态感知跳过、提取真日期', () => {
+    // <span data-x="</h1>…"> 里的 </h1> 是属性文本；plain indexOf 会命中它 mis-anchor 到 May 5。
+    const html =
+      `<article><h1>Title<span data-x="</h1><div>May 5, 2026</div>">badge</span></h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①x 紧邻元素属性含 `>`+`</div>`（`<div data-x=">DATE</div>">真日期</div>`，合法 HTML）→ 引号感知提取真日期', () => {
+    // 引号感知属性段让 `data-x=">May 5, 2026</div>"` 整体作属性、不把内部 `>`/`</div>` 当标签边界。
+    const html =
+      `<article><h1>Title</h1><div data-x=">May 5, 2026</div>">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  // ①y–①A：Codex R14——按 HTML tokenizer 语义修正的 mis-anchor（NBSP 非标签空白 / 属性名位裸引号 / 无引号值末尾 /）。
+  it('①y 闭标签里嵌 NBSP `</h1\\u00A0>`（非 HTML 空白 → tag 名不同、不闭合）→ 锚到真 </h1>、提取真日期', () => {
+    // 用 ASCII 标签空白判定，NBSP 不当空白：假的 `</h1(NBSP)>` 不被当闭标签，锚到后面真 </h1>。
+    const html =
+      `<article><h1>Title</h1\u00A0><div>May 5, 2026</div></h1><div class="body-3 agate">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
+  });
+
+  it('①z 属性名位置的裸引号 `<div "x>...">`（parse error）→ null（引号不作值、`>` 正常收尾，同浏览器）', () => {
+    // HTML 在第一个 `>` 收尾该 div（属性名 `"x`），内容变 `not">May 2` → 无整串日期 → null。
+    const html = `<article><h1>T</h1><div "x>not">May 2, 2026</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①A 无引号属性值末尾 `/`（`<div data-x=/ >DATE</div>`，合法非自闭合）→ 提取（`/` 作值、不误当自闭合）', () => {
+    const html = `<article><h1>T</h1><div data-x=/ >Jun 5, 2024</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2024-06-05T00:00:00.000Z');
+  });
+
+  it('①B 第二个 `=` 起无引号值（`<h1 data-x==">`，删一字符即得）→ 其后 `"` 不开启引号、锚到真 </h1>', () => {
+    // HTML 在第二个 `=` 进入无引号值态，`"` 只是值字符；旧 afterEq 会误开引号、吞掉真 </h1> 锚到 Apr 5。
+    // 陷阱/真日期均 in-range（NOW=2026-06-14）：回归提取 in-range 错误日期 Apr 5、非被时间窗毙成 null。
+    const html =
+      `<article><h1 data-x==">Title</h1><div class="body-3 agate">May 2, 2026</div>` +
+      `<span data-note="x></h1><div>Apr 5, 2026</div>">metadata</span></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe('2026-05-02T00:00:00.000Z');
   });
 
   it('①b 真实结构 fixture（<h1>…</h1><div class="body-3 agate">Nov 2, 2023</div>）→ 提取成功', () => {
@@ -778,11 +926,11 @@ describe('extractPublishedAt 纯函数（唯一 h1 + 紧邻元素整串日期）
     expect(d?.getUTCMonth()).toBe(11);
   });
 
-  it('紧邻元素为纯文本（无包裹标签）时也能提取', () => {
+  it('紧邻是裸文本（无包裹元素）→ null（拿不到元素边界，无法排除兄弟里的 `(updated)` 后缀 → 安全失败）', () => {
+    // 裸日期后跟 `<span>(updated)</span>` 与后跟 `<p>body</p>` 是**同一种形状**，裸文本分支无从分辨
+    // ⇒ 会把 updated 日期当发布日（错误提取）。真实页面日期恒被元素包裹，故不支持裸文本、一律干净失败。
     const html = `<article><h1>Title</h1>\n  Nov 2, 2023\n  <p>body</p></article>`;
-    expect(mod.extractPublishedAt(html, NOW_MS)?.toISOString()).toBe(
-      '2023-11-02T00:00:00.000Z',
-    );
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
   });
 
   it('⑨ ReDoS 上界：大量 <h1 但无闭合的畸形 HTML → < 100ms（indexOf 线性，非二次方回溯）', () => {

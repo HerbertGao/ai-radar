@@ -410,80 +410,188 @@ export function deriveTitleFromUrl(canonicalUrl: string): string {
 }
 
 /**
+ * 剥离非内容区（注释 / CDATA / raw-text 元素），供 `<h1`/`</h1>` 锚定使用。
+ * 锚定用 `indexOf` **上下文无关**：注释里 `<!-- <h1></h1><div>DATE</div> -->` 或脚本 JSON 里的裸 `<h1`/
+ * `</h1>` 会被当成真标签、锚到无关日期，且落在 authority=2（最高、不可纠）——最严重的失效。先剥掉这些区。
+ *
+ * 覆盖 HTML tokenizer 里 `<h1` **不作为标签**的上下文：注释、CDATA，以及 raw-text / escapable-raw-text /
+ * RAWTEXT 元素 `<script>/<style>/<textarea>/<title>/<iframe>/<noscript>/<noframes>/<noembed>/<xmp>`
+ * （这些元素内 `<h1`/`</h1>` 是文本、非标签）。标签名后用 `(?=[\s/>])` 作**真标签边界**（非 `\b`——`\b`
+ * 会让 `<title-text>` 等连字符自定义元素误配 `title` 而过剥到文末）。每条终止符都带 `|$`：**未闭合区**
+ * （页面被截断，或未闭合的 `<!--`/`<script>`）按浏览器语义吞到文档尾——否则残留的 `<h1` token 会漏进锚定。
+ * 惰性单遍 + 反向引用字面比较，无嵌套量词 → 防 ReDoS；替换成空格而非空串，避免跨剥离区把 `<h` 与 `1>`
+ * 拼出假 token。真实厂商页面 h1/日期在内容区、不受影响（实测剥离后两页仍正确提取），剥离只改善提取
+ * （h1 与日期间夹注释/脚本/iframe 时反而能对上）。
+ *
+ * 已知残留（**需畸形 / 作者失误 HTML，且须全页 0 个真 h1**——真实文章页恒有一个真 h1，任何杂散 token
+ * 即成第二个 h1 → `>1 → null`，故生产输入打不到）：① raw-text 元素的**字符串字面量里出现字面 `</script>`
+ * 等闭标签** → strip 提前收尾、残留尾部 token（作者应转义 `<\/script>`，浏览器同样会在此断开）；② 属性值里
+ * 的**裸未转义 `<h1`**（合法 HTML 要求转义为 `&lt;`）；③ **注释嵌在开标签内** `<h1<!--x-->>` → 注释替换成
+ * 空格后拼出合法的 `<h1 >` 开标签（任何「注释→空格」的剥离都有此方向，非本实现独有；SSR/模板不产出标签内注释）；
+ * ④ 已废弃的 `<plaintext>`（进入后到文末全是文本、无闭标签、正则不可界定；现代 SSR 不产出）；
+ * ⑤ bogus comment / SGML 声明 `<!…>`（非 `<!--`/`<![CDATA[`）与处理指令 `<?…?>` 内的裸 `<h1`（tokenizer
+ * 里它们跑到下一个 `>`、其中 `<h1` 是文本；同 ② 的畸形+0-真-h1 类）。
+ * 另有**安全方向的假阴（非错误提取）**：`<!--` 出现在 `<script>` 字符串里（顺序为 comment→raw-text，
+ * 该 `<!--` 无 `-->` 时会连同真内容剥到文末 → null）——上下文无关的顺序剥离对「注释↔raw-text 互嵌」两向
+ * 各有一个对称的罕见假阴，换序只是把洞从一向挪到另一向；根治需状态机 tokenizer，与本文件设计相悖，故按
+ * 假阴（宁可漏、绝不错）接受并登记。以上均不引入解析器。
+ */
+function stripNonContentRegions(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, ' ')
+    .replace(/<!\[CDATA\[[\s\S]*?(?:\]\]>|$)/g, ' ')
+    .replace(
+      /<(script|style|textarea|title|iframe|noscript|noframes|noembed|xmp)(?=[\s/>])[\s\S]*?(?:<\/\1\s*>|$)/gi,
+      ' ',
+    );
+}
+
+/**
  * 定位一个**真** `<h1` 开标签起点（`indexOf` 线性，从 `from` 起）；无则 -1。
  * 边界校验（`<h1` 后须为 `>`/空白/`/`）排除 `<h10>`/`<h1foo>`；沿用本采集器 `indexOf` 切块范式（防 ReDoS）。
  * 大小写敏感（同 parseSitemap 的 `<url`、extractOgTag 的 `<meta`）——`<H1>` 判 0 个 h1 → 干净失败置 null。
  */
+/** HTML tokenizer 的标签内空白 = ASCII `space \t \n \f \r`（**不含 NBSP/Unicode 空白**——那些在标签里是
+ * 普通字符、会成为 tag 名/属性名的一部分，不能当分隔符）。所有「标签边界」判定都用它，不用 `/\s/`。 */
+function isHtmlTagWs(c: string | undefined): boolean {
+  return c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+}
+
 function findH1TagStart(html: string, from: number): number {
   let pos = from;
   while (true) {
     const i = html.indexOf('<h1', pos);
     if (i === -1) return -1;
     const b = html[i + 3];
-    if (b === '>' || b === ' ' || b === '\t' || b === '\n' || b === '\r' || b === '/') return i;
+    if (b === '>' || b === '/' || isHtmlTagWs(b)) return i;
     pos = i + 3; // 非标签边界（<h10>/<h1x）：跳过继续找。
   }
 }
 
 /**
- * 取 `</h1>` 之后**紧邻第一个元素**的文本内容（跳过前导标签与空白，取到下一个 `<` 为止）。
- * 真实结构 `<h1>…</h1><div class="body-3 agate">Jun 30, 2026</div>` → 剥掉那一个 `<div…>` 标签、
- * 返回其内文本 `Jun 30, 2026`。有界 slice + `indexOf` 线性（不用 `[\s\S]*?` 跨整张 HTML，防 ReDoS）。
+ * 从 `<h1` 起点（`first`）**标签/引号状态感知**地找出**真**闭标签 `</h1>`，返回其后第一个字符下标（紧邻内容起点）；
+ * 无则 -1。为什么不能用 `indexOf('</h1>')`：字面 `</h1>` 可合法地出现在**任意元素的引号属性值**里
+ * （`<h1 data-x="</h1>…">` 或 h1 之后某个嵌套 `<span data-x="</h1>…">`），`indexOf` 会命中那个假闭标签、
+ * 把锚定挪到无关日期——该失效有一个真 h1、不受「>1 → null」保护，且属性内含 `<`/`>` 是**合法 HTML**。
+ *
+ * 数据态用 `indexOf('<')` **原生跳过文本段**（不逐字符，故 1MB 无闭合正文 ~0.1ms、防 ReDoS/慢扫）；每遇一个
+ * `<` 才判定：是真 `</h1>`（`</h1` 后跨 **HTML 标签空白**紧跟 `>`——NBSP 不算，`</h1>` 里嵌 NBSP 会改 tag 名、
+ * 不误判）就返回其后；否则把该标签当作要跳过的元素，**引号感知**扫到它的收尾 `>`。扫标签时**只在 `=` 之后**才把
+ * `"`/`'` 当引号值起点（属性名位置的裸引号如 `<span "x>` 是 parse error、不开引号，其后 `>` 正常收尾，同浏览器）；
+ * 引号值内的 `>`/`</h1>` 一律跳过。故任意元素引号属性里的字面 `</h1>` 都不会 mis-anchor。大小写敏感同 findH1TagStart。
  */
+function h1AdjacentStart(html: string, first: number): number {
+  let p = first;
+  while (p < html.length) {
+    const lt = html.indexOf('<', p);
+    if (lt === -1) return -1; // 数据态后续无标签 → 无真闭标签。
+    if (html.startsWith('</h1', lt)) {
+      let q = lt + 4;
+      while (q < html.length && isHtmlTagWs(html[q])) q += 1;
+      if (html[q] === '>') return q + 1; // 真闭标签 </h1> / </h1 > → 返回其后。
+    }
+    // 其它标签（含 h1 自己的开标签、`</h1x`、嵌套元素）→ 引号感知扫到其收尾 '>'，跳过其属性里的假 </h1>。
+    let quote = '';
+    let afterEq = false; // 「before-attribute-value」态（刚见 `=`、尚无值字符）：仅此态里引号才开启引号值。
+    let k = lt + 1;
+    for (; k < html.length; k += 1) {
+      const c = html[k]!;
+      if (quote) {
+        if (c === quote) quote = '';
+      } else if (c === '>') {
+        break; // `>`（含 `data-x=>` 空值）收尾标签，优先于 afterEq。
+      } else if (afterEq) {
+        // 仅在 before-value 态：引号开启引号值；任何非空白非引号（含**第二个 `=`**——HTML 此时进入无引号值态）
+        // 都意味着无引号值已开始，其后的 `"`/`'` 只是值字符、不再开启引号（Codex R15：`data-x=="` mis-anchor）。
+        if (c === '"' || c === "'") {
+          quote = c;
+          afterEq = false;
+        } else if (!isHtmlTagWs(c)) {
+          afterEq = false;
+        }
+      } else if (c === '=') {
+        afterEq = true; // 属性名/后 → before-value。
+      }
+      // else：属性名字符 / 无引号值字符 → 不改状态。
+    }
+    p = k + 1; // 越过该标签的 '>'（或到 EOF）继续数据态。
+  }
+  return -1;
+}
+
+/**
+ * 只认「扁平元素 `<tag …>DATE</同名 tag>`」——直接文本无子元素、开标签是真起始标签、闭标签同名。
+ * 用 **HTML 属性文法**逐 token 解析开标签（`[ \t\n\f\r]` 是 HTML tokenizer 唯一的标签空白——**不含 NBSP**，
+ * （故 `</h1>` 内嵌入 NBSP 时不被当空白、tag 名不同、不误当闭标签）：
+ *   · 起始名 `[a-zA-Z][a-zA-Z0-9-]*`：连字符自定义元素完整入名；`</` `<!` `<?` 起始名不匹配 → 拒绝把
+ *     闭标签 / 注释 / CDATA / 声明当成开标签。
+ *   · 属性 token `WS+ 名 (?:WS*=WS* 值)?`（值为 `"…"`/`'…'`/无引号 `[^\s"'<>]+`）**逐个**匹配：引号内值可含
+ *     任意 `<`/`>`/`/`（合法 HTML，`<div data-x=">DATE</div>">…` 不再 mis-parse）；**但必须有属性名**——
+ *     一个不跟名的裸引号（`<div "x>…`，属性名位的引号是 parse error）不作值、整体不匹配 → null（同浏览器）。
+ *   · 属性后 `WS*>` 收尾（**无 lookbehind**）：自闭合 `<tag/>`/`<tag />`/`<tag / >` 里那个孤立 `/` 既非合法
+ *     属性名首字符、又非 `>` → 匹配失败 → null；而无引号属性值末尾的 `/`（`<div data-x=/ >`）被当值吃掉、正常收尾。
+ *   · 直接文本 `[^<]*` 后必须紧跟【同名闭标签】`</\1WS*>`（反向引用，`i` 忽略大小写）：日期后子元素带
+ *     后缀、窗口内无闭标签（截断）、日期嵌在子元素里——全部配不上 → null。
+ *   · 匹配后再拒 **void 元素**（`<br>/<hr>/<img>…` 不能有内容；`<br>DATE</br>` 的 DATE 是兄弟、非内容）。
+ * 结构上不可能够到「紧邻元素之外」的日期。代价：子元素内的日期也 null，但真实页面扁平
+ * （`<div class="body-3 agate">Jun 30, 2026</div>`，实测多页），是安全方向的漏、非错误提取；下游整
+ * 串日期匹配再兜一层。锚定 + 有界 slice（≤4096），逐 token 量词只在此有界串上跑（实测对抗输入 <0.09ms/次，防 ReDoS）。
+ */
+const FLAT_ELEMENT_RE =
+  /^<([a-zA-Z][a-zA-Z0-9-]*)(?:[ \t\n\f\r]+[^\s/>"'=]+(?:[ \t\n\f\r]*=[ \t\n\f\r]*(?:"[^"]*"|'[^']*'|[^\s"'<>]+))?)*[ \t\n\f\r]*>([^<]*)<\/\1[ \t\n\f\r]*>/i;
+
+/** HTML void 元素（不能有内容）；匹配到它们即拒——`<br>DATE</br>` 的 DATE 是兄弟节点、非该元素内容。 */
+const VOID_ELEMENTS: ReadonlySet<string> = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
+
 function h1AdjacentText(slice: string): string | null {
   // 跳过 </h1> 与紧邻元素之间的空白。
   let i = 0;
   while (i < slice.length && /\s/.test(slice[i]!)) i += 1;
   if (i >= slice.length) return null;
 
-  // 日期直接裸露在 </h1> 之后（无包裹元素）：取到下一个 '<'。
-  if (slice[i] !== '<') {
-    const lt = slice.indexOf('<', i);
-    return (lt === -1 ? slice.slice(i) : slice.slice(i, lt)).trim() || null;
-  }
+  // 只认「紧邻的完整扁平元素」。**不**支持裸日期（`</h1>DATE<…>`）：真实页面日期恒被元素包裹
+  // （`<div class="body-3 agate">…</div>`），而裸文本分支拿不到「元素边界」——既会把 4096 截断处误当
+  // 文本终点，也会漏掉兄弟元素里的 `(updated)` 后缀，两者都造成【错误提取】。裸文本一律干净失败。
+  if (slice[i] !== '<') return null;
 
-  // 取紧邻元素的【直接文本】：开标签 '>' 之后、到下一个 '<' 为止。只认「扁平元素 `<tag …>DATE</tag>`」
-  // ——真实 Anthropic 结构即此（`<div class="body-3 agate">Jun 30, 2026</div>`，实测多页）。
-  //
-  // **绝不做正则深度计数配对闭标签**（上一版如此，被两类输入骗到、产生【错误提取】）：
-  //   ① 连字符自定义元素：`<div-card></div-card>` 的标签名被前缀正则截成 `div`，配对到外层 `</div>`，
-  //      越过这个空的紧邻元素、够到后续兄弟 `<p>` 的日期；
-  //   ② 注释里的 tag 文本：`<div><!-- <div --></div>` 里注释内的 `<div` 被当成嵌套开标签、depth 不归零，
-  //      同样越界够到兄弟。
-  // 二者都让「错的日期」提取成功、落在 authority=2（最高、不可纠）——本提取器最严重的失效。
-  //
-  // 扁平取直接文本对两者天然免疫：空紧邻元素（`<div></div>` / `<div-card></div-card>`）与「开标签后
-  // 紧接注释/子元素」的直接文本都是空串 → 整串匹配失败 → null（干净失败、绝不够到兄弟）。代价：日期
-  // 若嵌在子元素里（`<div><span>DATE</span></div>`）也 null——但真实页面是扁平的，这是安全方向的漏，
-  // 不是错误提取。含 `>` 的属性值让 openGt 取偏 → 直接文本变垃圾 → 整串不中 → null，同样干净失败。
-  const openGt = slice.indexOf('>', i);
-  if (openGt === -1) return null; // 开标签未闭合 → 干净失败。
-  if (slice[openGt - 1] === '/') return null; // 自闭合 `<tag/>` → 无直接文本。
-  const nextLt = slice.indexOf('<', openGt + 1);
-  const text = (nextLt === -1 ? slice.slice(openGt + 1) : slice.slice(openGt + 1, nextLt)).trim();
-  return text || null;
+  const m = FLAT_ELEMENT_RE.exec(slice.slice(i));
+  if (!m) return null;
+  if (VOID_ELEMENTS.has(m[1]!.toLowerCase())) return null; // void 元素不能有内容 → DATE 是兄弟、非内容。
+  return m[2]!.trim() || null;
 }
 
 /**
  * 从文章 HTML **确定性提取**真实发布日 → `published_at`（见 spec「时效正确性 ②」）。任何失败 → `null`（干净失败）。
  *
- * - **锚定 = 「文档有且仅有一个 `<h1>`」**（`indexOf` 计数：找第一个、再找第二个；第二个存在 ⇒ >1 ⇒ null）。
+ * - **先剥非内容区**（`stripNonContentRegions`）：`<h1`/`</h1>` 锚定用 `indexOf` 上下文无关，注释/脚本里
+ *   的假标签会污染锚定 → 必须先剥。
+ * - **锚定 = 「文档有且仅有一个 `<h1>`」**（`findH1TagStart` 计数：找第一个、再找第二个；第二个存在 ⇒ >1 ⇒ null）。
  *   **不**以「og:title 文本相等」作锚（实测仅 18/30，会丢 40% 有日期的页面）。
- * - 取唯一 h1 的**紧邻元素文本**，**整串全匹配** `^\s*([A-Z][a-z]{2} \d{1,2}, \d{4})\s*$`（如 `Nov 2, 2023`）。
+ * - 用 `h1AdjacentStart`（**标签/引号状态感知**）定位真 `</h1>` 之后的紧邻内容——不用 `indexOf('</h1>')`，
+ *   因字面 `</h1>` 可合法出现在任意元素的引号属性值里、会 mis-anchor 到无关日期。
+ * - 取紧邻元素文本，**整串全匹配** `^\s*([A-Z][a-z]{2}) (\d{1,2}), (\d{4})\s*$`（如 `Nov 2, 2023`）。
  *   整串（非子串）：`Updated Jan 5, 2024` / `By Jane · Mar 2, 2025 · 5 min` 一律不中（把「提取到错的」变「什么都没提取到」）。
  * - **`Date.UTC(y, m, d)` 显式构造 UTC 零点**（不用 `new Date(str)`——V8 按运行时本地时区解析非 ISO 串致边界漂）。
  * - 校验：日历有效（拒 `Feb 30` 类越月回绕）且 `2015-01-01 <= d <= now`；越界 → null。
- * - ReDoS：`<h1` 定位与计数用 `indexOf`；锚定正则只在**有界**紧邻文本小串上跑，绝不跨整张 5MB HTML。
+ * - ReDoS：剥离/计数/锚定全为单遍线性扫描；锚定正则只在**有界**紧邻文本小串（≤4096）上跑，绝不跨整张 5MB HTML。
+ *
+ * **正确性边界**：本函数是「近似 HTML tokenizer」而非 spec 完整实现。目标语料是机器生成的合法 HTML（Anthropic
+ * 文章页）——在其 + 全部合法 HTML + 绝大多数畸形 HTML 上满足「绝不提取错日期」。已知残留全部是**机器生成 HTML
+ * 不会产出的畸形边角**（属性名位裸引号、`data-x==` 双等号、注释嵌开标签内、`</script>` 出现在脚本字符串里、
+ * `<plaintext>` 等——见各 helper 文档）；根治须完整 tokenizer，与本文件「不引入 cheerio / 防 ReDoS」设计相悖，
+ * 故按残留接受。若接入非机器生成/不可信 HTML 源，或真页月份改用全称（`November`——届时静默全 null、非错），再评估升级。
  */
 export function extractPublishedAt(html: string, nowMs: number): Date | null {
-  const first = findH1TagStart(html, 0);
+  const clean = stripNonContentRegions(html);
+  const first = findH1TagStart(clean, 0);
   if (first === -1) return null; // 0 个 h1 → 干净失败。
-  if (findH1TagStart(html, first + 3) !== -1) return null; // >1 个 h1 → 干净失败（站点加了 nav/卡片 h1）。
+  if (findH1TagStart(clean, first + 3) !== -1) return null; // >1 个 h1 → 干净失败（站点加了 nav/卡片 h1）。
 
-  const closeIdx = html.indexOf('</h1>', first + 3);
-  if (closeIdx === -1) return null; // 唯一 h1 但无闭合 → 干净失败。
-  const afterH1 = closeIdx + 5; // 越过 '</h1>'。
-  const text = h1AdjacentText(html.slice(afterH1, afterH1 + H1_ADJACENT_SCAN_CHARS));
+  const afterH1 = h1AdjacentStart(clean, first); // 标签/引号状态感知找真 </h1>，跳过属性值里的假闭标签。
+  if (afterH1 === -1) return null; // 唯一 h1 但无（真）闭合 → 干净失败。
+  const text = h1AdjacentText(clean.slice(afterH1, afterH1 + H1_ADJACENT_SCAN_CHARS));
   if (text === null) return null;
 
   const m = /^\s*([A-Z][a-z]{2}) (\d{1,2}), (\d{4})\s*$/.exec(text);
