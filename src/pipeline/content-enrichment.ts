@@ -33,7 +33,7 @@ import { and, eq, isNull, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, rawItems } from '../db/schema.js';
 import { env } from '../config/env.js';
-import { extractOgTag, MAX_BODY_BYTES } from '../collectors/sitemap.js';
+import { extractOgTag, isSiteBoilerplate, MAX_BODY_BYTES } from '../collectors/sitemap.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测。 */
 type DbLike = typeof defaultDb;
@@ -287,10 +287,17 @@ export async function enrichCandidateContent(
     try {
       const html = await fetchArticleGuarded(target, fetchImpl, resolve, maxRedirects);
       const description = extractOgTag(html, 'og:description');
-      if (!description) {
-        // og:description 缺失/空：按失败处理，content 保持为空，下游退化仅标题。
+      if (!description || isSiteBoilerplate(description)) {
+        // og:description 缺失/空、或命中全站样板 → 按失败处理，content 保持为空，下游退化仅标题。
+        //
+        // 样板必须在写回【之前】判：采集器已把样板 og:description 置 content=null（见 sitemap.ts），
+        // 这些行恰因此落进本补全工作集；本阶段重抓的是【同一张页面】、拿回【同一段样板】，而它非空、
+        // extractOgTag 视为成功。若原样写回：content 由 null 变回非空样板 → digest 的 hasContent 护栏
+        // 不触发 → LLM 拿全站公司简介当正文 grounding；且 content 一旦非空该行永久离开工作集、样板
+        // 成为终身正文、无路径再修正。故必与采集器共享【同一个】isSiteBoilerplate（单一定义、两处引用），
+        // 绝不各写一份——两份必漂移，样板串变更时只改一处、另一处照旧放行，本洞从漂移那侧重开。
         fail += 1;
-        logError(`补抓 og:description 缺失（content 保持为空，退化仅标题）：${target}`, null);
+        logError(`补抓 og:description 缺失或命中全站样板（content 保持为空，退化仅标题）：${target}`, null);
         continue;
       }
       // 原子判空写回：命中 0 行 = 已被并发填充（RSS/Ask HN 再抓），跳过、良性、不计 hit/fail。

@@ -427,23 +427,57 @@ function findH1TagStart(html: string, from: number): number {
  * 返回其内文本 `Jun 30, 2026`。有界 slice + `indexOf` 线性（不用 `[\s\S]*?` 跨整张 HTML，防 ReDoS）。
  */
 function h1AdjacentText(slice: string): string | null {
+  // 跳过 </h1> 与紧邻元素之间的空白。
   let i = 0;
-  while (i < slice.length) {
-    const c = slice[i]!;
-    if (c === '<') {
-      const gt = slice.indexOf('>', i);
-      if (gt === -1) return null; // 未闭合标签 → 干净失败（线性 bail）。
-      i = gt + 1;
-      continue;
-    }
-    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v') {
-      i += 1;
-      continue;
-    }
-    const lt = slice.indexOf('<', i); // 文本起点 → 下一个 '<' 为止即该元素文本。
-    return lt === -1 ? slice.slice(i) : slice.slice(i, lt);
+  while (i < slice.length && /\s/.test(slice[i]!)) i += 1;
+  if (i >= slice.length) return null;
+
+  // 紧邻的必须是一个元素的开标签。日期直接裸露在 </h1> 之后（无包裹元素）也接受：取到下一个 '<'。
+  if (slice[i] !== '<') {
+    const lt = slice.indexOf('<', i);
+    return (lt === -1 ? slice.slice(i) : slice.slice(i, lt)).trim() || null;
   }
-  return null;
+
+  // 取【紧邻元素】的完整边界（开标签 → 其配对闭标签，同名嵌套按深度计数），再汇集其**全部**后代文本。
+  //
+  // 绝不「跳过标签直到第一个文本节点」——那会 ① 跳过空的紧邻元素、够到【非紧邻】兄弟的日期
+  // （`<div></div><p>Jul 15, 2026</p>` 抓成第二个兄弟）；② 只取第一个文本节点、忽略元素内后续文本
+  // （`<span>Jul 15</span> · Updated` 抠出纯日期、绕过整串匹配）。二者都让「错的日期」提取成功、
+  // 落在 authority=2（最高、不可纠），直接打穿本提取器「只能干净失败、绝不提取到错的」这条核心安全属性。
+  const openGt = slice.indexOf('>', i);
+  if (openGt === -1) return null; // 开标签未闭合 → 干净失败。
+  if (slice[openGt - 1] === '/') return null; // 自闭合 `<tag/>` → 空元素、无文本。
+
+  const nameMatch = /^<([a-zA-Z][a-zA-Z0-9]*)/.exec(slice.slice(i, openGt + 1));
+  if (!nameMatch) return null; // 非规范开标签 → 干净失败。
+  const tag = nameMatch[1]!.toLowerCase();
+
+  // 深度计数找配对闭标签（同名嵌套 +1/-1）；有界 slice + indexOf 线性，不用跨串懒惰捕获（防 ReDoS）。
+  let depth = 1;
+  let scan = openGt + 1;
+  let closeStart = -1;
+  const openRe = new RegExp(`<${tag}(?=[\\s/>])`, 'gi');
+  const closeRe = new RegExp(`</${tag}\\s*>`, 'gi');
+  while (depth > 0) {
+    closeRe.lastIndex = scan;
+    const close = closeRe.exec(slice);
+    if (!close) return null; // 紧邻元素在窗口内未闭合 → 干净失败。
+    openRe.lastIndex = scan;
+    let nestedOpens = 0;
+    let o = openRe.exec(slice);
+    while (o && o.index < close.index) {
+      nestedOpens += 1;
+      o = openRe.exec(slice);
+    }
+    depth += nestedOpens - 1;
+    scan = close.index + close[0].length;
+    if (depth === 0) closeStart = close.index;
+  }
+
+  // 紧邻元素的完整内部 → 剥掉所有内层标签 → 汇集全部文本。空 → null（绝不够到下一个兄弟）。
+  const inner = slice.slice(openGt + 1, closeStart);
+  const textOnly = inner.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+  return textOnly || null;
 }
 
 /**

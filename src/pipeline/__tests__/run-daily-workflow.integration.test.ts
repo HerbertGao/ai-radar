@@ -18,6 +18,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { Redis } from 'ioredis';
 import * as schema from '../../db/schema.js';
 import type { CollectedItem } from '../../collectors/types.js';
+import { ArxivRateLimitError } from '../../collectors/arxiv.js';
 import type { MessageSender } from '../../push/dispatcher.js';
 import type { EnrichContentOptions } from '../content-enrichment.js';
 import type { RunDailyWorkflowOptions } from '../run-daily-workflow.js';
@@ -1186,6 +1187,55 @@ describe.skipIf(!canRun)('runDailyWorkflow 改版静默死亡告警支路（fix-
     // rss 健康新闻使系统级/熔断不触发；sitemap 失败 → 源级健康告警恰好为此 dedupKey。
     expect(result.outcome).toBe('pushed');
     expect(alertedWith(alert, 'source-health:sitemap')).toBe(true);
+  });
+
+  it('源级健康告警豁免良性限流：arxiv 抛 ArxivRateLimitError（429 放弃）→ 【不】告警', async () => {
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          arxiv: async () => {
+            throw new ArxivRateLimitError('arXiv OAI-PMH 429 限流：达退避上限本轮放弃');
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    // 429 退避达上限是 arxiv 设计内的良性放弃 → 豁免，绝不产生 source-health:arxiv（防每日噪音告警）。
+    expect(alertedWith(alert, 'source-health:arxiv')).toBe(false);
+  });
+
+  it('源级健康告警不豁免真失败：arxiv 抛普通错（非限流）→ 告警 source-health:arxiv', async () => {
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          arxiv: async () => {
+            throw new Error('arXiv OAI-PMH 500 解析失败'); // 非限流 → 真异常，必须告警。
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'source-health:arxiv')).toBe(true);
   });
 });
 

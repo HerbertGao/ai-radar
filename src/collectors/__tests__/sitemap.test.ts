@@ -688,6 +688,21 @@ describe('extractPublishedAt 纯函数（唯一 h1 + 紧邻元素整串日期）
     expect(d?.toISOString()).toBe('2023-11-02T00:00:00.000Z');
   });
 
+  it('①b 紧邻元素【为空】+ 后续兄弟元素含日期 → null（绝不够到非紧邻兄弟）', () => {
+    // 只取「紧邻元素」的完整文本；紧邻元素为空 ⇒ 干净失败，绝不跳过它去抓第二个兄弟的日期
+    // （否则一个非发布日的邻近日期会以 authority=2 覆盖正确近似值、永久不可纠）。
+    const html = `<article><h1>T</h1><div></div><p>Jul 15, 2026</p></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
+  it('①c 紧邻元素内「日期 + 后缀」（`<span>date</span> · Updated`）→ null（整串匹配作用于元素全部文本）', () => {
+    // 汇集紧邻元素的【全部】后代文本（"Jul 15, 2026 · Updated"）再整串匹配 ⇒ 不中 ⇒ null。
+    // 若只取第一个文本节点会抠出纯日期、绕过整串匹配——那正是「提取到错的」失效模式。
+    const html =
+      `<article><h1>T</h1><div><span>Jul 15, 2026</span> · Updated</div></article>`;
+    expect(mod.extractPublishedAt(html, NOW_MS)).toBeNull();
+  });
+
   it('①b 真实结构 fixture（<h1>…</h1><div class="body-3 agate">Nov 2, 2023</div>）→ 提取成功', () => {
     const d = mod.extractPublishedAt(fixture('anthropic-article-dated.html'), NOW_MS);
     expect(d?.toISOString()).toBe('2023-11-02T00:00:00.000Z');

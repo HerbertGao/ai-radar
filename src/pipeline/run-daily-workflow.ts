@@ -35,6 +35,8 @@ import {
   type CollectAllOptions,
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
+import { ArxivRateLimitError } from '../collectors/arxiv.js';
+import { ProductHuntRateLimitError } from '../collectors/product-hunt.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
 import { buildOpsAlertSink, consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
 import {
@@ -138,6 +140,20 @@ export { type AlertDetail, type AlertSink } from './ops-alert-sink.js';
 
 // 未注入真 sink 时回落 stderr。生产装配路径（run()）注入 buildOpsAlertSink()。
 const defaultAlert: AlertSink = consoleAlertSink;
+
+/**
+ * 该源失败是否为「良性限流退避」——429 退避达上限、本轮放弃。arxiv/Product Hunt 把它设计为隔离、
+ * 不告警的正常背压事件（周期性发生）。源级健康告警据此豁免，只对【异常】失败告警（sitemap 静默死亡
+ * 那类）；真正的源死亡（连续多日零新增）由 source-staleness 兜底。cause 链也查（withRetry 可能包一层）。
+ */
+function isBenignRateLimit(error: unknown): boolean {
+  let e: unknown = error;
+  for (let depth = 0; e instanceof Error && depth < 5; depth += 1) {
+    if (e instanceof ArxivRateLimitError || e instanceof ProductHuntRateLimitError) return true;
+    e = e.cause;
+  }
+  return false;
+}
 
 /** 工作流被熔断中止时抛出的信号（编排层据此让 BullMQ job 失败/重试）。 */
 export class WorkflowAbortError extends Error {
@@ -509,13 +525,18 @@ export async function runDailyWorkflow(
       alerted = true;
     }
 
-    // ── 源级健康告警（fix-sitemap-published-at）：对本轮 perSource.ok=false 的**每一个源**各发一条告警。
+    // ── 源级健康告警（fix-sitemap-published-at）：对本轮**异常**失败的每一个源各发一条告警。
     //    `perSource` 由 registry 产出、此前**无任何消费者**（源失败只落 logError）——这是「throw →
     //    perSource.ok=false → 计入告警」这条链路的落地点（含 sitemap 的 loc_count=0 与「窗内有候选零发射」两种 throw）。
     //    dedupKey='source-health:<source>' **per-source**（多源同时坏不塌成一条）+ push_records 唯一键
     //    ⇒ 同源当天至多一响。**仅日报链**（本段本就只在日报链跑）。
+    //
+    //    **豁免良性限流退避**：arxiv/Product Hunt 把「429 退避达上限、本轮放弃」设计为良性、隔离、
+    //    不告警的事件（见 arxiv.ts / product-hunt.ts）。spec 的「每一个源」意在捕获**异常**静默死亡
+    //    （sitemap 改版归零那类），而非把周期性限流背压当故障——否则每天一条良性告警会训练运维忽略告警。
+    //    真正的源死亡（连续多日零新增）由既有的 source-staleness 告警兜底，不依赖本条。
     for (const [source, ps] of Object.entries(collected.perSource)) {
-      if (ps && ps.ok === false) {
+      if (ps && ps.ok === false && !isBenignRateLimit(ps.error)) {
         console.error(`[pipeline] 告警: 采集源失败 source=${source}`);
         await alert(`采集源失败：${source}`, {
           dedupKey: `source-health:${source}`,
