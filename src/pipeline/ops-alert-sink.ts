@@ -163,6 +163,32 @@ function detailLines(detail: AlertDetail): string[] {
 }
 
 /**
+ * 把 `prefix + body` 交 `escapeMarkdownV2` 后不超过 `limit`：二分 `body` 的 code-point 前缀、取「转义后仍
+ * ≤ limit」的最大前缀再整体转义。转义结果对更长输入单调不减，故二分成立；返回的是**转义后**的串——不是
+ * 「先转义再截」，故不会留孤儿反斜杠。`prefix`（固定标题）计入每次整体转义的长度。常见路径（整体不超限）
+ * 只做一次转义。
+ */
+function escapeToLimit(prefix: string, body: string, limit: number): string {
+  const cps = [...body];
+  const escapedAt = (n: number): string => escapeMarkdownV2(prefix + cps.slice(0, n).join(''));
+  const full = escapedAt(cps.length);
+  if (full.length <= limit) return full;
+  let lo = 0;
+  let hi = cps.length;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (escapedAt(mid).length <= limit) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return escapedAt(best);
+}
+
+/**
  * 按通道渲染一条告警——**两个通道的 sender 契约完全不同，绝不能给它们同一个裸文本**：
  * - telegram：`api.sendMessage(chatId, text, { parse_mode: 'MarkdownV2' })`，**零转义**。告警文案
  *   含 `.` `-` `(` `)` `!` 等 MarkdownV2 保留字（如「降级率 42.9% 超阈值（30%），中止本次流水线。」），
@@ -174,16 +200,18 @@ function detailLines(detail: AlertDetail): string[] {
  *   正文经 `escapeLarkMdText`。
  */
 function renderAlert(channel: Channel, lines: readonly string[]): string {
-  // 截断必须在转义【之前】、按 code point——escapeMarkdownV2 最坏近乎翻倍（每个保留字前加 `\`），
-  // 先转义再截会把反斜杠截在半路；裸 .slice 又会把 emoji 截成孤儿代理对。两条都是 push/message.ts
-  // 早就踩过并写进注释的坑（`MAX_MESSAGE_LENGTH` 保守取 4000，正是「留余量给 Markdown 转义」）。
+  // 截断必须在转义【之前】、按 code point——先转义再截会把反斜杠截在半路；裸 .slice 又会把 emoji 截成
+  // 孤儿代理对。先按转义前字符数粗截（feishu 分支用它；也作 telegram 二分的上界）。
   const body = truncateByCodePoint(
     lines.join('\n'),
     MAX_MESSAGE_LENGTH - [...ALERT_TITLE].length - 1,
   );
   switch (channel) {
     case 'telegram':
-      return escapeMarkdownV2(`${ALERT_TITLE}\n${body}`);
+      // escapeMarkdownV2 每个保留字前加 `\`、最坏近乎翻倍，故**按转义后长度**限长（仅粗截转义前字符数
+      // 不足以保证不超 Telegram 4096）：二分正文 code-point 前缀，取「转义后仍 ≤ MAX_MESSAGE_LENGTH」的
+      // 最大前缀，再整体转义（不留孤儿反斜杠）。全正常字符时前缀=全文、全保留字时约取一半，均不超限。
+      return escapeToLimit(`${ALERT_TITLE}\n`, body, MAX_MESSAGE_LENGTH);
     case 'feishu': {
       const card: FeishuCard = {
         config: { wide_screen_mode: true },

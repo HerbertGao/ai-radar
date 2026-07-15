@@ -15,7 +15,7 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../../db/index.js';
 import { pushRecords } from '../../db/schema.js';
 import { getPushDate } from '../../push/push-date.js';
-import { escapeMarkdownV2 } from '../../push/message.js';
+import { escapeMarkdownV2, MAX_MESSAGE_LENGTH } from '../../push/message.js';
 import { CHANNEL } from '../../push/targets.js';
 import { createFeishuSender, type FetchLike } from '../../push/feishu.js';
 import { createTelegramSender, type BotApiLike } from '../../push/telegram.js';
@@ -312,5 +312,20 @@ d('运维告警 sink：按通道渲染（真实 sender + 注入 transport，走�
     const rows = await rowsFor(key);
     expect(rows).toHaveLength(2);
     expect(rows.every((r) => r.status === 'success')).toBe(true);
+  });
+
+  it('正文全是保留字 → Telegram payload【转义后】仍 ≤ MAX_MESSAGE_LENGTH，且不留孤儿反斜杠', async () => {
+    // escapeMarkdownV2 每个保留字前加 `\`、最坏近乎翻倍：裸截到 4000 再转义会翻到 ~8000、被 Telegram 4096 拒收。
+    const tgSent: string[] = [];
+    const api: BotApiLike = {
+      async sendMessage(_chatId, text) {
+        tgSent.push(text);
+      },
+    };
+    const alert = buildOpsAlertSink({ [CHANNEL.telegram]: createTelegramSender({ api, chatId: 'c' }) });
+    await alert('.'.repeat(5000), { dedupKey: key }); // 5000 个保留字 '.'。
+    expect(tgSent).toHaveLength(1);
+    expect(tgSent[0]!.length).toBeLessThanOrEqual(MAX_MESSAGE_LENGTH);
+    expect(tgSent[0]!).not.toMatch(/(?<!\\)\\$/); // 结尾不是「未被转义的」孤儿反斜杠。
   });
 });

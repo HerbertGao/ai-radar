@@ -20,7 +20,7 @@ P0 实时告警车道（`realtime-alerts`）自落地起一直关着（`ALERT_SC
 
 - **告警闸一次建成终态**（`已评分 ∧ is_ai_related=true ∧ (支路 A OR 支路 B)`）：
 
-  ```
+  ```sql
   importance_score IS NOT NULL                              -- ① 已评分：两支路共用前提，在 OR 之外
   AND is_ai_related = true                                  -- ② AI 闸：两支路共用，fail-closed（= true，NOT `IS NOT FALSE`）
   AND ( importance_score >= ALERT_IMPORTANCE_THRESHOLD      -- ③ 支路 A：重要性

@@ -49,7 +49,7 @@ ALTER TABLE ai_news_events ADD CONSTRAINT ai_news_events_published_at_authority_
 
 #### 场景:CHECK 约束兜死「有日期 ⟺ 等级非 0」
 - **当** 任何写路径试图写入 `published_at IS NULL AND published_at_authority > 0`，或 `published_at IS NOT NULL AND published_at_authority = 0`
-- **那么** DB `CHECK` 约束拒绝该写入——该不变量是「权威高者胜出即隐含 NULL-fill」的依据，绝不可只靠应用层自觉；既有集成测试的 seed 亦须按 `(published_at, published_at_authority)` 二元组写入（非空 → 2、NULL → 0），否则当场违约
+- **那么** DB `CHECK` 约束拒绝该写入——该不变量是「权威高者胜出即隐含 NULL-fill」的依据，绝不可只靠应用层自觉；既有集成测试的 seed 亦须按 `(published_at, published_at_authority)` 二元组写入（NULL → 0；非空 → **1**，即近似档 rss/hn/github/AI；**唯有 sitemap 页面确定性提取才 → 2**——给普通非空 seed 写 2 会赋予它不该有的覆盖权），否则当场违约或错测覆盖语义
 
 #### 场景:迁移 forward-only 且幂等
 - **当** 在已迁移数据库上再次执行 `drizzle-kit migrate`
@@ -81,7 +81,7 @@ type AlertSink = (message: string, detail: AlertDetail) => void | Promise<void>;
 
 #### 契约（MUST）
 
-```
+```text
 createOpsAlertSink({ sender, dbh, channels, now }): AlertSink
 
 alert(message, detail) →
@@ -89,16 +89,19 @@ alert(message, detail) →
   ② push_date = dateInTimeZone(now())                // 时区口径见下，MUST NOT 用 UTC 日
   ③ INSERT push_records (target_type='ops-alert', target_id=dedupKey,
                           channel, push_date, status='pending')
-     ON CONFLICT DO NOTHING
-     → 命中 0 行 ⇒ 今天已就该 dedupKey 在该 channel 告过警 ⇒ 直接 return，不发
+     ON CONFLICT DO UPDATE SET status='pending', error_message=NULL
+       WHERE push_records.status <> 'success'          // 仅【未成功】行可被重新认领
+     RETURNING id
+     → 命中 0 行 ⇒ 今天已就该 dedupKey 在该 channel 告过【成功】 ⇒ 直接 return，不发
+     → 命中 1 行 ⇒ 认领当日名额（含崩溃残 pending / 上次 failed 的重新认领）
   ④ 经 sender 发送（复用既有 sender，如 createFeishuSender）
   ⑤ 成功 → status='success'
-     失败 → MUST NOT 让该失败占用当日限频名额（见下）
+     失败 → status='failed'（不删行）；MUST NOT 让该失败占用当日限频名额（见下）
 ```
 
 **`push_date` 的时区口径 MUST 为 `dateInTimeZone(now, PUSH_TIMEZONE)`（`Asia/Shanghai`），MUST NOT 用 UTC 日**（`toISOString().slice(0,10)` 是最常见的错误写法）。**理由 MUST 逐字保留**：**UTC 日界 = 08:00 CST，而日报链恰在 08:03 CST 运行**——只差 3 分钟。用 UTC 日则 07:49 那一轮高频链的告警落 `push_date = D-1`、08:03 日报链的同一告警落 `push_date = D` ⇒ **唯一键不冲突** ⇒ 「跨两条链自动去重」这条收益**当场为假** ⇒ 持续故障期**天天双响**。`createOpsAlertSink` MUST 支持注入 `now`（可测），两条链 MUST 传同一口径的运行时刻。
 
-**发送失败 MUST NOT 占用当日限频名额**：若失败留下一行 `status='failed'`，则同一 `dedupKey` 的下一次告警会命中 `ON CONFLICT DO NOTHING`（0 行）而**直接跳过** ⇒ **一次发送失败 = 该告警当天彻底哑火**。故 sink MUST 在发送失败时把该 `pending` 行**删除**（使下一轮可重新占位重试），**或**把限频判据改为「存在 `status='success'` 的行才算今天已告过」。两种形态择一、MUST 在实现里显式落地，不得留给实现者临时发明。
+**发送失败 MUST NOT 占用当日限频名额**：若把任意冲突都视为「今天已告过」（`ON CONFLICT DO NOTHING`），则失败留下的 `failed`（乃至崩溃残留的 `pending`）会挡死同一 `dedupKey` 当天的后续告警 ⇒ **一次发送失败 / 一次崩溃 = 该告警当天彻底哑火**。故限频判据 MUST 为「**仅 `status='success'` 的行才算今天已告过**」：认领用 `ON CONFLICT DO UPDATE ... WHERE status <> 'success'`（`failed` / 陈旧 `pending` 可被重新认领重发），失败时把该行置 `failed`（**不删行**、留痕）。此为实现所采形态，MUST 显式落地，不得留给实现者临时发明。
 
 **通道选择 MUST 定死**：sink 的 `channels` 取「**已配置通道全集**」（与业务推送同口径）并逐个发送。**未配置任何通道时 MUST 回落 `console.error`，且 MUST NOT 写任何 `push_records` 行**——否则限频键会把「根本没有通道可发」也算成「今天已告过」，使通道配好之后当天仍然静默。
 
@@ -128,7 +131,7 @@ alert(message, detail) →
 
 #### 场景:同一 dedupKey 当天只告一次（跨进程、跨重启、跨链）
 - **当** 同一 `dedupKey` 的告警在同一天被再次触发（同一进程重复轮次、进程重启后、或另一条链触发）
-- **那么** `INSERT ... ON CONFLICT DO NOTHING` 命中 0 行 ⇒ sink 直接 return、**不发送**——限频状态住在 DB 唯一约束里，不依赖任何进程内状态（进程内 Map 会在 redeploy 复位而使限频/连续计数永久失效）
+- **那么** `INSERT ... ON CONFLICT DO UPDATE ... WHERE status <> 'success'` 命中 0 行（已有 `success` 行）⇒ sink 直接 return、**不发送**——限频状态住在 DB 唯一约束里，不依赖任何进程内状态（进程内 Map 会在 redeploy 复位而使限频/连续计数永久失效）
 
 #### 场景:push_date 用 Asia/Shanghai 日而非 UTC 日（否则跨链去重为假）
 - **当** 高频告警链在 07:49 CST、日报链在 08:03 CST 各触发一次同 `dedupKey` 的告警
@@ -136,7 +139,7 @@ alert(message, detail) →
 
 #### 场景:发送失败不占用当日限频名额
 - **当** sink 写入 `pending` 行后，sender 发送失败
-- **那么** 该失败 **MUST NOT** 使同一 `dedupKey` 当天的后续告警被限频跳过——sink 须删除该 `pending` 占位行（下一轮可重新占位重试），或以「存在 `status='success'` 行」为限频判据。**绝不可**留下一行 `failed` 就让唯一键把当天的该告警彻底哑火；异常仅记错误日志、不向上抛
+- **那么** 该失败 **MUST NOT** 使同一 `dedupKey` 当天的后续告警被限频跳过——限频判据为「仅 `status='success'` 行算已告过」，失败置 `failed`（不删行）后，下一轮的 `ON CONFLICT DO UPDATE ... WHERE status <> 'success'` 可重新认领该行重发。**绝不可**留下一行 `failed` 就让唯一键把当天的该告警彻底哑火；异常仅记错误日志、不向上抛
 
 #### 场景:未配置任何推送通道时不写 push_records
 - **当** 运行环境未配置任何推送通道

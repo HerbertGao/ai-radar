@@ -75,7 +75,7 @@
 
 **等级 MUST 为两级非空——第 1 档内部 MUST NOT 再排序**：
 
-```
+```text
 0 = 无日期
 1 = 一切【不是页面确定性提取】的日期值
     （rss 的 pubDate / hacker_news 与 show_hn 的投稿时刻 / github 的 push 时刻 / AI 推断）
@@ -87,7 +87,7 @@
 
 **「程序 > LLM」的四级阶梯（0/1 LLM/2 程序/3 页面）是错的，且是【相对现状的净回归】**——它按「谁不是 LLM」排，而不是按「谁更接近发布日」排。`sitemap.ts:535` 明写「置 null、走既有 published-at-inference 推断真实发布日」⇒ **sitemap 那一族文章的日期按设计就住在第 1 档**（生产实测：28 个 sitemap 事件里 10 个有日期，其 `raw_item.published_at` **全为 NULL** ⇒ 那 10 个日期**全部来自 AI 回填**）。于是四级阶梯下：
 
-```
+```text
 1. sitemap 采到 anthropic.com/news/x   → published_at=NULL, authority=0
 2. AI 回填推断出【真实发布日】(2023)   → authority=1
 3. 同一 URL 被发上 HN → 同 dedup_key ⇒ 塌缩
