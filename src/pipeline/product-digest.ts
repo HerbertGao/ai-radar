@@ -48,16 +48,16 @@ import { TARGET_TYPE, type Channel } from '../push/targets.js';
 type DbLike = typeof defaultDb;
 
 /**
- * 告警 sink（与 run-daily-workflow 的 AlertSink 结构同构，参数注入）。
+ * 告警 sink 从 ops-alert-sink import（不再本地重复定义）。
  *
- * 本地定义而非从 run-daily-workflow import：run-daily-workflow 运行时 import 本文件
- * （collapseProductsOnce/selectProductsForChannelSafe/digestPendingProducts），反向再 import
- * 其类型会形成循环依赖；本地结构同构类型由结构化类型系统保证可接收注入的 AlertSink。
+ * 此前为避开与 run-daily-workflow 的循环依赖而本地复制了一份结构同构类型——代价是本文件的三条
+ * 告警走的是另一个 sink、永远只落 stderr，且 `dedupKey` 必填的编译期约束对它们不生效。
+ * AlertSink 的权威定义移出 run-daily-workflow 后，ops-alert-sink 是一个不 import 本文件的叶子模块，
+ * 无环，可直接引用。
  */
-type AlertSink = (message: string, detail?: unknown) => void;
+import { consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
 
-const defaultAlert: AlertSink = (message, detail) =>
-  console.error(`[product-segment][ALERT] ${message}`, detail ?? '');
+const defaultAlert: AlertSink = consoleAlertSink;
 
 // ──────────────────────────────────────────────────────────────────────────
 // 部署防假绿（启动自检）：ai_products 中文列存在性探针
@@ -317,7 +317,11 @@ export async function digestPendingProducts(
         `[product-digest] 候选并集收集失败[${channel}]，跳过该 channel（不拖垮新闻）`,
         e,
       );
-      alert('产品中文化候选并集收集失败（系统故障可观测）', { channel, error: e });
+      await alert('产品中文化候选并集收集失败（系统故障可观测）', {
+        dedupKey: `product-zh-candidates:${channel}`,
+        channel,
+        error: e,
+      });
     }
   }
   if (candidateIds.size === 0) return;
@@ -349,7 +353,10 @@ export async function digestPendingProducts(
   } catch (e) {
     // 整步系统级故障（如 DB 断连）：永不向上抛，但单独告警（不进熔断分母、不中止流水线）。
     console.error('[product-digest] 待中文化产品查询失败，整步降级（不拖垮新闻）', e);
-    alert('产品中文化待处理查询失败（系统故障可观测）', { error: e });
+    await alert('产品中文化待处理查询失败（系统故障可观测）', {
+      dedupKey: 'product-zh-pending-query',
+      error: e,
+    });
     return;
   }
 
@@ -391,10 +398,10 @@ export async function digestPendingProducts(
     (failureRate > PRODUCT_DIGEST_FAILURE_RATE_THRESHOLD ||
       failed >= PRODUCT_DIGEST_FAILURE_COUNT_THRESHOLD)
   ) {
-    alert(
+    await alert(
       `产品中文化失败规模异常：${failed}/${pending.length} 失败（${(failureRate * 100).toFixed(0)}%），` +
         `不进熔断分母、不中止流水线，但须排查系统故障（如 LLM/DB 不可用）。`,
-      { failed, total: pending.length, failureRate },
+      { dedupKey: 'product-zh-degrade', failed, total: pending.length, failureRate },
     );
   }
 }

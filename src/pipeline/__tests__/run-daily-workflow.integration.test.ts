@@ -18,6 +18,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { Redis } from 'ioredis';
 import * as schema from '../../db/schema.js';
 import type { CollectedItem } from '../../collectors/types.js';
+import { ArxivRateLimitError } from '../../collectors/arxiv.js';
 import type { MessageSender } from '../../push/dispatcher.js';
 import type { EnrichContentOptions } from '../content-enrichment.js';
 import type { RunDailyWorkflowOptions } from '../run-daily-workflow.js';
@@ -271,9 +272,14 @@ async function cleanup() {
   if (!pool) return;
   // 全表清空（而非仅删 TITLE_MARKER 行）：scoreUnscoredEvents 扫全表 `importance_score IS NULL`、
   // selectTopN 扫全表候选——都不带本套件 marker 过滤。配合 vitest fileParallelism=false（同进程串行），
-  // TRUNCATE 三张表确保全局表读只看到本用例 seed 的数据，外部残留的未评分/候选行不会混入断言。
+  // TRUNCATE 确保全局表读只看到本用例 seed 的数据，外部残留的未评分/候选行不会混入断言。
+  //
+  // **ai_products 必须一起清**：日报是「要闻段 + 新品段」一条消息，产品段非空就会推送。一行来自
+  // 别的测试文件（或一次崩掉的跑）的残留产品，会让「无候选 → 不推」那组用例全部红——而它们的
+  // 失败信息指向 sender.calls，读起来像代码回归。这是假红，且极难定位：本地库里一行孤儿产品，
+  // 就能让 12 条用例红成一片。
   await pool.query(
-    `TRUNCATE TABLE push_records, ai_news_events, raw_items RESTART IDENTITY`,
+    `TRUNCATE TABLE push_records, ai_news_events, raw_items, ai_products RESTART IDENTITY`,
   );
   if (redisUrl) {
     const r = new Redis(redisUrl);
@@ -485,8 +491,9 @@ describe.skipIf(!canRun)('runDailyWorkflow 编排 + 降级熔断（10.4）', () 
   it('采集返回 = 0（三源全挂）→ 告警，不推', async () => {
     const sender = okSender();
     const alert = vi.fn();
-    // 本用例不造任何 event；beforeEach 已清库 + 串行执行（vitest fileParallelism=false）
-    // 保证无残留候选，故「无候选 → 不推」确定性成立。
+    // 本用例不造任何 event。beforeEach 的 TRUNCATE 含 ai_products（日报是「要闻段 + 新品段」
+    // 一条消息，产品段非空即推送——漏清产品会让本断言假红），配合串行执行
+    // （vitest fileParallelism=false）保证无残留候选，故「无候选 → 不推」确定性成立。
     const result = await runDailyWorkflow({
       now: NOW,
       dbh: db!,
@@ -866,11 +873,13 @@ describe.skipIf(!canRun)('runDailyWorkflow 日报降级回归（组 C 4.2/4.4/4.
     const { sha256Hex, normalizeUrl } = await import('../../dedup/normalize.js');
     const dedupKey = sha256Hex(normalizeUrl(url)!);
     const { rows: seed } = await pool!.query<{ event_id: string }>(
+      // published_at 与 published_at_authority 同写（CHECK）；非空日期记 1（「非页面确定性提取」档，与 rss/HN/AI 回填同级）。
       `INSERT INTO ai_news_events
          (dedup_key, representative_title, representative_raw_item_id, should_push,
           importance_score, novelty_score, developer_relevance_score, hype_risk_score,
-          first_seen_at, published_at, is_ai_related, source_count)
-       VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,true,1) RETURNING event_id`,
+          first_seen_at, published_at, published_at_authority, is_ai_related, source_count)
+       VALUES ($1,$2,NULL,true,90,80,80,10,$3,$4,
+               CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 1 END,true,1) RETURNING event_id`,
       [
         dedupKey,
         `${TITLE_MARKER} P0 overlap event`,
@@ -1057,6 +1066,176 @@ describe.skipIf(!canRun)('runDailyWorkflow 按源陈旧度告警阶段（组 B 4
     expect(result.outcome).toBe('pushed');
     // 无陈旧源、无系统级/熔断告警 → alert 零调用。
     expect(alert).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * runDailyWorkflow「改版静默死亡」两条告警支路集成测试（fix-sitemap-published-at）：
+ * - 支路 1：日报链对 raw_items 的 DB 复算（source='sitemap' 且 fetched_at>=今日 00:00）判
+ *   `emitted>0 且 date_extracted=0` → alert（dedupKey='sitemap-date-extraction-zero'）。判据是 DB 复算、
+ *   与「本轮谁采的」无关（故用直接 seed raw_items 而非经采集器）。
+ * - 源级健康告警：本轮某源 perSource.ok=false（注入采集器桩让 sitemap throw）→ alert
+ *   （dedupKey='source-health:sitemap'）。这是支路 2 的 throw 变成告警的通道。
+ *
+ * 均用「rss 采到健康新闻」使系统级/熔断告警都不触发 + `staleness:[]` 静默陈旧度 → alert 的调用可精确断言。
+ * seed 的 sitemap 行置 collapsed=true（不进事件塌缩/判分/摘要，隔离到本断言）；beforeEach 全表 TRUNCATE 清理。
+ */
+describe.skipIf(!canRun)('runDailyWorkflow 改版静默死亡告警支路（fix-sitemap-published-at）', () => {
+  /** 直接 seed 一条 source='sitemap' 的 raw_item（collapsed=true，仅供支路 1 的 DB 复算计数）。 */
+  async function seedSitemapRow(id: string, publishedAt: Date | null): Promise<void> {
+    await db!.insert(schema.rawItems).values({
+      source: 'sitemap',
+      sourceItemId: `sitemap-b1-${id}`,
+      rawType: 'news',
+      title: `${TITLE_MARKER} seeded sitemap ${id}`,
+      publishedAt,
+      fetchedAt: NOW, // >= 今日 00:00（startOfDayInTimeZone(NOW,0)），落入复算窗。
+      collapsed: true, // 不进 collapse/judge/digest，隔离到支路 1 计数。
+    });
+  }
+
+  /** alert 是否被以某 dedupKey 调用过。 */
+  function alertedWith(alert: ReturnType<typeof vi.fn>, dedupKey: string): boolean {
+    return alert.mock.calls.some(
+      (c) => (c[1] as { dedupKey?: string } | undefined)?.dedupKey === dedupKey,
+    );
+  }
+
+  const healthyNews = () => [
+    item({ id: 'sd-news', url: 'https://ex.com/sd-news', title: 'Silent-death healthy news' }),
+  ];
+
+  it('支路 1：sitemap 当日入库 emitted>0 且 date_extracted=0 → 告警 sitemap-date-extraction-zero', async () => {
+    await seedSitemapRow('a', null);
+    await seedSitemapRow('b', null);
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(result.outcome).toBe('pushed');
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(true);
+  });
+
+  it('支路 1 反例：有至少一条 published_at IS NOT NULL（date_extracted>0）→ 不告警', async () => {
+    await seedSitemapRow('a', null);
+    await seedSitemapRow('b', new Date('2000-01-01T00:00:00Z')); // date_extracted=1>0。
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(false);
+  });
+
+  it('支路 1 反例：emitted=0（无今日 sitemap 行）→ 不告警（提取率跌零与今天没新文不可区分）', async () => {
+    // 不 seed 任何 sitemap 行 → 复算 emitted=0 → MUST NOT 告警。
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(healthyNews()) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'sitemap-date-extraction-zero')).toBe(false);
+  });
+
+  it('源级健康告警：本轮 sitemap 源 throw（perSource.ok=false）→ 告警 source-health:sitemap', async () => {
+    const alert = vi.fn();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          // 支路 2 的 throw 在采集器内部；此处直接让 sitemap 源 throw 模拟其效果 → perSource.ok=false。
+          sitemap: async () => {
+            throw new Error('sitemap window candidate but zero emit');
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    // rss 健康新闻使系统级/熔断不触发；sitemap 失败 → 源级健康告警恰好为此 dedupKey。
+    expect(result.outcome).toBe('pushed');
+    expect(alertedWith(alert, 'source-health:sitemap')).toBe(true);
+  });
+
+  it('源级健康告警豁免良性限流：arxiv 抛 ArxivRateLimitError（429 放弃）→ 【不】告警', async () => {
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          arxiv: async () => {
+            throw new ArxivRateLimitError('arXiv OAI-PMH 429 限流：达退避上限本轮放弃');
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    // 429 退避达上限是 arxiv 设计内的良性放弃 → 豁免，绝不产生 source-health:arxiv（防每日噪音告警）。
+    expect(alertedWith(alert, 'source-health:arxiv')).toBe(false);
+  });
+
+  it('源级健康告警不豁免真失败：arxiv 抛普通错（非限流）→ 告警 source-health:arxiv', async () => {
+    const alert = vi.fn();
+    await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: {
+        collectors: {
+          ...collectorsReturning(healthyNews()),
+          arxiv: async () => {
+            throw new Error('arXiv OAI-PMH 500 解析失败'); // 非限流 → 真异常，必须告警。
+          },
+        },
+      },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      staleness: async () => [],
+      sender: okSender(),
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert,
+    });
+    expect(alertedWith(alert, 'source-health:arxiv')).toBe(true);
   });
 });
 
@@ -1795,7 +1974,8 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品段编排（7.3）', () => {
  *   回退 NULL、本轮排除、下轮工作集 is_ai_related IS NULL 再补判自愈）；要闻段照推、judge/digest 统计不受影响。
  *
  * 推送均注入 mock sender + 钉 channels（防误发生产飞书，memory test-no-prod-sends）。
- * ai_products 不在 cleanup 的 TRUNCATE 内，故 seed 的产品用唯一前缀、本块 finally 显式清理。
+ * ai_products 已在 cleanup 的 TRUNCATE 内（每个用例前清空）；本块 seed 的产品仍用唯一前缀 +
+ * finally 显式清理，使本块单跑（不经 beforeEach）时也自洽。
  */
 describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，8.6）', () => {
   const PROD_PREFIX = `rdw-zh-${process.pid}-`;

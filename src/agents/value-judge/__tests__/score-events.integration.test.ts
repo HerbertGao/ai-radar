@@ -105,7 +105,7 @@ async function seedEvent(
     content: content ?? null,
   });
   const out = await collapseRawItem(
-    { id, url, title, publishedAt: new Date('2026-06-01T00:00:00Z'), fetchedAt: new Date() },
+    { id, url, source: 'rss', title, publishedAt: new Date('2026-06-01T00:00:00Z'), fetchedAt: new Date() },
     db!,
   );
   return out.dedupKey!;

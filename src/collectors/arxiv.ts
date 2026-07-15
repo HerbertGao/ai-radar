@@ -13,8 +13,11 @@
  * 限流与退避（design D3，2026-02 起 arXiv 收紧 429）：
  * - **单采集进程内** ≥3s 串行节流闸（单连接串行，不以并发绕过限流）。前提：P2 采集由单实例承载，
  *   进程内串行闸即满足 arXiv 侧「1 req/3s」；不承诺跨多 worker 的分布式节流（留后续）。
- * - HTTP 429 → 指数退避重试（复用 withRetry，baseDelay 调大）**且有重试上限**；超限本轮该源
- *   放弃、记 error，由编排层 `Promise.allSettled` 隔离（不无界 pending 拖长 job、不触发全失败告警）。
+ * - HTTP 429 → 指数退避重试（本文件【自有】退避循环、不用 withRetry——见 harvestArxiv 的 fetchPage，
+ *   为精确区分「鉴权不重试」与「429 有上限退避」而不用 withRetry 的盲重试；baseDelay 调大）**且有重试
+ *   上限**；超限本轮该源放弃、抛出原始 `ArxivRateLimitError`（instanceof 一路保留到 perSource.error，
+ *   供源级健康告警的 isBenignRateLimit 豁免），由编排层 `Promise.allSettled` 隔离（不无界 pending 拖长
+ *   job、不触发全失败告警；源级健康告警也豁免该良性放弃）。
  * - 鉴权类错误（HTTP 401/403）**不进入退避重试**（重试不可恢复的鉴权错误只是浪费预算），
  *   直接按单源失败抛出、由 allSettled 隔离。
  *

@@ -21,7 +21,9 @@
     "kb:backfill": "tsx src/kb/backfill-main.ts",
     "kb:search": "tsx src/kb/search-cli.ts",
     "mr:seed": "tsx src/mr/ingest/seed-main.ts",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "spec:validate": "openspec-cn validate --strict",
+    "prepare": "git config core.hooksPath .githooks || true",
+    "spec:body-superset": "node scripts/spec-body-superset.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.74",
@@ -44,6 +46,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@herbertgao/openspec-cn": "1.6.0",
     "@types/node": "^26.1.1",
     "@types/pg": "^8.20.0",
     "drizzle-kit": "^0.31.10",

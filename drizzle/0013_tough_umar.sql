@@ -1,0 +1,38 @@
+-- published_at 的权威等级（0 无 / 1 非页面确定性提取 / 2 页面确定性提取）。
+--
+-- ⚠️ 本迁移与【上一版镜像不兼容】——回滚必须先删约束，否则整条链路瘫痪。
+--
+-- ⚠️ 本文件在分支内被【原地改写】过（存量回填值由 2 改为 1，因权威阶梯从四级收窄为两级）。
+--    drizzle 的 journal 只记「0013 已应用」，不会因文件内容变化而重跑。故任何在改写【之前】
+--    跑过 0013 的库（本地 dev / CI 缓存），存量行会卡在 authority=2——而新阶梯里 2 = 页面提取
+--    ⇒ 那些 rss/HN 行既免疫真 sitemap 值的覆盖、又持有覆盖别人的权力。
+--    修法：`UPDATE ai_news_events SET published_at_authority = 1 WHERE published_at_authority = 2;`
+--    （或直接重建库）。生产库从未见过 0013，不受影响。
+--
+-- 下面这条 CHECK 的设计目的就是「让任何只写 published_at、不写 authority 的路径当场违约」——
+-- 而旧镜像的塌缩 INSERT 与 published-at-inference 的回填 CAS 正是这样的路径。故：
+--
+--   * 代码回滚（镜像回退、DB 不回滚，最常见的应急动作）⇒ 塌缩与回填的每一条事务都违反 CHECK
+--     而整体回滚 ⇒ raw_items.collapsed 永远置不上 ⇒ 采集之后的所有阶段停摆。
+--   * 已实测：本地库应用本迁移后 checkout 到上一版代码，run-daily-workflow 的集成套件红 53 条。
+--
+-- 回滚步骤（必须先做，再回退镜像）：
+--   ALTER TABLE ai_news_events DROP CONSTRAINT ai_news_events_published_at_authority_check;
+--   -- （published_at_authority 列可留着，旧代码不读它；DEFAULT 0 使旧代码的 INSERT 合法）
+--
+-- 注：`ADD CONSTRAINT ... NOT VALID` 救不了这个——NOT VALID 只跳过校验【存量行】，
+-- 对【新写入】照样强制，旧镜像还是会违约。
+--
+-- 语句顺序不可调换：ADD COLUMN → 回填 → ADD CONSTRAINT。约束若先于回填，存量每一行
+-- （published_at 非空而 authority 仍是默认 0）都会违约、迁移当场 abort。空库 CI 看不到这个
+-- ——它没有存量行；drizzle-kit generate 生成的正是那个错误顺序。
+ALTER TABLE "ai_news_events" ADD COLUMN "published_at_authority" smallint DEFAULT 0 NOT NULL;--> statement-breakpoint
+-- 存量回填记 1（「非页面确定性提取」档），不是 2：页面提取那条采集路径此前并不存在，故存量的
+-- 一切非空 published_at（rss 的 pubDate / HN 的投稿时刻 / github 的 push 时刻 / AI 回填的推断值）
+-- 全部属于该档。CHECK 要求 published_at IS NULL ⟺ authority = 0，故非空行必须同时给出非 0 等级。
+--
+-- 存量 published_at 一行不动：同一 canonical_url 下 HN 与 RSS 的日期实测可差 ±12 天且方向不定，
+-- 哪个是文章真正的发布日，数据里没有。按源权威性去「清洗」等于猜，而猜错的方向会把 published_at
+-- 往后推 ⇒ 让老文看起来更新 ⇒ 正是时效性红线要防的方向。
+UPDATE "ai_news_events" SET "published_at_authority" = 1 WHERE "published_at" IS NOT NULL;--> statement-breakpoint
+ALTER TABLE "ai_news_events" ADD CONSTRAINT "ai_news_events_published_at_authority_check" CHECK (("ai_news_events"."published_at" IS NULL) = ("ai_news_events"."published_at_authority" = 0));

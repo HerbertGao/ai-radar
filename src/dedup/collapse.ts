@@ -24,14 +24,23 @@
  * 重复、禁止向 tombstone 累加 source_count。详见 collapseRawItem 内联注释（守卫谓词 + 链解析 + 并发原子性）。
  */
 import { and, eq, sql } from 'drizzle-orm';
+import type { CollectorSource } from '../collectors/types.js';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, rawItems } from '../db/schema.js';
 import { normalizeRawItem, NORMALIZER_VERSION } from './normalize.js';
 
 /** 塌缩所需的最小 raw_item 视图（由 collector 落库后读出，或集成测 seed）。 */
 export interface RawItemForCollapse {
-  /** raw_items.id（BIGINT），作 representative_raw_item_id。 */
+  /**
+   * raw_items.id（BIGINT），作 representative_raw_item_id。
+   */
   id: bigint;
+  /**
+   * raw_items.source（NOT NULL）。**必填，不可选**——它是 published_at 权威等级的唯一推导依据。
+   * 写成可选时全部既有调用点不改也能编译，而 source 为 undefined 会让 sitemap 的页面提取日期
+   * 被降级成「非页面提取」⇒ 永远覆盖不了任何已设值 ⇒ 本能力对上了 HN 的重大发布静默失效。
+   */
+  source: CollectorSource;
   /** 原始 url，用于生成 canonical_url。 */
   url?: string | null;
   /** 原始 title（NOT NULL），既用于归一化，也作 representative_title 原文。 */
@@ -40,6 +49,77 @@ export interface RawItemForCollapse {
   publishedAt?: Date | null;
   /** raw_items 入库时间（raw_items.fetched_at NOT NULL，恒有值），作首建 event.first_seen_at。 */
   fetchedAt: Date;
+}
+
+/**
+ * 各源的 published_at 是不是「从文章页面确定性提取的发布日」（文章自己印的那个日期）。
+ *
+ * 只有 sitemap 是——它读文章 HTML 里印的发布日；其余源的 published_at 都测的是**别的事件**：
+ * rss 是 feed 声明的 pubDate（转载/重生成会漂）、hacker_news / show_hn 是投稿到站点的时刻、
+ * github 是仓库 push 时刻。
+ *
+ * `satisfies Record<CollectorSource, boolean>` 强制与 `CollectorSource` 联合类型逐一对齐：
+ * 联合类型新增成员却漏加此处 → typecheck 立即失败（防新源被静默当成非页面提取）。
+ */
+const PAGE_EXTRACTED_SOURCES = {
+  rss: false,
+  hacker_news: false,
+  github: false,
+  arxiv: false,
+  product_hunt: false,
+  show_hn: false,
+  hugging_face_papers: false,
+  blogger: false,
+  sitemap: true,
+} as const satisfies Record<CollectorSource, boolean>;
+
+/**
+ * 由 raw_item 的 source 推导 published_at 的权威等级（见 schema.ts 的列注释）。
+ *
+ * 阶梯只有两级非空，**这是有意的，不要再细分**：
+ * 排的是「这个值离【文章的发布日】有多近」，不是「时间戳的来源有多可信」。任何在「非页面提取」
+ * 这一档内部再排序的方案，都会引入一条**能把日期往后推**的覆盖关系——例如让 rss 的 pubDate
+ * （转载时会是今天）覆盖 LLM 正确推断出的 2023 年发布日 ⇒ 老文又看起来是新的 ⇒ 过时效闸被
+ * 当成今日重大发布推出去。而页面提取读的是文章自己印的日期，结构上不可能让老文看起来新，
+ * 故只有它有资格覆盖；其余一律同档、同档不覆盖 ⇒ 先到者胜出（= 引入本列之前的行为，零回归）。
+ */
+export function derivePublishedAtAuthority(
+  source: CollectorSource,
+  publishedAt: Date | null | undefined,
+): 0 | 1 | 2 {
+  if (publishedAt == null) return 0;
+  // `=== true` 而非 truthy 判定：`toCollectorSource` 会把 DB 里的任意字符串 cast 成 CollectorSource，
+  // 类型系统自此不再兜底。而 `PAGE_EXTRACTED_SOURCES['toString']` 取到的是原型链上的**函数**——
+  // truthy ⇒ 未知源会拿到「页面提取」的覆盖权，恰好在这道守卫要防的那一类上失效。
+  return isPageExtractedSource(source) ? 2 : 1;
+}
+
+/** 该 source 是否为页面确定性提取源。**只认自有属性**（原型链上的 toString/constructor 等不算）。 */
+function isPageExtractedSource(source: string): boolean {
+  return (
+    Object.hasOwn(PAGE_EXTRACTED_SOURCES, source) &&
+    PAGE_EXTRACTED_SOURCES[source as CollectorSource] === true
+  );
+}
+
+/**
+ * DB 读出口的边界收敛：`raw_items.source` 是 `varchar(64)` ⇒ drizzle 给 `string`，而权威推导要
+ * `CollectorSource`。未知值记一行错误日志（防拼写错静默降级），随后按非页面提取档处理（落 1）
+ * ——安全侧，不会凭空获得覆盖权。
+ *
+ * 日志按 source **去重**：一批塌缩里若有 1000 条同一未知源，只应刷一行、不是一千行。
+ */
+const warnedUnknownSources = new Set<string>();
+
+function toCollectorSource(source: string): CollectorSource {
+  if (!Object.hasOwn(PAGE_EXTRACTED_SOURCES, source) && !warnedUnknownSources.has(source)) {
+    warnedUnknownSources.add(source);
+    console.error(
+      `[collapse] 未知的 raw_items.source「${source}」：按「非页面提取」档（authority=1）处理。` +
+        `新增采集源必须在 PAGE_EXTRACTED_SOURCES 显式登记，否则其页面提取日期会被静默降级。`,
+    );
+  }
+  return source as CollectorSource;
 }
 
 /** 单条塌缩结果（供调用方统计/可观测）。 */
@@ -149,17 +229,33 @@ export async function collapseRawItem(
         firstSeenAt: item.fetchedAt,
         lastSeenAt: now,
         publishedAt: item.publishedAt ?? null,
+        publishedAtAuthority: derivePublishedAtAuthority(item.source, item.publishedAt),
         sourceCount: 1,
       })
       .onConflictDoUpdate({
         target: aiNewsEvents.dedupKey,
-        // set 累加 source_count、更新 last_seen_at；published_at 经 COALESCE 单向 NULL-fill
-        // （仅 NULL→已知补值，已设值绝不被覆盖）——绝不覆盖身份/代表/first_seen_at（design D8）。
-        // EXCLUDED.published_at 是 ON CONFLICT 的 proposed-insertion 行列名（snake_case）。
+        // set 累加 source_count、更新 last_seen_at；绝不覆盖身份/代表/first_seen_at（design D8）。
+        //
+        // published_at 按**权威高者胜出**归集：只有页面确定性提取的发布日（authority=2，sitemap
+        // 从文章 HTML 抽取的、文章自己印的日期）有资格覆盖已设值；其余源（authority=1）互不覆盖，
+        // 先到者胜出。HN 总是先到（持续轮询、官宣几分钟内上榜），但它的 published_at 是**投稿时刻**，
+        // 不是发布日——不给它覆盖权，老文被翻上 HN 才不会被改写成「今天发布」。
+        //
+        // 这两行就是全部，没漏 NULL-fill：不变量 published_at IS NULL ⟺ authority = 0 使
+        // NULL-fill 成为「权威高者胜出」的一个特例（已有 NULL ⇒ authority=0 ⇒ 任何非空来者
+        // authority ≥ 1 严格大于 0 ⇒ 自动填入）。同权威不覆盖 ⇒ 非页面提取源之间维持既有的
+        // 先到者胜出、行为零变化。
+        //
+        // EXCLUDED.* 是 ON CONFLICT 的 proposed-insertion 行列名（snake_case）。
         set: {
           sourceCount: sql`${aiNewsEvents.sourceCount} + 1`,
           lastSeenAt: now,
-          publishedAt: sql`COALESCE(${aiNewsEvents.publishedAt}, EXCLUDED.published_at)`,
+          publishedAt: sql`CASE
+            WHEN EXCLUDED.published_at_authority > ${aiNewsEvents.publishedAtAuthority}
+              THEN EXCLUDED.published_at
+            ELSE ${aiNewsEvents.publishedAt}
+          END`,
+          publishedAtAuthority: sql`GREATEST(${aiNewsEvents.publishedAtAuthority}, EXCLUDED.published_at_authority)`,
         },
         // ⚠️ tombstone 改投守卫：命中行 merged_into 非空时不更新（不动 tombstone source_count）。
         setWhere: sql`${aiNewsEvents.mergedInto} IS NULL`,
@@ -168,7 +264,13 @@ export async function collapseRawItem(
 
     // returning 为空 = 命中 tombstone（DO UPDATE 守卫未满足、INSERT 也因冲突未发生）→ 改投存活者。
     if (upserted.length === 0) {
-      await rerouteToSurvivor(tx, dedupKey, now);
+      await rerouteToSurvivor(
+        tx,
+        dedupKey,
+        now,
+        item.publishedAt ?? null,
+        derivePublishedAtAuthority(item.source, item.publishedAt),
+      );
     }
 
     // 塌缩成功后把该 raw_item 置 collapsed=true：source_count 贡献恰好一次（幂等，design D1）。
@@ -198,6 +300,8 @@ async function rerouteToSurvivor(
   tx: TxLike,
   dedupKey: string,
   now: Date,
+  publishedAt: Date | null,
+  publishedAtAuthority: 0 | 1 | 2,
 ): Promise<void> {
   // 沿 merged_into 链迭代到终态存活者；链上每行 FOR UPDATE（与并发合并/改投串行化）+ 环路保护。
   const visited = new Set<string>();
@@ -243,12 +347,23 @@ async function rerouteToSurvivor(
     mergedInto = row.mergedInto;
   }
 
-  // currentId 为终态存活者（merged_into IS NULL）：仅对其 source_count +1（新到 raw_item 的贡献）+ 更新 last_seen。
+  // currentId 为终态存活者（merged_into IS NULL）：对其 source_count +1（新到 raw_item 的贡献）、
+  // 更新 last_seen，并按与 ON CONFLICT 分支【同一口径】归集 published_at（权威高者胜出）。
+  //
+  // 这条改投分支是该 raw_item 的**唯一**写入路径——ON CONFLICT 的 setWhere 因命中 tombstone 而
+  // 不执行。不在这里归集 published_at，一条 sitemap 的页面提取日期（authority=2）就会在其事件
+  // 恰好被语义合并吞掉时静默丢失。
   await tx
     .update(aiNewsEvents)
     .set({
       sourceCount: sql`${aiNewsEvents.sourceCount} + 1`,
       lastSeenAt: now,
+      publishedAt: sql`CASE
+        WHEN ${publishedAtAuthority} > ${aiNewsEvents.publishedAtAuthority}
+          THEN ${publishedAt}
+        ELSE ${aiNewsEvents.publishedAt}
+      END`,
+      publishedAtAuthority: sql`GREATEST(${aiNewsEvents.publishedAtAuthority}, ${publishedAtAuthority})`,
     })
     .where(eq(aiNewsEvents.eventId, currentId));
 }
@@ -314,6 +429,9 @@ export async function collapseUncollapsedRawItems(
   const pending = await dbh
     .select({
       id: rawItems.id,
+      // source 是 published_at 权威等级的唯一推导依据（见 derivePublishedAtAuthority）——漏投影
+      // 这一列，sitemap 的页面提取日期会被当成非页面提取值，永远覆盖不了 HN 的投稿时刻。
+      source: rawItems.source,
       url: rawItems.url,
       title: rawItems.title,
       publishedAt: rawItems.publishedAt,
@@ -333,6 +451,7 @@ export async function collapseUncollapsedRawItems(
 
   const items: RawItemForCollapse[] = pending.map((r) => ({
     id: r.id,
+    source: toCollectorSource(r.source),
     url: r.url,
     title: r.title,
     publishedAt: r.publishedAt,

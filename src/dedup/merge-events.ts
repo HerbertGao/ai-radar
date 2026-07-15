@@ -205,9 +205,19 @@ export async function mergeEvents(
         sourceCount: sql`COALESCE(${aiNewsEvents.sourceCount}, 0) + COALESCE((
           select ${aiNewsEvents.sourceCount} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId}
         ), 0)`,
-        publishedAt: sql`COALESCE(${aiNewsEvents.publishedAt}, (
-          select ${aiNewsEvents.publishedAt} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId}
-        ))`,
+        // published_at 按**权威高者胜出**归集（与硬去重塌缩同一口径，见 collapse.ts 的 ON CONFLICT）。
+        // 不变量 published_at IS NULL ⟺ authority = 0 使 NULL-fill 成为该口径的一个特例；
+        // 同权威不覆盖 ⇒ 近似源之间行为零变化。被吞者若持有更权威的日期（如 sitemap 的页面提取值），
+        // 存活者必须继承它——否则一次语义合并就把全系统唯一的真发布日丢掉了。
+        publishedAt: sql`CASE
+          WHEN (select ${aiNewsEvents.publishedAtAuthority} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId})
+               > ${aiNewsEvents.publishedAtAuthority}
+            THEN (select ${aiNewsEvents.publishedAt} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId})
+          ELSE ${aiNewsEvents.publishedAt}
+        END`,
+        publishedAtAuthority: sql`GREATEST(${aiNewsEvents.publishedAtAuthority}, COALESCE((
+          select ${aiNewsEvents.publishedAtAuthority} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId}
+        ), 0))`,
         firstSeenAt: sql`LEAST(${aiNewsEvents.firstSeenAt}, (
           select ${aiNewsEvents.firstSeenAt} from ${aiNewsEvents} where ${aiNewsEvents.eventId} = ${absorbed.eventId}
         ))`,

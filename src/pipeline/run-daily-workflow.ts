@@ -35,7 +35,10 @@ import {
   type CollectAllOptions,
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
+import { ArxivRateLimitError } from '../collectors/arxiv.js';
+import { ProductHuntRateLimitError } from '../collectors/product-hunt.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
+import { buildOpsAlertSink, consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
 import {
   semanticMergeEvents,
   type SemanticMergeOptions,
@@ -131,10 +134,26 @@ const DEFAULT_DIGEST_LOCK_TTL_MS = 30 * 60 * 1000;
  * 告警 sink：把「系统级故障」与「降级率熔断」以可观测方式上报。
  * 默认 console.error（非静默）。生产可注入 Telegram/PagerDuty 等。
  */
-export type AlertSink = (message: string, detail?: unknown) => void;
+// AlertSink / AlertDetail 的权威定义在 ops-alert-sink（detail.dedupKey 必填，是当日限频键）。
+// 此处 re-export 保持既有 import 路径可用。
+export { type AlertDetail, type AlertSink } from './ops-alert-sink.js';
 
-const defaultAlert: AlertSink = (message, detail) =>
-  console.error(`[pipeline][ALERT] ${message}`, detail ?? '');
+// 未注入真 sink 时回落 stderr。生产装配路径（run()）注入 buildOpsAlertSink()。
+const defaultAlert: AlertSink = consoleAlertSink;
+
+/**
+ * 该源失败是否为「良性限流退避」——429 退避达上限、本轮放弃。arxiv/Product Hunt 把它设计为隔离、
+ * 不告警的正常背压事件（周期性发生）。源级健康告警据此豁免，只对【异常】失败告警（sitemap 静默死亡
+ * 那类）；真正的源死亡（连续多日零新增）由 source-staleness 兜底。cause 链也查（withRetry 可能包一层）。
+ */
+function isBenignRateLimit(error: unknown): boolean {
+  let e: unknown = error;
+  for (let depth = 0; e instanceof Error && depth < 5; depth += 1) {
+    if (e instanceof ArxivRateLimitError || e instanceof ProductHuntRateLimitError) return true;
+    e = e.cause;
+  }
+  return false;
+}
 
 /** 工作流被熔断中止时抛出的信号（编排层据此让 BullMQ job 失败/重试）。 */
 export class WorkflowAbortError extends Error {
@@ -496,12 +515,68 @@ export async function runDailyWorkflow(
     let alerted = false;
     if (sysFailure.alert) {
       console.error(`[pipeline] 告警: 系统级故障 kind=${sysFailure.kind}`);
-      alert(`系统级故障：${sysFailure.reason}`, {
+      await alert(`系统级故障：${sysFailure.reason}`, {
+        // 按 kind 分键：no-collection 与 all-unprocessable 是两种故障，同日各响一次。
+        dedupKey: `system-failure:${sysFailure.kind}`,
         kind: sysFailure.kind,
         collectedCount,
         newsProcessableCount,
       });
       alerted = true;
+    }
+
+    // ── 源级健康告警（fix-sitemap-published-at）：对本轮**异常**失败的每一个源各发一条告警。
+    //    `perSource` 由 registry 产出、此前**无任何消费者**（源失败只落 logError）——这是「throw →
+    //    perSource.ok=false → 计入告警」这条链路的落地点（含 sitemap 的 loc_count=0 与「窗内有候选零发射」两种 throw）。
+    //    dedupKey='source-health:<source>' **per-source**（多源同时坏不塌成一条）+ push_records 唯一键
+    //    ⇒ 同源当天至多一响。**仅日报链**（本段本就只在日报链跑）。
+    //
+    //    **豁免良性限流退避**：arxiv/Product Hunt 把「429 退避达上限、本轮放弃」设计为良性、隔离、
+    //    不告警的事件（见 arxiv.ts / product-hunt.ts）。spec 的「每一个源」意在捕获**异常**静默死亡
+    //    （sitemap 改版归零那类），而非把周期性限流背压当故障——否则每天一条良性告警会训练运维忽略告警。
+    //    真正的源死亡（连续多日零新增）由既有的 source-staleness 告警兜底，不依赖本条。
+    for (const [source, ps] of Object.entries(collected.perSource)) {
+      if (ps && ps.ok === false && !isBenignRateLimit(ps.error)) {
+        console.error(`[pipeline] 告警: 采集源失败 source=${source}`);
+        await alert(`采集源失败：${source}`, {
+          dedupKey: `source-health:${source}`,
+          source,
+          error: ps.error, // sink 沿 cause 链摘要真正的故障原因。
+        });
+      }
+    }
+
+    // ── 改版静默死亡形态①（文章页还在、但日期没了：h1 数变了 / 日期格式变了）：判据 MUST 为**日报链
+    //    对 DB 的复算**，MUST NOT 读本轮采集结果——sitemap 若进高频链，高频链会先采走新文并入库 ⇒ 日报链
+    //    本轮 emitted 恒 0 ⇒ 读本轮结果的谓词永不触发；raw_items 是两条链共同的事实源，DB 复算与「谁采的」无关。
+    //    `emitted > 0 且 date_extracted = 0` → 一次**独立**的 alert（MUST NOT 塞进 classifySystemFailure——
+    //    后者入参是「本轮采集统计」，用它就把判据绑回「谁采的」）。**emitted=0 时 MUST NOT 告警**：彼时
+    //    「提取率跌零」与「今天没新文」不可区分，会天天误报。今日 00:00 按 PUSH_TIMEZONE。
+    const sitemapDayStart = startOfDayInTimeZone(now, 0);
+    const [sitemapDateStats] = await dbh
+      .select({
+        emitted: sql<number>`count(*)::int`,
+        dateExtracted: sql<number>`count(*) FILTER (WHERE ${rawItems.publishedAt} IS NOT NULL)::int`,
+      })
+      .from(rawItems)
+      .where(
+        and(eq(rawItems.source, 'sitemap'), gte(rawItems.fetchedAt, sitemapDayStart)),
+      );
+    const sitemapEmitted = sitemapDateStats?.emitted ?? 0;
+    const sitemapDateExtracted = sitemapDateStats?.dateExtracted ?? 0;
+    if (sitemapEmitted > 0 && sitemapDateExtracted === 0) {
+      console.error(
+        `[pipeline] 告警: sitemap 页面日期提取归零（emitted=${sitemapEmitted}, date_extracted=0）`,
+      );
+      await alert(
+        `sitemap 页面日期提取归零：当日入库 ${sitemapEmitted} 条 sitemap raw_item 但 published_at 全为 NULL` +
+          `（站点改版致唯一 h1 消失 / 日期格式变化？提取失败永久不可恢复，须人工核对）`,
+        {
+          dedupKey: 'sitemap-date-extraction-zero',
+          emitted: sitemapEmitted,
+          dateExtracted: sitemapDateExtracted,
+        },
+      );
     }
 
     // ── 阶段 2.4（best-effort、可观测）：按源陈旧度检测（add-per-source-staleness-alert，design D1/D4）。
@@ -528,9 +603,10 @@ export async function runDailyWorkflow(
         console.error(
           `[pipeline] 告警: 检测到 ${staleSources.length} 个陈旧源（长期零新增）`,
         );
-        alert(
+        // 单键：本判定每天只跑一次（日报链内），一条消息已列出全部陈旧源，无需按源分键。
+        await alert(
           `按源陈旧度告警：${staleSources.length} 个源长期零新增\n${lines}`,
-          { staleSources },
+          { dedupKey: 'source-staleness', staleSources },
         );
       } else {
         console.error('[pipeline] 陈旧度: 全部待监控源新鲜，无陈旧告警');
@@ -638,9 +714,10 @@ export async function runDailyWorkflow(
       console.error(
         `[pipeline] 熔断: Value Judge 降级率超阈值，中止流水线`,
       );
-      alert(
+      // 必须 await：紧接着 throw，不等则告警是个游离 Promise、job 已失败、投递零完成保证。
+      await alert(
         `Value Judge 阶段降级率 ${(rate * 100).toFixed(1)}% 超阈值（${(abortRatio * 100).toFixed(0)}%），中止本次流水线。`,
-        judgeStage,
+        { dedupKey: 'degrade-abort:value-judge', ...judgeStage },
       );
       throw new WorkflowAbortError('value-judge', rate);
     }
@@ -780,9 +857,10 @@ export async function runDailyWorkflow(
     if (stageShouldAbort(digestStage, abortRatio)) {
       const rate = stageDegradeRate(digestStage)!;
       console.error(`[pipeline] 熔断: 中文摘要降级率超阈值，中止流水线`);
-      alert(
+      // 必须 await：理由同上（紧接着 throw）。
+      await alert(
         `中文摘要阶段降级率 ${(rate * 100).toFixed(1)}% 超阈值（${(abortRatio * 100).toFixed(0)}%），中止本次流水线。`,
-        digestStage,
+        { dedupKey: 'degrade-abort:digest', ...digestStage },
       );
       throw new WorkflowAbortError('digest', rate);
     }
@@ -977,7 +1055,9 @@ export async function runDailyWorkflow(
       console.error(
         `[pipeline] 租约已失（锁被抢占/过期），中止本次以触发重试，避免静默漏发`,
       );
-      alert(`日报推送前租约已失（锁被抢占/过期），中止本次并触发重试。`, {
+      // 必须 await：理由同上（紧接着 throw）。
+      await alert(`日报推送前租约已失（锁被抢占/过期），中止本次并触发重试。`, {
+        dedupKey: 'digest-lease-lost',
         pushDate,
         topNCount: topN.length,
       });
@@ -1125,6 +1205,13 @@ export async function run(
   try {
     return await core({
       emit: ctx.emit,
+      // 生产装配的运维告警出口（这里是真正的注入点——worker.ts 调的是 run(ctx)，自身不拼 options）。
+      // 不注入则回落 consoleAlertSink：告警只进 stderr、没人会被叫醒。
+      // 真实 sender 惰性构造（首次真告警时才装配），故本行在桩核心单测里不触发任何真实发送器构造。
+      //
+      // `now` 必须与工作流同源：sink 用它算 push_date（告警的当日限频键）。不转发的话，注入 now 的
+      // 运行（回补 / 演练）里工作流按注入日算 push_date、而告警行落到真实今天——两个口径分裂。
+      alert: buildOpsAlertSink(undefined, input.now ? () => input.now! : undefined),
       ...(input.now ? { now: input.now } : {}),
     });
   } catch (err) {

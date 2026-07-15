@@ -24,6 +24,7 @@ import {
   bigint,
   bigserial,
   boolean,
+  check,
   customType,
   date,
   index,
@@ -31,6 +32,7 @@ import {
   jsonb,
   numeric,
   pgTable,
+  smallint,
   text,
   timestamp,
   unique,
@@ -145,6 +147,22 @@ export const aiNewsEvents = pgTable('ai_news_events', {
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
   // 代表 raw_item 的发布时间，供 Top N 排序 tiebreaker（published_at DESC NULLS LAST）。
   publishedAt: timestamp('published_at', { withTimezone: true }),
+  // published_at 的权威等级。塌缩与语义合并按「权威高者胜出」归集：
+  //   0 = 无日期（不变量：published_at IS NULL ⟺ authority = 0，由下方 CHECK 兜底）
+  //   1 = 一切**不是页面确定性提取**的日期值：rss 的 pubDate、hacker_news / show_hn 的投稿时刻、
+  //       github 的 push 时刻、published-at-inference 的 AI 推断。**互不覆盖，先到者胜出。**
+  //   2 = 页面确定性提取的发布日（sitemap 从文章 HTML 抽取的、文章自己印的日期）。覆盖一切。
+  //
+  // 这个阶梯排的是「**这个值离【文章的发布日】有多近**」，**不是**「时间戳的来源有多可信」。
+  // 逐字登记两个反直觉事实：HN 的投稿时刻是**真实**时间戳，但它测的是**错误的事件**（谁在何时
+  // 把链接贴上了 HN）；LLM 的推断是**猜的**，但它猜的是**正确的事件**（文章何时发布）。对错误
+  // 事物的精确测量，比对正确事物的粗略估计更坏——故二者同档，谁都不许覆盖谁。
+  //
+  // 为何只有两级非空、而不在第 1 档内部再排序（**不要「优化」回去**）：任何档内排序都会引入一条
+  // 能把日期**往后推**的覆盖关系（如让 rss 转载时的今日 pubDate 覆盖 LLM 正确推断的 2023 年发布日）
+  // ⇒ 老文看起来是新的 ⇒ 过时效闸被当成今日重大发布推出去。而页面提取读的是文章自己印的日期，
+  // 结构上不可能让老文看起来新——故只有它有资格覆盖。
+  publishedAtAuthority: smallint('published_at_authority').notNull().default(0),
   sourceCount: integer('source_count').default(1),
   importanceScore: numeric('importance_score', { precision: 5, scale: 2 }),
   noveltyScore: numeric('novelty_score', { precision: 5, scale: 2 }),
@@ -176,6 +194,13 @@ export const aiNewsEvents = pgTable('ai_news_events', {
 }, (table) => [
   // 硬去重塌缩的 ON CONFLICT 冲突目标（design D1/D3）。
   unique('ai_news_events_dedup_key_key').on(table.dedupKey),
+  // published_at 与其权威等级必须同生同灭：任何只写 published_at 而不写 authority 的
+  // 写路径（塌缩 INSERT / ON CONFLICT / 语义合并 / AI 回填 CAS / 测试 seed）会在此当场违约。
+  // 这正是要的效果——authority 若被默默留在 0，「权威高者胜出」的归集会静默退化成先到者胜出。
+  check(
+    'ai_news_events_published_at_authority_check',
+    sql`(${table.publishedAt} IS NULL) = (${table.publishedAtAuthority} = 0)`,
+  ),
 ]);
 
 /**

@@ -56,7 +56,7 @@ async function seedEvent(prefix: string): Promise<{ eventId: string; dedupKey: s
   );
   const id = BigInt(rows[0]!.id);
   const out = await collapseRawItem(
-    { id, url, title: 'Claimable event', publishedAt: null, fetchedAt: new Date() },
+    { id, source: 'rss', url, title: 'Claimable event', publishedAt: null, fetchedAt: new Date() },
     db!,
   );
   // 取回 event_id（用于 claim 单测直接调）。

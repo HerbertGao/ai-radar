@@ -23,6 +23,13 @@ export default tseslint.config(
     },
   },
   {
+    // 仓库维护脚本（`scripts/*.mjs`）跑在 Node 上、不经 tsconfig，故显式声明其全局量。
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly' },
+    },
+  },
+  {
     // Model Radar（5b + add-model-radar-price-state-and-periods）结构守卫：把「抓取/保鲜改不了事实」从人的纪律降为 lint 错误。
     // `src/mr/scrape/`（三档抓取）与 `src/mr/freshness/`（保鲜回路）只允许 import `src/mr/write/`
     // （flag / fingerprint / last_checked 更新器）——**禁 import `src/mr/ingest/`** 的事实 writer

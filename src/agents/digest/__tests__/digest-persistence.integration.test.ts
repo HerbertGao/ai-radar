@@ -64,11 +64,12 @@ async function seedScoredEvent(args: {
     published_at: Date | null;
     importance_score: string | null;
   }>(
+    // published_at 与 published_at_authority 同写（CHECK）；非空日期记 1（「非页面确定性提取」档，与 rss/HN/AI 回填同级）。
     `INSERT INTO ai_news_events
        (dedup_key, representative_raw_item_id, representative_title,
-        first_seen_at, last_seen_at, published_at, source_count,
+        first_seen_at, last_seen_at, published_at, published_at_authority, source_count,
         importance_score, novelty_score, developer_relevance_score, hype_risk_score, should_push)
-     VALUES ($1, $2, $3, now(), now(), '2026-06-01T00:00:00Z', 1, 82, 75, 90, 35, true)
+     VALUES ($1, $2, $3, now(), now(), '2026-06-01T00:00:00Z', 1, 1, 82, 75, 90, 35, true)
      RETURNING event_id, representative_raw_item_id, representative_title,
                first_seen_at, published_at, importance_score`,
     [args.dedupKey, args.representativeRawItemId.toString(), args.representativeTitle],
