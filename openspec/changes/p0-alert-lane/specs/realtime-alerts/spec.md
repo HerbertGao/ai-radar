@@ -34,7 +34,7 @@ AND (
 
 **③ 支路 A** 语义不变：默认阈值 `importance_score >= 85`（严于日报候选 `should_push` 的 `importance >= 75` 与 Top N 下限闸 `>= 60`——实时门槛应更高以防告警刷屏），阈值经环境配置可调。**实测稳态量级 ≈ 3.67 条/天**（`is_ai_related` 列全天生效后的三个干净日：07-11 = **4** / 07-12 = **4** / 07-13 = **3**；**样本 n=3，MUST 标注**）；不带 AI 闸的 30 天窗为 **3.83 条/天**。**日间波动窄**：干净日极差 **[3, 4]**，约 **1.3×** ⇒ 以量级为准的回滚判据（≈ **26 条 / 7 天**）**有功效**，能区分信号与噪音。**此前登记的「日方差 3.5 倍」是错的，MUST NOT 再被引用**：它来自 **07-10**——而 07-10 是**回填日**、**已被排除出稳态均值**。**一天不能既被剔出均值、又用来算方差**（那是拿一个被判定为「不属于该分布」的点去度量该分布的离散度）。
 
-**④ 支路 B（新增）**：事件的 `representative_title` 命中**精确事实变更词表**（价格 / 额度 / 限流 / 弃用；词表核心与 conversational-rag「价格/选型确定性前置闸」共享，其三组常量的穷举表在该能力，是唯一 SOT）即取得告警资格，**不论其 `importance_score` 高低**。动因：厂商的额度 / 限流 / 定价 / 弃用变更直接决定开发者当日的用法与成本决策，但其 `importance_score` 天然低于重大发布阈值（非模型发布、非融资），单靠支路 A 对该类事件**结构性失明**。**实测量级 ≤ 1 条 / 30 天**（离线回放的成立上界）。
+**④ 支路 B（新增）**：事件的 `representative_title` 命中**精确事实变更词表**（价格 / 额度 / 限流 / 弃用；词表核心与 conversational-rag「价格/选型确定性前置闸」共享，其词表常量（四组 + 共现）的穷举表在该能力，是唯一 SOT）即取得告警资格，**不论其 `importance_score` 高低**。动因：厂商的额度 / 限流 / 定价 / 弃用变更直接决定开发者当日的用法与成本决策，但其 `importance_score` 天然低于重大发布阈值（非模型发布、非融资），单靠支路 A 对该类事件**结构性失明**。**实测量级 ≤ 1 条 / 30 天**（离线回放的成立上界）。
 
 **④ 支路 B MUST NOT 附加 `should_push = true`（绝不可省的反向要求）**：`should_push` 是 Value Judge 的语义布尔——而**支路 B 存在的全部意义，正是推翻 Judge 对该类事件的低估**。生产实测：30 天生产语料内唯一一条经支路 B 命中的事件（「GPT-5.6 一发布，Claude 终于舍得重置 Fable 5 额度了」，`importance=30`、`is_ai_related=true`）其 **`should_push = false`**。若把 `should_push = true` 纳入支路 B，该支路将**恒为空**——等于把它要绕过的那个 LLM 否决权原样请回来。**支路 B 是一条有意的「LLM 否决覆盖」通道**，这是它的设计语义，MUST 被显式承认而非掩饰。
 
@@ -50,7 +50,7 @@ AND (
 
 **④ 是纯 `representative_title` 谓词，本期不附加 source 谓词**：`ai_news_events` 的 source 全集当前即 `{rss, hacker_news, github, sitemap}`，与 `REALTIME_NEWS_SOURCES` 相等（arXiv / hf_papers / product_hunt / show_hn / blogger 的 `raw_type` 经 dedup-and-normalization 的塌缩候选谓词排除、永不成为事件，该塌缩不变量已有测试守护）。在该等式下源子集谓词**筛掉 0 行**，为它写闸属重复建坝，故**本期不加**。
 
-> **但这条等式是两处手工维护的字面量、不是结构性保证（登记，防它被当成禁令）**。**该前向守卫的触发谓词 MUST 按事件塌缩的【实际闸】写**——塌缩候选闸是**黑名单**（`src/dedup/collapse.ts:327-329`：`raw_type IS DISTINCT FROM 'product' / 'paper' / 'experience'`），且 `raw_items.raw_type` **可空**（`src/db/schema.ts:83`，无 `.notNull()`；`IS DISTINCT FROM` 正是为**有意放行 NULL** 而选）。故：
+> **但这条等式是两处手工维护的字面量、不是结构性保证（登记，防它被当成禁令）**。**该前向守卫的触发谓词 MUST 按事件塌缩的【实际闸】写**——塌缩候选闸是**黑名单**（`src/dedup/collapse.ts:445-447`：`raw_type IS DISTINCT FROM 'product' / 'paper' / 'experience'`），且 `raw_items.raw_type` **可空**（`src/db/schema.ts:85`，无 `.notNull()`；`IS DISTINCT FROM` 正是为**有意放行 NULL** 而选）。故：
 >
 > **任何人新增一个源，其产出的 `raw_type` 不在排除集 `{product, paper, experience}` 内（含 `raw_type` 为 NULL / 未设置），却不把该源加进 `REALTIME_NEWS_SOURCES`**，其条目就会进 `ai_news_events`、**直接取得支路 B 的 P0 资格**（支路 B **无 importance 地板、无 source 谓词**）——一条从未为 P0 审过的源，一命中就是一次手机震动。
 >
@@ -63,7 +63,7 @@ AND (
 - `published_at` 时效窗口：下界 `>= lowerBound`、未来上界 `<= now`、`published_at IS NOT NULL` 排除；`ALERT_FIRST_SEEN_WINDOW_DAYS=0` 旁路只免下界 gte，**不免** NULL 排除与未来上界；
 - **tombstone 排除 `merged_into IS NULL`**；
 - **首次启用发布时间基线水位 `published_at >= ALERT_MIN_PUBLISHED_AT`**；
-- Model B「一生一次」channel-agnostic 去重（尚未 alert-success 投递给所有已配置通道）；
+- Model B「一生一次」channel-agnostic 去重（**本能力既有的去重模型**，语义 = 尚未 alert-success 投递给所有已配置通道）；
 - 单轮上限 `ALERT_MAX_PER_SCAN`；
 - 与日报链并发评分的原子 claim；
 - **`is_ai_related = true`**（两支路共用前提，见上）。
@@ -121,46 +121,50 @@ AND ( importance_score >= ALERT_IMPORTANCE_THRESHOLD
 
 **故告警侧的判分 MUST 有界（本需求修改点，绝不可省）**：
 
-- 告警链调用 Value Judge 判分时 MUST 施加**每轮工作预算**——候选 SELECT 加 **确定性取序 + `LIMIT N`**。当前实现无界：候选 SELECT **既无 `ORDER BY` 也无 `LIMIT`**（`src/agents/value-judge/score-events.ts:179-196`），告警链每轮直接全量送判（`src/pipeline/alert-scan.ts:350`）。
-- **该预算 MUST 只对告警链生效：其默认值 MUST 为「无界」（`undefined` / 不加 `LIMIT`），MUST NOT 为那个模块常量 N（绝不可省——写反这一条，本条的目的与它下面「不饥饿」的论证会【一起】被打掉）**：预算是**调用方显式传入**的选项，日报链**不传** ⇒ 其判分**保持全量无界**。若把 N 写成模块常量的**缺省值**（`const limit = options.maxPerRun ?? N`），日报链会**一并被截到 N 条/天**（N ≤ 4）⇒ ① 日报要闻段瞬间枯竭；② 下面「告警链不饥饿」的**唯一依据**（「老的未评分事件由**无界的日报链**在 ≤24h 内排空」）**当场坍塌** ⇒ 老事件永久积压、永不评分。**该失效对测试完全不可见**：单测与集成测的 fixture 事件数通常 ≤ 4，两条链的行为逐字相同 ⇒ **全绿**。故 MUST 有一条**回归钉**：日报链对 **> N** 条未评分事件（如 6 条）跑判分 → 断言**全部**被判（不截断）。
+- 告警链调用 Value Judge 判分时 MUST 施加**每轮工作预算**——候选 SELECT 加 **确定性取序 + `LIMIT N+1`（只处理前 N 条）**。当前实现无界：候选 SELECT **既无 `ORDER BY` 也无 `LIMIT`**（`src/agents/value-judge/score-events.ts:242-266`，工作集谓词在 `:266`；全文仅 `:363` 有一个与候选集无关的 0 行回读 `.limit(1)`），告警链每轮直接全量送判（`src/pipeline/alert-scan.ts:350`）。
+- **该预算 MUST 只对告警链生效：其默认值 MUST 为「无界」（`undefined` / 不加 `LIMIT`），MUST NOT 为那个模块常量 N（绝不可省——写反这一条，本条的目的与它下面「不饥饿」的论证会【一起】被打掉）**：预算是**调用方显式传入**的选项，日报链**不传** ⇒ 其判分**保持全量无界**。若把 N 写成模块常量的**缺省值**（`const limit = options.maxPerRun ?? N`），日报链会**一并被截到 N 条/天**（N ≤ 3）⇒ ① 日报要闻段瞬间枯竭；② 下面「告警链不饥饿」的**唯一依据**（「老的未评分事件由**无界的日报链**在 ≤24h 内排空」）**当场坍塌** ⇒ 老事件永久积压、永不评分。**该失效对测试完全不可见**：条数 ≤ N 的单测与集成测 fixture 在两条链上行为逐字相同 ⇒ **全绿**。故 MUST 有一条**回归钉**：日报链对 **> N** 条未评分事件（如 6 条）跑判分 → 断言**全部**被判（不截断）。
 - **取序 MUST 定死为（绝不可只写 `LIMIT`）**：
 
   ```sql
-  ORDER BY first_seen_at DESC NULLS LAST, event_id DESC   LIMIT N
+  ORDER BY first_seen_at DESC NULLS LAST, event_id DESC   LIMIT N + 1
   --                          ^^^^^^^^^^  ^^^^^^^^^^^^ 二者【均必需】
   ```
 
   `event_id` 这一项 MUST 有：`first_seen_at` 同值（同一轮采集入库的事件常见同秒）时，只按它排序仍是**部分序**，PG 可返回任意一批。而**加 `LIMIT` 却不加 `ORDER BY` 更糟**——PG 返回**任意** N 行，「哪 N 条被判」每轮随物理扫描序漂移。
 
-  **`NULLS LAST` 同样 MUST 有（它防的正是本条花整段论证要防的那个永久饥饿）**：`ai_news_events.first_seen_at` **可空**（`src/db/schema.ts:144` 无 `.notNull()`），而 PG 的 `ORDER BY x DESC` 默认是 **`NULLS FIRST`**（实测：`(1, NULL, 3)` 上 `ORDER BY x DESC LIMIT 1` 返回 **NULL**）。⇒ 只要有**一行** `first_seen_at IS NULL`，它就**恒排第一**、每轮吃掉 N 个名额中的一个、且**永不老化出局**（判分工作集无任何时间剪枝）——与上面「毒事件每轮吃满预算」是**同一个失效**，只是成因从「物理扫描序」换成「NULL 排序默认值」。仓内他处均已显式写 `DESC NULLS LAST`（如 `src/pipeline/experience-chain.ts:534`）。
+  **`NULLS LAST` 同样 MUST 有（它防的正是本条花整段论证要防的那个永久饥饿）**：`ai_news_events.first_seen_at` **可空**（`src/db/schema.ts:146` 无 `.notNull()`），而 PG 的 `ORDER BY x DESC` 默认是 **`NULLS FIRST`**（实测：`(1, NULL, 3)` 上 `ORDER BY x DESC LIMIT 1` 返回 **NULL**）。⇒ 只要有**一行** `first_seen_at IS NULL`，它就**恒排第一**、每轮吃掉 N 个名额中的一个、且**永不老化出局**（判分工作集无任何时间剪枝）——与上面「毒事件每轮吃满预算」是**同一个失效**，只是成因从「物理扫描序」换成「NULL 排序默认值」。仓内他处均已显式写 `DESC NULLS LAST`（如 `src/pipeline/experience-chain.ts:534`）。
   **该地雷今日处于休眠态，MUST 如实登记**：生产实测 `first_seen_at IS NULL` 的事件 = **0 / 3698** ⇒ 它今天不是活 bug。**修它的理由不是它正在爆，而是它的失效【是静默的】**——第一行 NULL 出现的那天，没有任何测试、日志或告警会变红。
-- **「不加 `LIMIT`、循环内数到 N 就 break」这个所谓的等效变体 MUST NOT 被采用（它不等效，且能永久丢事件）**：不加 `LIMIT` 时 SELECT 是**全量无序**返回、break 前 N 条。**物理扫描序在轮与轮之间是稳定的** ⇒ 排在扫描序头部的 N 条**毒事件**（判分恒失败 → `releaseJudgeClaim` → `importance_score` 仍 NULL → 留在工作集 → 下一轮**又排在同一位置**）**每轮吃满整个预算**，其后**所有健康事件永久饿死**。而判分工作集**无任何时间剪枝**（谓词只有 `importance_score IS NULL AND merged_into IS NULL`），毒事件**永不老化出局**。⇒ 契约声称「绝不丢事件」，而该变体**能永久丢事件**。**MUST 落在候选 SELECT 的 `ORDER BY … LIMIT N` 上。**
+- **「不加 `LIMIT`、循环内数到 N 就 break」这个所谓的等效变体 MUST NOT 被采用（它不等效，且能永久丢事件）**：不加 `LIMIT` 时 SELECT 是**全量无序**返回、break 前 N 条。**物理扫描序在轮与轮之间是稳定的** ⇒ 排在扫描序头部的 N 条**毒事件**（判分恒失败 → `releaseJudgeClaim` → `importance_score` 仍 NULL → 留在工作集 → 下一轮**又排在同一位置**）**每轮吃满整个预算**，其后**所有健康事件永久饿死**。而判分工作集**无任何时间剪枝**（谓词只有 `importance_score IS NULL AND merged_into IS NULL`），毒事件**永不老化出局**。⇒ 契约声称「绝不丢事件」，而该变体**能永久丢事件**。**MUST 落在候选 SELECT 的 `ORDER BY … LIMIT N+1`（只处理前 N 条）上。**
 - **N MUST 有值，且 MUST 满足下式（只写「N 是模块常量、MUST 有界」不构成约束）**：
 
   ```
-  N × (F + A × L)  <  ALERT_SCAN_CRON 的周期
+  N × (F + A × L + W)  <  ALERT_SCAN_CRON 的周期
   F = COLLECTOR_FETCH_TIMEOUT_MS = 15s（env）
   A = JUDGE_MAX_ATTEMPTS = 3（unify-judge-stage 把判分模块的 DEFAULT_MAX_ATTEMPTS 提为 config 侧的
       【导出常量】后的那一个——它【不是 env 变量】，MUST NOT 被表述成 env）
   L = LLM_TIMEOUT_MS = 60s（env）
-  ⇒ 每条最坏 195s ⇒ 15 分钟一轮的 cron ⇒ 【N ≤ 4】
+  W = JUDGE_WRITE_BUDGET_MS = 60s（env——与 unify-judge-stage 落地的 T > F+A×L+W 回收阈值同一口径）
+  ⇒ 每条最坏 255s（末次尝试成功 + 写分）⇒ 15 分钟一轮的 cron ⇒ 【N ≤ 3】
   ```
 
-  **反例 MUST 一并读到**：取 `N = 20`（与 `PUBLISHED_AT_INFERENCE_MAX_PER_RUN` 同量级的「自然」选择）⇒ 单轮最坏 `20 × 195s = 65 分钟` = cron 周期的 **4 倍** ⇒ 因 `concurrency: 1`（`src/pipeline/alert-queue.ts:116`）**队列只会越积越长** ⇒ **车道仍然不可用**，只是从「死大半天」变成「每轮 1 小时且持续落后」。**一个不满足上式的 N 兑现不了本条的目的。**
+  **反例 MUST 一并读到**：取 `N = 20`（与 `PUBLISHED_AT_INFERENCE_MAX_PER_RUN` 同量级的「自然」选择）⇒ 单轮最坏 `20 × 255s ≈ 85 分钟` = cron 周期的**近 6 倍** ⇒ 因 `concurrency: 1`（`src/pipeline/alert-queue.ts:116`）**队列只会越积越长** ⇒ **车道仍然不可用**，只是从「死大半天」变成「每轮 1 小时余且持续落后」。**一个不满足上式的 N 兑现不了本条的目的。**
+  **口径区分（MUST 一并读到）**：预算口径的每条最坏 = `F + A×L + W`（末次尝试成功仍要写分）；而「重渲染风暴 11.5h」的每条 = `F + A×L = 195s`（LLM 全挂 = 全部尝试失败 ⇒ **无写分**）——两个口径各自正确，MUST NOT 互相替换。
 
-- **该不等式 MUST 由启动期跨字段校验（`superRefine`）强制，MUST NOT 只写在文档里（绝不可省）**：上式四项里**有三项是 env**（`COLLECTOR_FETCH_TIMEOUT_MS` / `LLM_TIMEOUT_MS` / `ALERT_SCAN_CRON` 的周期），只有 `A` 是导出常量。⇒ 把 N 写成一个硬编码的 `4`、把约束留在散文里，则**生产上调高 `LLM_TIMEOUT_MS`（或把 cron 周期改短）时约束静默失效** ⇒ 单轮又超 cron 周期 ⇒ `concurrency: 1` 下队列积压 ⇒ **P0 车道回到不可用**，而没有任何东西会变红。
+- **该不等式 MUST 由启动期跨字段校验（`superRefine`）强制，MUST NOT 只写在文档里（绝不可省）**：上式五项里**有四项是 env**（`COLLECTOR_FETCH_TIMEOUT_MS` / `LLM_TIMEOUT_MS` / `JUDGE_WRITE_BUDGET_MS` / `ALERT_SCAN_CRON` 的周期），只有 `A` 是导出常量。⇒ 把 N 写成一个硬编码的 `3`、把约束留在散文里，则**生产上调高 `LLM_TIMEOUT_MS`（或把 cron 周期改短）时约束静默失效** ⇒ 单轮又超 cron 周期 ⇒ `concurrency: 1` 下队列积压 ⇒ **P0 车道回到不可用**，而没有任何东西会变红。
 
-  **同一份变更对 `T > F + A×L + W`（claim 回收阈值）已要求「MUST 由启动期跨字段校验强制、**禁止**只写在文档里」**（见 daily-intel-pipeline 的「降级逐条容错」）——**对 N 不能是另一套标准**。故：N 的上式 MUST 同样落进 `env.ts` 的 `superRefine`（N 由 env 派生、或以常量 N 参与校验，两种形态择一并显式落地），不满足即**启动 fail-fast**；**错误消息 MUST 报出四项的当前值**（`N` / `F` / `A×L` / cron 周期），否则运维看到一条不可行动的报错。
+  **同一份变更对 `T > F + A×L + W`（claim 回收阈值）已要求「MUST 由启动期跨字段校验强制、**禁止**只写在文档里」**（见 daily-intel-pipeline 的「降级逐条容错」）——**对 N 不能是另一套标准**。故：N 的上式 MUST 同样落进 `env.ts` 的 `superRefine`（N 由 env 派生、或以常量 N 参与校验，两种形态择一并显式落地），不满足即**启动 fail-fast**；**错误消息 MUST 报出五项的当前值**（`N` / `F` / `A×L` / `W` / cron 周期），否则运维看到一条不可行动的报错。**该 superRefine MUST 以 `ALERT_SCAN_ENABLED === 'true'` 为合取门**（与既有「启用告警而未显式给出基线 SHALL 快速失败」同门控）：N 约束只对告警链有意义，纯日报部署（车道关）不得因 alert cron × LLM 超时组合被拒启动。（既有 `T > F+A×L+W` superRefine 不门控，因 claim 不变量对两条链都成立——本条不是。）
 - **「不饥饿」MUST 被论证，不能默认（`DESC` 取序表面上会饿死老的未评分事件）**：告警链按 `first_seen_at DESC` 取 N 条 ⇒ 老的未评分事件在**告警链**里可能长期取不到。这**不是**饥饿，理由有两条、缺一不可：
   1. 老的未评分事件**过不了告警闸的时效地板**（`src/pipeline/alert-scan.ts:249` 的 `gte(publishedAt, lowerBound)` 与 `:258` 的 `gte(publishedAt, minPublishedAt)`）⇒ **判了也不会告警** ⇒ 告警链把预算花在它们身上是**纯浪费**；
   2. 它们由**无界的日报链**在 ≤24h 内排空（日报链每天全量判）。
 - **⇒「MUST NOT 给日报链设界」现在承载【两个】理由，MUST 显式登记这条依赖**：除「一天一次、无界是它的正确形态」外，它还是**告警链取序不饿死老事件的唯一依据**。**将来任何给日报链也加预算的改动，MUST 先重新论证告警链的非饥饿性**——顺手加一个界，积压就永久饿死了。
 - 触顶 MUST 发一条**结构化可观测事件**（复用既有 run-event 通道，MUST NOT 新建通道），**MUST NOT 静默截断**。
-- **触顶事件的落点 MUST 定死（否则「复用既有通道」这条会被实现成新建通道）**：`emit` 挂在 `RunAlertScanOptions`（`src/pipeline/alert-scan.ts:126`），**不在** `ScoreEventsOptions` 上，而截断发生在 `scoreUnscoredEvents` **内部**。⇒ 唯一不新建通道的落法是：**`ScoreEventsResult` 增 `budgetExhausted` / `candidateCount` 字段，由 `alert-scan.ts` 读取后 emit**。**MUST NOT 给 `ScoreEventsOptions` 加 `emit`**——那就是新建一条通道，与本条自己的 MUST 相悖。
+- **触顶事件的落点 MUST 定死（否则「复用既有通道」这条会被实现成新建通道）**：`emit` 挂在 `RunAlertScanOptions`（`src/pipeline/alert-scan.ts:126`），**不在** `ScoreEventsOptions` 上，而截断发生在 `scoreUnscoredEvents` **内部**。⇒ 唯一不新建通道的落法是：**`ScoreEventsResult` 增 `budgetExhausted` / `candidateCount`（= 本轮实际处理条数 ≤ N）字段，由 `alert-scan.ts` 读取后 emit**。**MUST NOT 给 `ScoreEventsOptions` 加 `emit`**——那就是新建一条通道，与本条自己的 MUST 相悖。触顶的**判定** MUST 用 `LIMIT N+1` 取候选、只处理前 N 条（`budgetExhausted = 取回行数 > N`）——单靠 `LIMIT N` 无法区分恰好 N 与超过 N。事件名定死为 **`p0.judge_budget`**（载荷 `{budgetExhausted, candidateCount}`），经既有 emit 通道发射。
 - 触顶 MUST 保持既有 claim / 写 CAS 不变量：被预算挡在本轮之外的事件**留在工作集里**（`importance_score` 仍为 NULL），下一轮继续——预算只裁**单轮工作量**，绝不丢事件、绝不改「一事件只评一次分」。
-- **界 MUST 施加在 claim 之前（绝不可省——写错这一条，预算本身就是新的饥饿源）**：`importance_score IS NULL` 只决定**工作集成员资格**，而**下一轮能不能取到该事件，由 `judge_claimed_at` 决定**。若预算在 claim **之后**才截断（先 `claimEventForJudging` 再判「超预算 → break」），被截的事件就是 **claimed 但未判分**——它确实「留在工作集里」，但下一轮 `claimSkipped++` 取不到它，**要等满整个 `T`（`JUDGE_CLAIM_RECLAIM_MS`）才能被回收**。候选 SELECT 的 `LIMIT N` 天然落在 claim 之前，本条即自动成立。
+- **界 MUST 施加在 claim 之前（绝不可省——写错这一条，预算本身就是新的饥饿源）**：`importance_score IS NULL` 只决定**工作集成员资格**，而**下一轮能不能取到该事件，由 `judge_claimed_at` 决定**。若预算在 claim **之后**才截断（先 `claimEventForJudging` 再判「超预算 → break」），被截的事件就是 **claimed 但未判分**——它确实「留在工作集里」，但下一轮 `claimSkipped++` 取不到它，**要等满整个 `T`（`JUDGE_CLAIM_RECLAIM_MS`）才能被回收**。候选 SELECT 的 `LIMIT N+1` 天然落在 claim 之前（第 N+1 行不 claim、只作触顶信号），本条即自动成立。
 - **日报链 MUST 保持全量**（见上「不饥饿」的第 2 条理由与其登记）；**MUST 只对 P0 高频链设界**。
 - **`ALERT_SCAN_ENABLED=false` MUST NOT 被列为唯一的运行时保护**：那是**人翻开关的事后止血**（发现时车道已经死了几个小时），不是上线前的保护。一条高频车道必须**有界**——这是基本属性，不是可登记的风险。
+
+**预算只封【判分段】，MUST NOT 被表述为「单轮整体已有界」（登记）**：回填段在同一轮内，最坏 `PUBLISHED_AT_INFERENCE_MAX_PER_RUN（env，默认 20）× A×L（180s）= 3600s = 4× 周期`。把它折进 superRefine 在默认值下无解（会迫使上限为 0），故不设不等式；其真实的界是**结构性的**——非豁免源实测 0 条 NULL `published_at`、`sitemap` 已整源豁免 ⇒ 回填池近乎空（见 published-at-inference 的登记），负缓存是池变大时的既定升级路径。**若日后出现产 NULL 条目的非豁免源，MUST 先重新论证回填段时长（或给该上限设界）再扩源。**
 
 **与日报链的并发评分必须原子 claim（绝不可省）**：高频告警链路与日报链路可能**同时**对同一未评分事件跑 Value Judge。仅靠「只处理未评分」不防并发双评分，必须用 daily-intel-pipeline「降级逐条容错」定义的**原子 claim**（`UPDATE ... SET judge_claimed_at WHERE *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now() - interval 'T') RETURNING` / `FOR UPDATE SKIP LOCKED`，含超时回收防僵尸 claim 永久漏评），只有 claim 成功的链路送 LLM——保证「一事件只评一次分、永不覆写、崩溃不致永久漏评」跨两链路成立。
 
@@ -168,17 +172,17 @@ AND ( importance_score >= ALERT_IMPORTANCE_THRESHOLD
 
 **但「不做全源 0 告警」MUST NOT 被扩大为「不做源级健康告警」——两条链 MUST 都消费 `perSource`（本需求修改点，绝不可省）**：这是两条不同的判据（前者判「整轮全挂」，后者判「某一个源结构性失败」）。
 
-- **本需求落地前的缺口 MUST 精确表述：`perSource.ok=false` 【无任何告警消费者】——没有任何一条链读 `collected.perSource`。** 高频链不读、且按设计不调 `classifySystemFailure`（`src/pipeline/alert-scan.ts:334-341`）；**日报链同样不读**（`run-daily-workflow.ts` 全文 `perSource` 零命中；系统级故障判定的入参是「本轮采集统计」结构，其中**不含** `perSource`——**观察记述，2026-07-14**：该结构当时只有 `collectedCount` / `newsProcessableCount` 两个字段。**此处 MUST NOT 写成对该结构字段数的现在时断言**——字段集会随其它变更增删，而本需求的判据**不依赖**它的字段数，只依赖「它不含 `perSource`」）。单源 throw 被 `allSettled` 隔离 ⇒ 其余源照常返回 ⇒ `collectedCount > 0` ⇒ 判 `alert: false`。
-- **⇒ 系统 MUST NOT 声称「护栏只是退化为日频、日报链最长 24h 后会补上告警」**——那是假的：日报链**不会**在 24h 后告警，它**永远**不会告警。`source-collectors` 里那句「throw → `perSource.ok=false` → **计入告警**」**在两条链上一直都是空头支票**。
-- **缺口的准确表述是【无告警消费者】，MUST NOT 被夸大成「连信号都没留下」**：`runRegistry` 对每个被隔离的源失败**都记**（`src/collectors/index.ts:229-231`：`perSource[source]={ok:false}` + `logError` + `console.error`）——缺的是**出口**，不是记录。往反方向夸大缺口，与「恒绿的守卫等于没有守卫」是同一种失真。
+- **本需求的缺口 MUST 精确表述：`perSource.ok=false` 【只有高频链无告警消费者】，不是「两条链都没有」。** 后 `fix-sitemap-published-at` 基线（该前置变更已归档）下，**日报链已消费 `collected.perSource`**（`run-daily-workflow.ts:526` 的消费循环对 `ok=false` 发 `dedupKey='source-health:<source>'` 告警，生产经 `run(ctx)` 注入 `buildOpsAlertSink`）。**缺口只在高频链**：`alert-scan.ts` 不读 `collected.perSource`、且按设计不调 `classifySystemFailure`（防刷屏），亦无 `AlertSink` 注入口。（`classifySystemFailure` 的入参「本轮采集统计」结构**不含** `perSource`——但那是「全源 0」系统判据，与源级 `perSource` 消费是两条不同链路；日报链直接读 `perSource`、不经此函数。**此处 MUST NOT 写成对该结构字段数的现在时断言**——本需求只依赖「它不含 `perSource`」。）
+- **⇒ 系统 MUST NOT 声称「护栏只是退化为日频、日报链最长 24h 后会补上告警」，亦 MUST NOT 反向声称「日报链永远不会告警」**：日报链的源级告警**今天就在**——`source-collectors` 里那句「throw → `perSource.ok=false` → **计入告警**」在**日报链上已兑现**，只在**高频链上尚是空头支票**。站点改版把某源打成结构性失败时，**高频链**会静默丢该源最长 24h——那正是本需求要为高频链补的出口。
+- **缺口的准确表述是【高频链无告警消费者】，MUST NOT 被夸大成「两条链都没有」或「连信号都没留下」**：`runRegistry` 对每个被隔离的源失败**都记**（`src/collectors/index.ts:229-231`：`perSource[source]={ok:false}` + `logError` + `console.error`）——高频链缺的是**出口**，不是记录。往两个方向夸大（说成「两条链都无消费者」，或「连信号都没留下」），都与「恒绿的守卫等于没有守卫」是同一种失真。
 - **该缺口恰好打掉本车道唯一的收益**：sitemap 进实时子集买到的是「采集延迟 ≤20min」，而站点改版后本车道会**静默丢掉这个源最长 24 小时**。
 - **故：高频链与日报链 MUST 都读 `collected.perSource`，对 `ok=false` 的结构性失败产出【源级健康告警】**（典型：`sitemap` 站点改版致 `loc_count=0` → 整源 throw）。该告警 MUST 经 platform-foundation 的**运维告警 sink**（`createOpsAlertSink`）落**真实通道**，幂等键 **`dedupKey = 'source-health:<source>'`**。**MUST NOT 登记后继续吞**——一条被写进采集器契约却在新车道上落空的承诺是缺陷，不是可登记的取舍。
-- **告警链 MUST 有 `AlertSink` 的注入口，且生产入口 MUST 真的注入它（绝不可省——没有这一条，上面整段 MUST 在生产上是空的，而测试恒绿）**：日报链的运行选项**已有** `alert?: AlertSink`（`run-daily-workflow.ts:190`，未注入时回落 `console.error`）；**告警链的运行选项没有**（`RunAlertScanOptions`，`src/pipeline/alert-scan.ts:110-130`：`log` / `emit` / `judge` / `collect` / `publishedAtInfer` / `publishedAtLock` / `threshold` / `windowDays` / `maxPerScan` / `dbh` ——**无 `alert`**），其 worker 工厂 `createAlertScanWorker({connection, concurrency})`（`alert-queue.ts:97`）**亦无透传口**。⇒ 高频链即便写了源级告警，生产也只能回落 `console.error` ⇒ **静默**。故：
+- **告警链 MUST 有 `AlertSink` 的注入口，且生产入口 MUST 真的注入它（绝不可省——没有这一条，上面整段 MUST 在生产上是空的，而测试恒绿）**：日报链的运行选项**已有** `alert?: AlertSink`（`run-daily-workflow.ts:203`，未注入时回落 stderr 的 `consoleAlertSink`，**生产经 `run(ctx)` 已注入 `buildOpsAlertSink`**）；**告警链的运行选项没有**（`RunAlertScanOptions`，`src/pipeline/alert-scan.ts:82-127`：`log` / `emit` / `judge` / `collect` / `publishedAtInfer` / `publishedAtLock` / `threshold` / `windowDays` / `maxPerScan` / `dbh` 等——**无 `alert`**），其 worker 工厂 `createAlertScanWorker({connection, concurrency})`（`alert-queue.ts:97`）**亦无透传口**。⇒ 高频链即便写了源级告警，生产也只能回落 `console.error` ⇒ **静默**。故：
   - `RunAlertScanOptions` MUST 增 `alert?: AlertSink`；
-  - **`alert-queue` / `worker-main` 这条【生产装配路径】MUST 真的把 `createOpsAlertSink(...)` 注进去**——只加字段不接线，等于把注入口留给测试自己填；
+  - **生产装配路径 MUST 真的接线：告警链自身的 `run(ctx)` 包装 MUST 注入 `buildOpsAlertSink(...)`**（与日报链同型；`buildOpsAlertSink` 自发现并懒构造生产通道，裸 `createOpsAlertSink` 需预构造 senders、不作为装配入口）——只加字段不接线，等于把注入口留给测试自己填；
   - **MUST 有一条「未注入即回落 stderr」的显式回归断言**。**理由 MUST 一并读到**：源级告警的单测**自己注入 sink** ⇒ **无论生产有没有接线，那些用例都恒绿**。一个只能被「测试自己传进来的东西」满足的契约，不构成对生产的任何保证——这与本能力反复指认的「恒绿的守卫等于没有守卫」是同一个失效。
-- **限频 MUST 由 DB 唯一约束承载，MUST NOT 用 Redis 键或进程内 Map**：状态住在推送幂等的 `UNIQUE(target_type, target_id, channel, push_date)` 里（`ON CONFLICT DO NOTHING` 命中 0 行 ⇒ 今天已告过 ⇒ 直接 return）⇒ **零新状态、跨进程、跨重启、跨两条链自动去重**（高频链每天 72–96 轮、故障源每轮都 throw ⇒ **第一轮告警，其余 71–95 轮命中唯一键冲突而跳过**）。**进程内 Map 每次 redeploy 复位** ⇒ 「连续 N 轮失败」永不达标 ⇒ **静默不告警，比刷屏更糟**。
-- **源级健康告警 MUST 同时落在日报链，与高频链共用【同一个判定与同一个 `dedupKey`】（结构性要求，绝不可省）**：整条 P0 车道的回滚路径是 `ALERT_SCAN_ENABLED=false`（worker 完全跳过告警链）⇒ **只把源级告警放在高频链，一回滚唯一的告警出口就随之消失**。共用 `dedupKey` ⇒ 两条链经同一个唯一键**自动互相去重、不会双响**。
+- **限频 MUST 由 DB 唯一约束承载，MUST NOT 用 Redis 键或进程内 Map**：状态住在推送幂等的 `UNIQUE(target_type, target_id, channel, push_date)` 里，判据 = **仅 `status='success'` 行算今天已告过**（`ON CONFLICT DO UPDATE … WHERE status <> 'success'`，权威见 platform-foundation；**MUST NOT 写成 `ON CONFLICT DO NOTHING`**——失败残行会挡死当天重试 = 当天彻底哑火）⇒ **零新状态、跨进程、跨重启、跨两条链自动去重**（首个 success 轮后其余轮跳过、发送失败不占名额可重试）。**进程内 Map 每次 redeploy 复位** ⇒ 「连续 N 轮失败」永不达标 ⇒ **静默不告警，比刷屏更糟**。
+- **源级健康告警 MUST 同时落在日报链，与高频链共用【同一个判定与同一个 `dedupKey`】（结构性要求，绝不可省）**：整条 P0 车道的回滚路径是 `ALERT_SCAN_ENABLED=false`（worker 完全跳过告警链）⇒ **只把源级告警放在高频链，一回滚唯一的告警出口就随之消失**。共用 `dedupKey` ⇒ 两条链经同一个唯一键**自动互相去重、不会双响**。判定 MUST 含日报链既有的**良性限流豁免**（arXiv/PH 429 背压不告警），豁免谓词提为共享函数、两链同用。
 - **MUST NOT 套用日报的「全源返回 0」系统级告警**——高频链空轮是常态，那道闸会每天数十次误告警。
 
 > 此设计同时满足：① 两条支路的判定都在 `importance_score` 写入之后（「已评分」共用前提，不 `NULL >= 85` 误判、亦不让未评分事件绕过语义闸）；② 告警由高频小链路提前评分触发、不等日报，保留实时性；③ 原子 claim 防与日报链双评分；④ 时效窗口基于 `published_at`，冷启动/新增源不把历史老文误当重大发布告警；⑤ fail-closed 的 `is_ai_related = true` 闸挡住高 importance 的非 AI 新闻（KVM CVE / 癌症研究 / 探测器一类）；⑥ 闸与回填域由同一构造器生成，两个方向的漂移（饥饿 / 静默丢弃）都在结构上不可能发生；⑦ 支路 B 使「importance 低但改变当日决策」的精确事实变更不再结构性失明，且不以降低任何分数线或新增 LLM 轴为代价。
@@ -260,7 +264,7 @@ AND ( importance_score >= ALERT_IMPORTANCE_THRESHOLD
 - **且** 真的限流变更公告「Improved **rate limiting**」「**Beyond rate limits**: scaling access to Codex and Sora」「… and 3000× **Rate Limit** Increase」**照常告警**——**`rate limiting` MUST NOT 入否定项**（公告常用动名词，非器物名）。方向不对称是有意的：**漏一条真变更**正是支路 B 要防的失效，**误震一次博文**只是烦人、可恢复
 
 #### 场景:每轮工作预算只裁告警链、日报链保持全量
-- **当** 未评分事件数**大于**告警链的每轮预算 N（如 6 > 4），日报链跑判分阶段（**不传**该预算选项）
+- **当** 未评分事件数**大于**告警链的每轮预算 N（如 6 > N，默认 3），日报链跑判分阶段（**不传**该预算选项）
 - **那么** 日报链**全部判完**（判分保持无界）——预算的默认值 MUST 为「无界」，**MUST NOT** 把模块常量 N 写成缺省值（`options.maxPerRun ?? N`）。写反这一条会把日报链一并截到 N 条/天 ⇒ 要闻段枯竭，且**告警链「不饥饿」的唯一依据**（老事件由无界的日报链在 ≤24h 内排空）**当场坍塌** ⇒ 老事件永久积压。**该失效对 fixture ≤ N 条的测试完全不可见**，故 MUST 有此回归钉
 
 #### 场景:是否告警由程序阈值决定
@@ -275,12 +279,12 @@ AND ( importance_score >= ALERT_IMPORTANCE_THRESHOLD
 
 系统必须为实时告警提供可观测口径,支撑「精确/召回、噪音率」的人工抽检——这是「大事发生时先从即时推送知道、噪音可忍」这一上线判据的验证信号。每次高频扫描完成后,系统必须以结构化日志/事件记录本次:达阈值并推送的告警计数、命中事件的 `importance_score`（供分布/边界抽检）、以及各告警事件的 `event_id` 与命中的 `channel`。记录必须为**确定性程序输出**（非 LLM 判断质量）,不得引入新的对外副作用（只记录、不额外推送）。
 
-**上线/回滚判据必须可由数据库复算，绝不可只依赖上述结构化日志（本需求修改点）**：上述结构化记录经进程 stdout 输出，而系统**不落库 run 事件、也不做日志聚合**——把「观察 N 天的告警质量」建立在它之上，判据在证伪任何东西之前就已**不可执行**（无处查询、无留存保证）。故告警质量的**观察判据与回滚判据 MUST 定义为 `push_records` ⋈ `ai_news_events` 上的确定性复算**。复算是 DB 列（＋同一词表构造器的纯函数出口）的**纯函数**，**不需要任何新表、新列或日志聚合基建**，且可随时重跑。结构化日志保留为实时旁路信号，但 **MUST NOT** 作为判据的唯一载体——**包括支路 B 的回滚判据**（它 MUST NOT 去数只落在 stdout 的告警候选事件）。
+**上线/回滚判据必须可由数据库复算，绝不可只依赖上述结构化日志（本需求修改点）**：上述结构化记录经 console.error 落进程 stderr 输出（仓内未装 pino），而系统**不落库 run 事件、也不做日志聚合**——把「观察 N 天的告警质量」建立在它之上，判据在证伪任何东西之前就已**不可执行**（无处查询、无留存保证）。故告警质量的**观察判据与回滚判据 MUST 定义为 `push_records` ⋈ `ai_news_events` 上的确定性复算**。复算是 DB 列（＋同一词表构造器的纯函数出口）的**纯函数**，**不需要任何新表、新列或日志聚合基建**，且可随时重跑。结构化日志保留为实时旁路信号，但 **MUST NOT** 作为判据的唯一载体——**包括支路 B 的回滚判据**（它 MUST NOT 去数只落在 stdout 的告警候选事件）。
 
 **噪音口径 MUST 逐项定死（写错任一项都会让判据静默失效）**：噪音 = 观察窗内的推送中，同时满足下列**全部**条件的条数——
 
 1. `target_type = 'alert'` **且 `status = 'success'`**——**`status` 谓词绝不可省**：dispatcher 先写 `pending`、失败置 `failed`，不带 `status` 的复算会把未送达的记录也算成「已推送」；
-2. 其事件**两条支路皆不满足**告警闸——即 `importance_score` 为 NULL、**或 `is_ai_related` 不为 `true`**、或（`importance_score < ALERT_IMPORTANCE_THRESHOLD` **且** `representative_title` 未命中词表）。
+2. 其事件**两条支路皆不满足**告警闸——即 `importance_score` 为 NULL、**或 `is_ai_related` 不为 `true`**、或（`importance_score < ALERT_IMPORTANCE_THRESHOLD` **且【支路 B 判定不为真】**）。**支路 B 判定 = `representative_title` 命中词表 ∧ 不命中 `NEGATIVE_PATTERNS`**——只写「未命中词表」会把「命中词表却被否定项挡下、仍被推送」的工具帖漏出噪音口径；且 `representative_title` 为 NULL 时该判定按【不为真】计（SQL 侧 MUST 用 `(…) IS NOT TRUE` 承载，防三值逻辑把 NULL 行漏出口径）。
 
 **支路 B 的低分命中是【设计内的低分告警】，MUST NOT 被计入噪音**——否则回滚判据会把本能力自己当噪音关掉。**阈值 MUST 从 `ALERT_IMPORTANCE_THRESHOLD` 读取，MUST NOT 在判据 SQL 里硬编码字面量**（生产改阈值时硬编码的判据会静默失灵）。
 
@@ -320,8 +324,8 @@ trigger = (importance_score >= ALERT_IMPORTANCE_THRESHOLD) ? 'importance' : 'fac
 - **那么** 该记录为纯旁路观测,不影响是否告警的确定性阈值判定、不重复推送、不阻塞或改变告警链其余阶段
 
 #### 场景:告警质量判据由数据库复算而非日志留存
-- **当** 观察期内需核验 P0 告警质量（噪音率 / 命中分数分布 / 支路归因）或判定是否回滚，而结构化日志只落在进程 stdout、无落库无聚合
-- **那么** 判据仍可执行——由 `push_records`（`target_type='alert'` **且 `status='success'`**）与 `ai_news_events` 的连接**确定性复算**得出（噪音 = 两条支路皆不满足的条数：`importance_score` 为 NULL，或 `is_ai_related` 不为 `true`，或低于阈值且未命中词表；**支路 B 的低分命中不计入噪音**；阈值从 `ALERT_IMPORTANCE_THRESHOLD` 读取、不硬编码），不依赖日志的留存或聚合，且复算为纯读、不产生任何对外副作用
+- **当** 观察期内需核验 P0 告警质量（噪音率 / 命中分数分布 / 支路归因）或判定是否回滚，而结构化日志只落在进程 stderr（console.error）、无落库无聚合
+- **那么** 判据仍可执行——由 `push_records`（`target_type='alert'` **且 `status='success'`**）与 `ai_news_events` 的连接**确定性复算**得出（噪音 = 两条支路皆不满足的条数：`importance_score` 为 NULL，或 `is_ai_related` 不为 `true`，或低于阈值且支路 B 判定不为真（命中词表 ∧ 不命中否定项，NULL 标题按不为真计）；**支路 B 的低分命中不计入噪音**；阈值从 `ALERT_IMPORTANCE_THRESHOLD` 读取、不硬编码），不依赖日志的留存或聚合，且复算为纯读、不产生任何对外副作用
 
 #### 场景:P0 告警候选记录其触发支路与命中词
 - **当** 某告警候选 `importance_score` 低于阈值、经支路 B（精确事实变更词表）取得告警资格

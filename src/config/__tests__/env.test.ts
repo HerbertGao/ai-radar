@@ -10,6 +10,12 @@
  * 纯函数测试，不触发 import 期的 `env` 单例校验（直接调用导出的 parseEnv）。
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+// 两个零依赖叶子模块（静态 import 不触发 env 单例校验）：展开器 = 避整点判据的共享文法；
+// DEFAULT_WEEKLY_CRON 是模块常量非 env（本体在叶子、weekly-queue re-export），直接 import
+// 断言真值——禁抄字面量副本（副本与真值静默漂移，守卫失效），也不经 weekly-queue（driver
+// top-level import bullmq，纯函数测试不宜拖入其依赖图）。
+import { expandCronMinutes } from '../cron-minutes.js';
+import { DEFAULT_WEEKLY_CRON } from '../weekly-cron.js';
 
 // env.ts 在 import 期会以 process.env 评估 `env` 单例（缺关键变量即 throw）。
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
@@ -217,12 +223,47 @@ describe('parseEnv —— 飞书可选通道（feishu-push 5.1）', () => {
   });
 });
 
-describe('parseEnv —— 每日 cron 默认避整点/半点（feishu-push 5.5）', () => {
-  it('DAILY_DIGEST_CRON 默认分钟字段 ∉ {0, 30}', () => {
+describe('parseEnv —— 飞书 cron 默认避整点/半点（feishu-push / p0-alert-lane A1）', () => {
+  // 判据主语是【展开集】不是字段字符串：旧字面量判据（字段字符串 ∉ {'0','30'}）对 */15
+  // （展开 {0,15,30,45}，同时撞整点与半点）恒绿，正是它漏掉了 ALERT_SCAN_CRON 的违反。
+
+  /** 避整点判据：expandCronMinutes(cron) ∩ {0,30} ≠ ∅ 即违反；展开抛错同计违反（fail-closed）。 */
+  function violatesQuietMinutes(cron: string): boolean {
+    try {
+      const minutes = expandCronMinutes(cron);
+      return minutes.has(0) || minutes.has(30);
+    } catch {
+      return true; // 无法展开 = 违反——绝不静默空集判过（空集 ∩ {0,30} = ∅ 恒判过）。
+    }
+  }
+
+  it('全部 4 条走飞书发送的定时 cron 默认值：分钟展开集 ∩ {0,30} = ∅（任一违反即失败）', () => {
     const env = parseEnv(validEnv());
-    const minuteField = env.DAILY_DIGEST_CRON.trim().split(/\s+/)[0]!;
-    expect(['0', '30']).not.toContain(minuteField);
+    // 覆盖清单 = 全部会触发飞书发送的定时 cron；新增飞书 cron 时 MUST 同步加进本清单
+    // （清单是判据唯一的强制手段）。不发飞书的 4 条（MR_EVENT_REVIEW / MR_SCRAPE_HTTP /
+    // MR_SCRAPE_BROWSER / MR_STALENESS）不在覆盖面。
+    const feishuCrons: Record<string, string> = {
+      DAILY_DIGEST_CRON: env.DAILY_DIGEST_CRON, // {3}
+      ALERT_SCAN_CRON: env.ALERT_SCAN_CRON, // {4,19,34,49}
+      DEFAULT_WEEKLY_CRON, // {7}（模块常量非 env，直接 import 真值）
+      MR_PRICE_CURATION_CRON: env.MR_PRICE_CURATION_CRON, // {53}
+    };
+    for (const [name, cron] of Object.entries(feishuCrons)) {
+      expect(
+        violatesQuietMinutes(cron),
+        `${name}="${cron}" 的分钟展开集撞整点/半点（或无法展开）`,
+      ).toBe(false);
+    }
   });
+
+  // 负例断言（A1.5，防判据退回字面量后无人察觉）：这些 cron 的分钟字段字符串都 ∉ {'0','30'}
+  // （字面量判据恒放行），但展开集与 {0,30} 有交——判据 MUST 判违反。
+  it.each(['*/15 * * * *', '*/20 * * * *', '* * * * *', '0/15 * * * *'])(
+    '负例：%s 判违反（字面量判据在此恒绿）',
+    (cron) => {
+      expect(violatesQuietMinutes(cron)).toBe(true);
+    },
+  );
 });
 
 describe('parseEnv —— RSS_FEEDS 带 vendor 的 feed 配置解析（design D2）', () => {
@@ -727,6 +768,118 @@ describe('parseEnv —— 首次启用发布时间基线水位 fail-fast（add-h
 
     const unset = parseEnv({ ...validEnv(), ALERT_SCAN_ENABLED: 'false' } as NodeJS.ProcessEnv);
     expect(alertMinPublishedAt(unset)).toBeNull(); // undefined（未设）→ 无水位。
+  });
+});
+
+describe('parseEnv —— 不支持组合 fail-fast：启用告警 × 窗口=0 × 基线空串（p0-alert-lane A4）', () => {
+  // 跨字段不变量（不新增 env）：ALERT_SCAN_ENABLED='true' ∧ ALERT_FIRST_SEEN_WINDOW_DAYS=0（旁路
+  // 时效下界）∧ ALERT_MIN_PUBLISHED_AT=''（显式 opt-out 基线水位）→ 候选谓词只剩「published_at 非
+  // NULL 且 <= now」，告警候选域扩成全表历史 → superRefine 启动期拒绝（守 policy-push-timeliness）。
+
+  it('三元组合同时成立 → 抛错（superRefine fail-fast，报错含字段名）', () => {
+    const source = {
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_FIRST_SEEN_WINDOW_DAYS: '0',
+      ALERT_MIN_PUBLISHED_AT: '',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/ALERT_FIRST_SEEN_WINDOW_DAYS/);
+  });
+
+  it('窗口 > 0（其余同组合）→ 正常加载（时效下界仍在，候选域有界）', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_FIRST_SEEN_WINDOW_DAYS: '3',
+      ALERT_MIN_PUBLISHED_AT: '',
+    } as NodeJS.ProcessEnv);
+    expect(env.ALERT_FIRST_SEEN_WINDOW_DAYS).toBe(3);
+  });
+
+  it('基线为合法 ISO（其余同组合）→ 正常加载（水位挡住历史存量）', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_FIRST_SEEN_WINDOW_DAYS: '0',
+      ALERT_MIN_PUBLISHED_AT: '2026-07-11T00:00:00.000Z',
+    } as NodeJS.ProcessEnv);
+    expect(env.ALERT_FIRST_SEEN_WINDOW_DAYS).toBe(0);
+    expect(env.ALERT_MIN_PUBLISHED_AT).toBe('2026-07-11T00:00:00.000Z');
+  });
+
+  it('车道关（ALERT_SCAN_ENABLED=false，其余同组合）→ 正常加载（纯日报部署不受此闸约束）', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'false',
+      ALERT_FIRST_SEEN_WINDOW_DAYS: '0',
+      ALERT_MIN_PUBLISHED_AT: '',
+    } as NodeJS.ProcessEnv);
+    expect(env.ALERT_SCAN_ENABLED).toBe('false');
+  });
+});
+
+describe('parseEnv —— 告警侧判分预算 N × (F + A×L + W) < cron 周期（p0-alert-lane A5.1c）', () => {
+  // N = ALERT_JUDGE_MAX_PER_RUN(3) 是 env.ts 模块常量；F/L/W/cron 周期四项是 env ⇒ 约束必须落
+  // superRefine（散文约束在生产上调 LLM_TIMEOUT_MS 或调密 cron 时静默失效）。合取门 =
+  // ALERT_SCAN_ENABLED='true'（纯日报部署不受此约束拒启）。cron 周期 = expandCronMinutes 展开
+  // 分钟集在 mod-60 环上的最小相邻间隔（单元素 ⇒ 环绕 60min）。
+
+  /** 车道开的最小合法组合（基线水位必设 ISO，否则先撞 ALERT_MIN_PUBLISHED_AT 的 superRefine）。 */
+  const laneOn = (): NodeJS.ProcessEnv =>
+    ({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'true',
+      ALERT_MIN_PUBLISHED_AT: '2026-07-11T00:00:00.000Z',
+    }) as NodeJS.ProcessEnv;
+
+  it('默认值组合（N=3、F=15s、A×L=180s、W=60s、周期 15min：765s < 900s）→ 正常加载', () => {
+    const env = parseEnv(laneOn());
+    expect(env.ALERT_SCAN_CRON).toBe('4-59/15 * * * *'); // 展开 {4,19,34,49} ⇒ 周期 15min。
+  });
+
+  it('调高 LLM_TIMEOUT_MS 使不等式不成立 → 抛错，且错误消息报出五项当前值', () => {
+    // 3 × (15s + 3×300s + 60s) = 2925s ≥ 900s（15min 周期）→ fail-fast。
+    // JUDGE_CLAIM_RECLAIM_MS 同步调高（> F+A×L+W = 975s），隔离出本条 superRefine（而非 T 阈值先红）。
+    const source = {
+      ...laneOn(),
+      LLM_TIMEOUT_MS: '300000',
+      JUDGE_CLAIM_RECLAIM_MS: '2000000',
+    } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    // 五项当前值（N / F / A×L / W / cron 周期）都在消息里——否则运维拿到一条不可行动的报错。
+    expect(() => parseEnv(source)).toThrow(/ALERT_JUDGE_MAX_PER_RUN\(3\)/);
+    expect(() => parseEnv(source)).toThrow(/COLLECTOR_FETCH_TIMEOUT_MS\(15000ms\)/);
+    expect(() => parseEnv(source)).toThrow(/LLM_TIMEOUT_MS\(300000ms\)/);
+    expect(() => parseEnv(source)).toThrow(/JUDGE_WRITE_BUDGET_MS\(60000ms\)/);
+    expect(() => parseEnv(source)).toThrow(/cron 周期=900000ms/);
+  });
+
+  it('cron 调密（*/3，周期 3min < 单条最坏 255s×3）→ 抛错（生产调密 cron 时约束不静默失效）', () => {
+    const source = { ...laneOn(), ALERT_SCAN_CRON: '*/3 * * * *' } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/ALERT_SCAN_CRON/);
+  });
+
+  it('单元素分钟集（"9 * * * *"）⇒ 周期取 mod-60 环绕 60min → 正常加载', () => {
+    const env = parseEnv({ ...laneOn(), ALERT_SCAN_CRON: '9 * * * *' } as NodeJS.ProcessEnv);
+    expect(env.ALERT_SCAN_CRON).toBe('9 * * * *');
+  });
+
+  it('展开器对非法 cron 抛错 → superRefine 同样 fail-fast（fail-closed，绝不静默跳过校验）', () => {
+    const source = { ...laneOn(), ALERT_SCAN_CRON: 'x * * * *' } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+    expect(() => parseEnv(source)).toThrow(/无法展开/);
+  });
+
+  it('车道关（ALERT_SCAN_ENABLED=false）+ 高 LLM_TIMEOUT_MS → 正常加载（合取门：纯日报部署不受此约束拒启）', () => {
+    const env = parseEnv({
+      ...validEnv(),
+      ALERT_SCAN_ENABLED: 'false',
+      LLM_TIMEOUT_MS: '300000',
+      JUDGE_CLAIM_RECLAIM_MS: '2000000',
+    } as NodeJS.ProcessEnv);
+    expect(env.LLM_TIMEOUT_MS).toBe(300000);
   });
 });
 

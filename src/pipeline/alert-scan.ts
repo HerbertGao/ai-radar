@@ -2,16 +2,20 @@
  * 实时重大发布告警高频工作流（realtime-alerts，design D6）。
  *
  * 一个**独立于 runDailyWorkflow** 的高频轻量工作流（独立 BullMQ 调度入口，频率 env 可配，
- * 默认每 20min）。纯顺序确定性流：
- *   采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv 非实时 / PH 配额受限）
+ * 默认 4-59/15，15 分钟节奏）。纯顺序确定性流：
+ *   采集（**只跑实时新闻源 {rss, hacker_news, github, sitemap}**，排除 arXiv 非实时 / PH 配额受限；
+ *     sitemap 的稳态每轮成本 = 1 次 sitemap.xml GET + 1 次已见集查询——已见集去重在 per-article
+ *     fetch 之前 + first-fetch-wins，见 collectors/index.ts 的 REALTIME_NEWS_SOURCES 注释）
  *   → 入库 → 去重塌缩
  *   → 对未评分事件评分（与日报链共用 scoreUnscoredEvents，含并发原子 claim 防双评分）
- *   → **评分后**判 `importance_score IS NOT NULL AND >= 阈值`（默认 85，env 可配，纯程序阈值）
- *   → 对达阈值且「从未以该 channel success 告警过」的事件推送告警
+ *   → **评分后**判告警闸（两支路，见 alert-gate.ts 共享构造器 alertGatePredicate）：共用前提
+ *     `importance_score IS NOT NULL AND is_ai_related = true`（AI 闸 fail-closed），支路 A
+ *     `importance_score >= 阈值`（默认 85，env 可配）OR 支路 B 标题命中精确事实变更词表；纯程序判定
+ *   → 对过闸且「从未以该 channel success 告警过」的事件推送告警
  *
  * 关键不变量（绝不可违背，realtime-alerts / design D6）：
- * - **判定必在评分后**：importance_score 评分前为 NULL（`NULL >= 85` 恒假），阈值判定查 SQL
- *   `importance_score IS NOT NULL AND >= 阈值`——评分阶段已先于本判定执行，绝不以 NULL 误判。
+ * - **判定必在评分后**：importance_score 评分前为 NULL，闸的共用前提 `importance_score IS NOT NULL`
+ *   在 OR 之外（alertGatePredicate）——未评分事件两支路都进不了闸；评分阶段已先于本判定执行，绝不以 NULL 误判。
  * - **候选时效闸键于 `published_at`（绝不基于 `first_seen_at`）**：候选窗口为闭区间
  *   `lowerBound <= published_at <= now`——下界 `gte(published_at, lowerBound)` 拦超窗老文（lowerBound
  *   与日报候选同源 startOfDayInTimeZone，防冷启动/新增源把历史老文误当重大发布刷屏），上界
@@ -22,13 +26,16 @@
  *   published_at <= now`（须显式 isNotNull + lte，否则旧 NULL/未来事件会绕过修复刷屏）。单次扫描
  *   上限取序按 `published_at DESC`（取最新发布）。`first_seen_at` 语义不变（仍记首次抓取，供调试/
  *   僵尸 claim 回收），**不再**用于告警时效过滤。
- * - **非 LLM 决定**：是否告警完全由程序阈值决定，禁止 LLM 参与。
+ * - **非 LLM 决定**：是否告警完全由程序判定（阈值 / 词表两支路均确定性），禁止 LLM 参与。
  * - **不做语义去重 / 不做 KB 入库**（add-semantic-dedup-and-store-hardening 6.3，spec「语义去重仅作用于
  *   日报链新闻事件」）：本高频链恒走硬去重快路径，**绝不**调 semanticMergeEvents（embedding/LLM 二次
  *   判断/事件合并）或 runKbIngestion——语义层与 KB 入库**仅日报链**执行。日报链合并产生的 tombstone
  *   仍存于库，故 selectAlertCandidates 仍须排除 `merged_into IS NOT NULL`（已加，组 4.7），但本链不**产生**合并。
  * - **高频链路不套用日报「全源 0」系统级告警**：高频轮询全源 0 / 空轮是常态，本工作流**不调**
- *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。
+ *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。**但「不做全源 0
+ *   告警」不蕴含「不做源级健康告警」**（p0-alert-lane C1.3 / design D11②）：两条判据不同（前者判
+ *   「整轮全挂」，后者判「某一个源结构性失败」）——本链与日报链都消费 perSource，对 ok=false 的
+ *   结构性失败发 dedupKey='source-health:<source>' 告警（共用同一个判定与同一个 dedupKey，见阶段 1）。
  * - **独立四元组**：`target_type='alert'`、`target_id=event_id`、`push_date=触发当日(Asia/Shanghai)`，
  *   与日报 `event` 互不挤占（日报已推同一事件不吞掉告警）。
  * - **一生一次去重**：候选「该 event_id 从未以该 channel success 告警过」管跨天；
@@ -43,7 +50,12 @@
 import { and, desc, eq, gte, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords, rawItems } from '../db/schema.js';
-import { env, isFeishuEnabled, alertMinPublishedAt } from '../config/env.js';
+import {
+  env,
+  isFeishuEnabled,
+  alertMinPublishedAt,
+  ALERT_JUDGE_MAX_PER_RUN,
+} from '../config/env.js';
 import { digestEvent } from '../agents/digest/persistence.js';
 import type { SummarizeOptions } from '../agents/digest/index.js';
 import {
@@ -67,6 +79,14 @@ import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
+import { alertGatePredicate } from './alert-gate.js';
+import { matchFactChangeKeywords } from '../keywords/fact-change-gate.js';
+import {
+  buildOpsAlertSink,
+  consoleAlertSink,
+  type AlertSink,
+} from './ops-alert-sink.js';
+import { isBenignRateLimit } from './source-health.js';
 import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 import type { RunContext } from './run-context.js';
@@ -109,6 +129,13 @@ export interface RunAlertScanOptions {
   digest?: SummarizeOptions;
   /** 运行期日志 sink（默认 console.error）。 */
   log?: AlertLogSink;
+  /**
+   * 运维告警出口（源级健康告警，p0-alert-lane C1.3 / design D11②）：对本轮 perSource.ok=false 的
+   * 结构性失败发 dedupKey='source-health:<source>' 告警。未注入回落 stderr 的 consoleAlertSink
+   * （不静默）；**生产由本文件的 run(ctx) 包装注入 buildOpsAlertSink**（与日报链
+   * run-daily-workflow.ts 的 run() 同型）——只加字段不接线等于把注入口留给测试自己填。
+   */
+  alert?: AlertSink;
   /**
    * 发布时间回填阶段的推断选项（透传给 backfillPublishedAt 的 `infer`）。
    * 注入 mock generateObjectFn / maxAttempts 等，使测试控制推断结果、不依赖真实 LLM。
@@ -167,7 +194,9 @@ interface AlertCandidate {
  * 查「评分后达阈值且从未以任一通道 success 告警过」的候选事件（realtime-alerts 一生一次）。
  *
  * 条件（全在 SQL 程序层，无 LLM）：
- *   importance_score IS NOT NULL AND importance_score >= 阈值   ← 判定必在评分后（NULL 不误判）
+ *   告警闸（alertGatePredicate 共享构造器）：importance_score IS NOT NULL（判定必在评分后，NULL
+ *     不误判）AND is_ai_related = true（AI 闸 fail-closed，false/NULL 一律排除，不含 should_push）
+ *     AND importance_score >= 阈值
  *   AND NOT EXISTS (push_records WHERE target_type='alert' AND target_id=event_id
  *                     AND status='success')   ← 任一通道从未 success 告警（channel-agnostic）
  *   AND 时效闸（闭区间）：windowDays>0 → lowerBound <= published_at <= now（下界隐含非 NULL）；
@@ -235,9 +264,10 @@ export async function selectAlertCandidates(
     .leftJoin(rawItems, eq(aiNewsEvents.representativeRawItemId, rawItems.id))
     .where(
       and(
-        // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
-        isNotNull(aiNewsEvents.importanceScore),
-        gte(aiNewsEvents.importanceScore, String(threshold)),
+        // 告警闸（共享构造器，p0-alert-lane A3）：已评分（NULL 不误判）∧ is_ai_related=true
+        // （fail-closed，false/NULL 一律排除）∧ importance>=阈值。与回填域（backfill.ts scopePredicate
+        // alert 分支）同调同一构造器——回填域 == 告警闸的共享谓词段，结构上杜绝漂移（design D3）。
+        alertGatePredicate(threshold),
         // P3 tombstone 排除（合并核心闭环）：不对已被日报链合并掉的死 event_id 告警（spec「tombstone
         // 对所有下游消费者不可见」）。注：告警链不调语义合并，但日报链合并的 tombstone 仍存于库中。
         isNull(aiNewsEvents.mergedInto),
@@ -275,6 +305,50 @@ export async function selectAlertCandidates(
     content: r.content,
     source: r.source,
   }));
+}
+
+/** p0.observed 归因取值（D2.3/design D6）：候选由哪条支路取得告警资格，定死三元。 */
+export type AlertTrigger = 'importance' | 'fact-change' | 'unknown';
+
+/**
+ * 告警候选的触发支路归因（p0-alert-lane D2.3 / design D6）——**支路 A 优先**：
+ *   trigger = (importanceScore >= threshold) ? 'importance' : 'fact-change'
+ *
+ * - `matchedKeywords` **仅在 trigger='fact-change' 时记录**，由与告警闸同一词表构造器的 TS 出口
+ *   （matchFactChangeKeywords）对该候选标题复算（≤ 单轮上限条，成本可忽略）。**绝不可用
+ *   `matchedKeywords.length > 0` 反推 trigger**——那是纯标题函数，一条经支路 A 正常入选的高分
+ *   事件若标题恰含词表词也会返回非空 → 误标 fact-change → 误触发回滚判据（把正常功能当噪音关掉）。
+ * - `importanceScore === null` 按构造不可达（闸的「已评分」前提在 OR 之外），MUST 走**显式分支**：
+ *   记 error 级结构化日志 + trigger='unknown'。陷阱在三元表达式本身、不在缺省值——JS 的
+ *   `null >= 85` 静默求值为 false，不加任何 ?? 兜底它就会把 NULL 静默归成 'fact-change'、污染
+ *   以 trigger='fact-change' 计的回滚判据；'unknown' 的全部意义是让这条静默路径在日志里显形。
+ * - **MUST NOT 抛错**：p0.observed 的 emit 在全部 dispatch 之后且不在 try/catch 内——抛错 =
+ *   副作用已发生后炸掉整轮 → run.failed → BullMQ 重试整轮重跑（采集/补全/评分/回填）。
+ *
+ * 归因为纯附加字段：只写观测、不改变告警行为。
+ */
+export function attributeAlertTrigger(
+  candidate: Pick<
+    AlertCandidate,
+    'eventId' | 'representativeTitle' | 'importanceScore'
+  >,
+  threshold: number,
+  log: AlertLogSink = defaultLog,
+): { trigger: AlertTrigger; matchedKeywords?: string[] } {
+  if (candidate.importanceScore === null) {
+    // 显式 NULL 分支（按构造不可达）：error 级结构化日志 + unknown，绝不抛错、绝不静默归支路 B。
+    log(
+      `归因异常: 告警候选 importanceScore=NULL（按构造不可达，标 trigger=unknown）`,
+      { level: 'error', eventId: candidate.eventId },
+    );
+    return { trigger: 'unknown' };
+  }
+  // 支路 A 优先：高分事件标题恰含词表词时归因仍为 importance、不记 matchedKeywords。
+  if (candidate.importanceScore >= threshold) return { trigger: 'importance' };
+  return {
+    trigger: 'fact-change',
+    matchedKeywords: matchFactChangeKeywords(candidate.representativeTitle),
+  };
 }
 
 /** 把告警候选映射为 dispatcher 输入的 SelectedEvent（headline 缺失走 dispatcher 渲染回退链）。 */
@@ -315,7 +389,7 @@ function resolveChannelSenders(
 /**
  * 跑一次实时告警高频扫描（纯顺序）。
  *
- * @param options 注入点（now / db / collect mock / judge mock / threshold / channels / senders / lock / log）。
+ * @param options 注入点（now / db / collect mock / judge mock / threshold / channels / senders / lock / log / alert）。
  */
 export async function runAlertScan(
   options: RunAlertScanOptions = {},
@@ -323,6 +397,8 @@ export async function runAlertScan(
   const now = options.now ?? new Date();
   const dbh = options.dbh ?? defaultDb;
   const log = options.log ?? defaultLog;
+  // 源级健康告警出口（C1.3）：未注入回落 stderr 的 consoleAlertSink（不静默）；生产由 run(ctx) 注入。
+  const alert = options.alert ?? consoleAlertSink;
   const threshold = options.threshold ?? env.ALERT_IMPORTANCE_THRESHOLD;
   const windowDays = options.windowDays ?? env.ALERT_FIRST_SEEN_WINDOW_DAYS;
   const maxPerScan = options.maxPerScan ?? env.ALERT_MAX_PER_SCAN;
@@ -330,8 +406,11 @@ export async function runAlertScan(
   const emit = options.emit ?? (() => {});
   const pushDate = getPushDate(now);
 
-  // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv/PH）+ 入库。
+  // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github, sitemap}**，排除 arXiv/PH）+ 入库。
   // 高频链路全源 0 / 空轮是常态：**不**调 classifySystemFailure 做系统级告警（防刷屏）。
+  // sitemap 进本子集（p0-alert-lane 阶段 C）买到的是采集延迟（≤24h → ≤20min）、不是告警资格；
+  // 其成本形状被增量语义摊薄：已见集去重在 per-article fetch **之前** + first-fetch-wins ⇒
+  // 稳态每轮 = 1 次 sitemap.xml GET + 1 次已见集查询（见 collectors/index.ts）。
   emit('stage.collect');
   const collected = await collectSources(REALTIME_NEWS_SOURCES, {
     ...options.collect,
@@ -340,18 +419,58 @@ export async function runAlertScan(
   await storeCollectedItems(collected.items, { dbh });
   log(`实时源采集: 返回 ${collectedCount} 条（仅 ${REALTIME_NEWS_SOURCES.join('/')}）`);
 
+  // ── 源级健康告警（p0-alert-lane C1.3 / design D11②，与日报链 run-daily-workflow.ts 的消费循环
+  //    **同一个判定与同一个 dedupKey**）：对本轮 perSource.ok=false 的**结构性失败**（sitemap 的
+  //    loc_count=0 → 整源 throw 即典型）发 dedupKey='source-health:<source>'（per-source，多源同时
+  //    坏不塌成一条）。良性限流豁免经共享谓词 isBenignRateLimit（arXiv/PH 的 429 退避是设计内背压，
+  //    不告警——共享防两链判定静默漂移）。限频由 createOpsAlertSink 内部的 push_records 唯一约束承载
+  //    （仅 status='success' 行算「今天已告过」：本链每天 72–96 轮，首个 success 轮后其余轮跳过；
+  //    发送失败置 failed 不占名额、可重试——跨进程、跨重启、跨两条链共用同一判据，非进程内状态）。
+  //    **日报链那一份不可删**：整条车道的回滚路径是 ALERT_SCAN_ENABLED=false，只留本链则一回滚
+  //    唯一的告警出口随之消失；共用 dedupKey ⇒ 两条链经同一唯一键自动互相去重、不双响。
+  for (const [source, ps] of Object.entries(collected.perSource)) {
+    if (ps && ps.ok === false && !isBenignRateLimit(ps.error)) {
+      log(`告警: 采集源失败 source=${source}`);
+      await alert(`采集源失败：${source}`, {
+        dedupKey: `source-health:${source}`,
+        source,
+        error: ps.error, // sink 沿 cause 链摘要真正的故障原因。
+      });
+    }
+  }
+
   // ── 阶段 2：去重塌缩（与日报链共用 collapseUncollapsedRawItems，按 collapsed 标记驱动、幂等）。
   emit('stage.dedup');
   await collapseUncollapsedRawItems(dbh);
 
   // ── 阶段 3：对未评分事件评分（与日报链共用，含并发原子 claim 防双评分）。
   //    评分必在阈值判定**之前**：保证下一步判定时 importance_score 已写（不 NULL 误判）。
+  //    **判分预算（p0-alert-lane A5.2 / design D11）**：告警链是高频车道，判分 MUST 有界——每轮最多
+  //    判 ALERT_JUDGE_MAX_PER_RUN 条（N × (F + A×L + W) < cron 周期，env.ts superRefine 启动期强制），
+  //    余量下一轮续判（超预算事件从未被 claim，见 score-events.ts 候选 SELECT 注释）。显式值放 spread
+  //    之【后】：将来某个 judge 注入体若带 maxPerRun，预算恒胜、车道不会静默回到无界（前瞻性防御——
+  //    spread 只复制自有属性，今日注入体不含该键时反序也不会覆盖成 undefined）。
+  //    日报链（run-daily-workflow.ts）**不传** ⇒ 保持全量无界，两个理由缺一不可：① 一天一次，无界是
+  //    它的正确形态；② 它是本链 first_seen_at DESC 取序不饿死老事件的唯一依据——老的未评分事件过
+  //    不了下方告警闸的时效地板（判了也不告警、花预算是纯浪费），由无界的日报链在 ≤24h 内排空。
   emit('stage.score');
-  const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
+  const judgeResult = await scoreUnscoredEvents(
+    { ...options.judge, maxPerRun: ALERT_JUDGE_MAX_PER_RUN },
+    dbh,
+  );
   log(
     `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条` +
-      `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}`,
+      `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}` +
+      `, 判分预算 ${judgeResult.candidateCount}/${ALERT_JUDGE_MAX_PER_RUN}` +
+      (judgeResult.budgetExhausted ? '（触顶，余量下轮续判）' : ''),
   );
+  // 触顶结构化可观测（A5.3）：经既有 emit 通道发射 p0.judge_budget（不新建通道、不改 p0.observed
+  // 既有 schema、绝不静默截断）。budgetExhausted = 候选 SELECT（LIMIT N+1）取回行数 > N；
+  // candidateCount = 本轮实际处理条数（≤ N）。被挡下的事件 importance_score 仍 NULL、留在工作集。
+  emit('p0.judge_budget', {
+    budgetExhausted: judgeResult.budgetExhausted,
+    candidateCount: judgeResult.candidateCount,
+  });
 
   // ── 阶段 3.5：发布时间回填（published-at-inference，realtime-alerts spec / design D2/D4）。
   // **必在 selectAlertCandidates 之前**：对「评分后达阈值（importance_score 非 NULL 且 >= threshold）
@@ -498,6 +617,10 @@ export async function runAlertScan(
     hits: candidates.map((c) => ({
       eventId: c.eventId,
       importanceScore: c.importanceScore,
+      // 归因为纯附加字段（p0-alert-lane D2.3，阶段 D 的 spec 内附加、非 schema 冻结不变量）：
+      // trigger 三元 {'importance','fact-change','unknown'}（支路 A 优先、NULL 走显式 unknown
+      // 分支且绝不抛错），matchedKeywords 仅 fact-change 时带。见 attributeAlertTrigger。
+      ...attributeAlertTrigger(c, threshold, log),
     })),
   });
   log(
@@ -530,6 +653,13 @@ export async function run(
   try {
     return await core({
       emit: ctx.emit,
+      // 生产装配的运维告警出口（源级健康告警，p0-alert-lane C1.3）：与日报链 run(ctx) 同型
+      // （run-daily-workflow.ts run()）。不注入则核心回落 consoleAlertSink：告警只进 stderr、
+      // 没人会被叫醒。用 buildOpsAlertSink（自发现并懒构造生产通道——首次真告警才装配，桩核心
+      // 单测不触发真实发送器构造）而非裸 createOpsAlertSink（后者需预构造 senders map）。
+      // `now` 与工作流同源：sink 用它算 push_date（告警当日限频键），防注入 now 的运行（回补/
+      // 演练）里工作流与告警行的日期口径分裂。
+      alert: buildOpsAlertSink(undefined, input.now ? () => input.now! : undefined),
       ...(input.now ? { now: input.now } : {}),
     });
   } catch (err) {

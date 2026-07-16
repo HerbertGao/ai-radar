@@ -9,7 +9,7 @@
  *
  * 三条调度链（互不嵌套、各自独立队列/worker/cron）：
  *   1. 日报      daily-digest    每日 DAILY_DIGEST_CRON（含新闻要闻段 + 产品新品段）
- *   2. 实时告警  alert-scan      每 ALERT_SCAN_CRON（默认 20min）
+ *   2. 实时告警  alert-scan      每 ALERT_SCAN_CRON（默认 4-59/15，15 分钟节奏）
  *   3. 周报      weekly-report   每周 DEFAULT_WEEKLY_CRON（每周一 09:07）
  *
  * 用法：

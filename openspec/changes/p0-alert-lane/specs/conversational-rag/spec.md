@@ -47,7 +47,7 @@ NEGATIVE   = error · 429 · retry · back off · backoff · handle · handling 
 - **MUST NOT 把 `how much` 收进共现意图词**——它已是 `SELECTION_QUERY_EXT` 的**裸词**、被本闸消费 ⇒ 含 `how much` 的提问早已由裸词命中 ⇒ 共现分支**恒不独立命中** = **死规则**（违反本规范自己的死词自检 MUST）。
 - **否定项 MUST NOT 含 `hit`**——`hit` ⊂ **`white`**：`what is Claude's rate limit for white-label apps?` 会被否定项误放行。**否定项自身同样 MUST 过子串自检**。
 
-**第四组常量 `NEGATIVE_PATTERNS`（两个出口【共同】消费，绝不可省）**：
+**第四组常量 `NEGATIVE_PATTERNS`（两个出口【共同】消费，绝不可省；与共现规则内部的否定词表 `NEG` 是两张不同的表——`NEG` 只在共现判定内部，本组横跨两出口一票否决）**：
 
 ```
 NEGATIVE_PATTERNS = rate limiter · 限流器 · 速率限制器
@@ -148,16 +148,17 @@ AND NOT ( lower(representative_title) LIKE ANY (<NEGATIVE_PATTERNS patterns>) )
 
 **过宽面是【语料】的函数，不只是词表的函数（MUST 据此定复检的触发条件）**：上表 `FACT_CHANGE_EXT` 一栏的假阳（`rate limiter` / `限流器` / `deprecated` 教程贴）**打在什么量级上，取决于 P0 车道采到的是哪些源**。故离线回放（见 realtime-alerts「P0 实时告警质量可观测」）的强制重跑触发条件 MUST 为「**改词表 _或_ 改采集源集合**之后」，MUST NOT 只写「改词表后」——本变更自己就在改采集源集合（`sitemap` 进 `REALTIME_NEWS_SOURCES`）。
 
-**LIKE 元字符禁令（MUST，且 MUST 可强制）**——词表常量 MUST NOT 含 `%`、`_`、`\`，且词表模块 MUST 在**加载时即断言**这一点（断言比测试更难被绕过：新增词的人不跑测试也会立刻炸）。理由是**同一份词表有两个出口**：P0 侧渲染成 SQL `LIKE ANY`（逐词包 `%`），advisor 侧走 TS `String.includes()`。`_` 是 LIKE 的**单字符通配符**（实测 `'gptX4 released' LIKE '%gpt_4%'` → `true`），而 TS 侧 `includes()` 把 `_` 当**字面量**——一个含 `_` 的词会让 **SQL 与 TS 两个出口静默分叉**，且没有任何测试会自然发现它。`\` 是 LIKE 的默认转义符，同禁。该断言同时保证词表**非空**，这是 P0 侧谓词函数「恒返回 `SQL`、永不返回 `undefined`」的前提。
+**LIKE 元字符禁令（MUST，且 MUST 可强制）**——词表常量 MUST NOT 含 `%`、`_`、`\`，且词表模块 MUST 在**加载时即断言**这一点（断言比测试更难被绕过：新增词的人不跑测试也会立刻炸）。理由是**同一份词表有两个出口**：P0 侧渲染成 SQL `LIKE ANY`（逐词包 `%`），advisor 侧走 TS `String.includes()`。`_` 是 LIKE 的**单字符通配符**（实测 `'gptX4 released' LIKE '%gpt_4%'` → `true`），而 TS 侧 `includes()` 把 `_` 当**字面量**——一个含 `_` 的词会让 **SQL 与 TS 两个出口静默分叉**，且没有任何测试会自然发现它。`\` 是 LIKE 的默认转义符，同禁。词表**非空** MUST 由**显式的逐组 length 断言**保证（元字符遍历对空数组恒过、担不起这个保证），这是 P0 侧谓词函数「恒返回 `SQL`、永不返回 `undefined`」的前提。
 
-**三组常量的穷举表（本文件是唯一 SOT，design / tasks MUST 引用不得抄副本）**：精确事实域的**核心词** MUST 由一处共享常量承载，被本前置闸与 realtime-alerts 的「精确事实变更」告警支路**共同消费**，MUST NOT 在两处各自维护副本（防漂移）。三组常量 MUST **逐词穷举**（不得留省略号——词表未穷举等同于两个闸的语料域未定义）：
+**词表常量的穷举表——四组裸词常量 + 一组共现规则（本文件是唯一 SOT——design / tasks 不得另立权威源；其内标注「落地快照、改 SOT 时 MUST 同步」的成员代码块是施工形态、非第二 SOT）**：精确事实域的**核心词** MUST 由一处共享常量承载，被本前置闸与 realtime-alerts 的「精确事实变更」告警支路**共同消费**，MUST NOT 在两处各自维护副本（防漂移）。全部常量组 MUST **逐词穷举**（不得留省略号——词表未穷举等同于两个闸的语料域未定义）：
 
 | 词组 | 成员（穷举） | 消费者 |
 |---|---|---|
 | **`PRECISE_FACT_CORE`**（精确事实域**取值型**短语） | `价格` `定价` `计费` `订阅费` `会员费` `pricing`；`额度` `限额` `配额` `token 包` `token　包` `token包` `token package` `quota`；`weekly limit` `用量上限` | **两侧共享** |
 | **`SELECTION_QUERY_EXT`**（提问词 / 主观词） | `多少钱` `预算` `费用` `收费` `性价比` `划算` `便宜` `套餐` `报价` `单价` `售价`；`选型` `选哪个` `推荐哪个` `怎么选`；`how much` `cost per` `per token` | **仅**本前置闸 |
 | **`FACT_CHANGE_EXT`**（新闻标题措辞 + 运维泛词） | `deprecat` `sunset` `弃用` `停止支持` `限流` `rate limit` `usage limit` `速率限制` | **仅** P0 告警支路 |
-| **`PRECISE_FACT_COOCCUR`**（**共现规则**：`NOT(否定项) ∧ 取值意图词 ∧ 事实名词`，非裸词） | **意图**（跨语言并集）：`what is` `what's` `current` `maximum` `how many`；`多少` `上限是` `最多` `最高`　**∧**　**事实名词**：`rate limit` `usage limit` `速率限制`　**∧ NOT 否定项**：`error` `429` `retry` `back off` `backoff` `handle` `handling` `maxed` `exceed` `avoid` `throttl` `怎么办` `怎么处理` `退避` `重试` `撞`。**否定项一票否决，优先于共现。**〔**MUST NOT 含**：裸 `max`（⊂ `max_tokens` / `maxed`）· `how much`（已是 `SELECTION_QUERY_EXT` 裸词 ⇒ 死规则）· `是多少`（⊂ `多少` ⇒ 死词）· 事实名词侧的 `用量上限`（已是核心裸词 ⇒ 死规则）· 否定项里的 `hit`（⊂ `white`）〕 | **仅**本前置闸 |
+| **`NEGATIVE_PATTERNS`**（器物名否定模式） | `rate limiter` `限流器` `速率限制器`（**MUST NOT 含 `rate limiting`**，裁决见上） | **两侧共享**（advisor 一票否决两分支；P0 SQL 否定合取项） |
+| **`PRECISE_FACT_COOCCUR`**（**共现规则**：`NOT(否定项) ∧ 取值意图词 ∧ 事实名词`，非裸词） | **意图**（跨语言并集）：`what is` `what's` `current` `maximum` `how many`；`多少` `上限是` `最多` `最高`　**∧**　**事实名词**：`rate limit` `usage limit` `速率限制`　**∧ NOT 否定项**：`error` `429` `retry` `back off` `backoff` `handle` `handling` `maxed` `exceed` `avoid` `throttl` `怎么办` `怎么处理` `退避` `重试` `撞`。**否定项一票否决，优先于共现。**〔**MUST NOT 含**：裸 `max`（⊂ `max_tokens` / `maxed`）· `how much`（已是 `SELECTION_QUERY_EXT` 裸词 ⇒ 死规则）· `是多少`（⊂ `多少` ⇒ 死词）· 事实名词侧的 `用量上限`（已是核心裸词 ⇒ 死规则）· 否定项里的 `hit`（⊂ `white`）〕。**`handling` MUST 与 `handle` 并存、不是死词**：`'handling'.includes('handle')` 为 **false**（handle 的 e 在 -ing 前脱落 ⇒ 'handling' 不含子串 'handle'）——删它则「current rate limit handling」这类含意图词的运维问法会被共现**误拦**（无兜底拒答）。曾有一轮按「死词」误删过，此处登记防重演。 | **仅**本前置闸 |
 
 本闸消费 `PRECISE_FACT_CORE ∪ SELECTION_QUERY_EXT` 的裸词匹配 **∪** `PRECISE_FACT_COOCCUR` 的共现匹配；P0 告警支路消费 `PRECISE_FACT_CORE ∪ FACT_CHANGE_EXT`（**纯裸词，不消费共现规则**——其 SQL `LIKE ANY` 谓词形态由 realtime-alerts 定死）。
 
@@ -216,5 +217,5 @@ AND NOT ( lower(representative_title) LIKE ANY (<NEGATIVE_PATTERNS patterns>) )
 - **那么** 判定结果**逐条不变**（仍命中 `性价比` / `划算` / `how much`）——`isPriceOrSelectionQuery` 是 `some(kw => q.includes(kw))`，更短的词先满足，死词永不独立命中
 
 #### 场景:含 LIKE 元字符的词在模块加载时即被拒
-- **当** 有人向三组常量中任一组加入含 `%`、`_` 或 `\` 的词
-- **那么** 词表模块**加载即抛错**（不是等测试跑到）——`_` 在 SQL `LIKE` 侧是单字符通配符、在 TS `includes()` 侧是字面量，两个出口会就此**静默分叉**；该断言同时保证词表非空，是 P0 侧谓词恒返回 `SQL`（而非 `undefined`）的前提
+- **当** 有人向任一组词表常量（含 `NEGATIVE_PATTERNS` 与共现三表）加入含 `%`、`_` 或 `\` 的词
+- **那么** 词表模块**加载即抛错**（不是等测试跑到）——`_` 在 SQL `LIKE` 侧是单字符通配符、在 TS `includes()` 侧是字面量，两个出口会就此**静默分叉**；模块加载断言同时含**逐组非空**检查（空数组对元字符循环恒过），是 P0 侧谓词恒返回 `SQL`（而非 `undefined`）的前提

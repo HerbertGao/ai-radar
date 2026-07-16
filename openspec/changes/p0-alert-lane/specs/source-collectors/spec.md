@@ -66,12 +66,12 @@
 
 **支路 1 只接日报链**：高频告警链有意不做系统级故障告警（空轮是常态，防刷屏），本条不改该口径。支路 2 在采集器内部，两条链调用都会 throw，其告警由源级健康告警统一限频（同 `dedupKey`、当天只响一次）。
 
-**源级健康告警（MUST，本需求修改点）**：日报链 MUST 对本轮 `perSource.ok = false` 的**每一个源**各发一条告警（`dedupKey = 'source-health:<source>'`，per-source ——否则多源同时坏会塌成一条）。**本条不是锦上添花**：`perSource` 今天**由 registry 产出、却无任何消费者**，源失败只落 `logError` + `console.error` ⇒ 本需求里「`loc_count = 0` → throw → **计入告警**」这句话、以及上面支路 2 的整条链路，**在没有本条时全部落空**。
+**源级健康告警（MUST）**：日报链 MUST 对本轮 `perSource.ok = false` 的**每一个源**各发一条告警（`dedupKey = 'source-health:<source>'`，per-source ——否则多源同时坏会塌成一条）。**该日报链告警已由 `fix-sitemap-published-at` 落地**（`run-daily-workflow.ts:526` 消费循环 + 生产 `run(ctx)` 注入 `buildOpsAlertSink`）——本需求**只在其上追加高频链**（见下）。没有任何源级告警消费者时，本需求里「`loc_count = 0` → throw → **计入告警**」这句话、以及上面支路 2 的整条链路会落空；**日报链侧此洞已补**，高频链侧由下条补。
 
 **高频实时链 MUST 同样消费 `perSource`（本需求修改点，在上一条之上【追加】而非替换）**：`sitemap` 纳入实时子集后（见下「实时子集归属」），高频链每天跑 72–96 轮；若只有日报链发源级告警，站点改版把某源打成结构性失败时，本车道会**静默丢掉该源最长 24 小时**——而 ≤20min 的采集延迟正是本车道唯一收益。两条链 MUST **共用同一个判定与同一个 `dedupKey`**：
 
-- 告警 MUST 经 platform-foundation 的**运维告警 sink**（`createOpsAlertSink`，见「运维告警落真实通道并由 DB 唯一约束限频」）落**真实通道**，**MUST NOT 只落 stderr 后继续吞**；
-- **限频状态 MUST 住在推送幂等的 DB 唯一约束里**（`UNIQUE(target_type, target_id, channel, push_date)`）：`ON CONFLICT DO NOTHING` 命中 0 行 ⇒ 今天已就该源告过 ⇒ 直接 return。⇒ **零新状态、跨进程、跨重启、跨两条链自动去重**（高频链每天 72–96 轮、故障源每轮都 throw ⇒ 第一轮告警，其余 71–95 轮命中唯一键冲突而跳过；两条链共用 `dedupKey` ⇒ **不会双响**）。**MUST NOT 用 Redis 键或进程内 Map** 承载限频 / 「连续 N 轮」计数——进程内 Map 每次 redeploy 复位 ⇒ 计数永不达标 ⇒ **静默不告警，比刷屏更糟**；
+- 告警 MUST 经 platform-foundation 的**运维告警 sink**（`createOpsAlertSink`，见「运维告警落真实通道并由 DB 唯一约束限频」）落**真实通道**，**MUST NOT 只落 stderr 后继续吞**；判定与日报链**共用同一个共享谓词**（含既有的良性限流豁免——arXiv/PH 的 429 退避不告警）；
+- **限频状态 MUST 住在推送幂等的 DB 唯一约束里**（`UNIQUE(target_type, target_id, channel, push_date)`）：判据 = **仅 `status='success'` 行算今天已就该源告过**（`ON CONFLICT DO UPDATE … WHERE status <> 'success'`，权威见 platform-foundation；**MUST NOT 写成 `ON CONFLICT DO NOTHING`**——失败残行会挡死当天重试 = 当天彻底哑火）⇒ **零新状态、跨进程、跨重启、跨两条链自动去重**（首个 success 轮后其余轮跳过、发送失败不占名额可重试；两条链共用 `dedupKey`）。**MUST NOT 用 Redis 键或进程内 Map** 承载限频 / 「连续 N 轮」计数——进程内 Map 每次 redeploy 复位 ⇒ 计数永不达标 ⇒ **静默不告警，比刷屏更糟**；
 - **日报链那一份 MUST NOT 因「高频链已发」而被省掉**：整条 P0 车道的回滚路径是 `ALERT_SCAN_ENABLED=false`（worker 完全跳过告警链）⇒ 只把源级告警放在高频链，**一回滚唯一的告警出口就随之消失**；
 - **MUST NOT 套用日报的「全源返回 0」系统级告警**——高频链空轮是常态，那道闸会每天数十次误告警。这两条是**不同判据**（前者判「整轮全挂」，后者判「某一个源结构性失败」），「不做全源 0 告警」MUST NOT 被扩大为「不做源级健康告警」。
 
@@ -146,8 +146,8 @@ sitemap 与文章 HTML 的解析 MUST 用确定性方式（如正则提取 `<loc
 
 #### 场景:源级健康告警对每个失败源各响一条
 - **当** 本轮采集中有一个或多个源失败（`perSource.ok = false`，含 `loc_count=0` 与「窗内有候选零发射」两种 throw）
-- **那么** 日报链对**每一个**失败源各发一条告警（`dedupKey = 'source-health:<source>'`，per-source——绝不可把多个失败源塌成一条）。**没有本条，`perSource` 就是一个没有消费者的结构**（今天正是如此：源失败只落 `logError`），上面所有「throw → 计入告警」的链路全部落空
-- **且** **高频实时链同样消费 `perSource`**、用**同一个判定与同一个 `dedupKey`** 发告警：经 `createOpsAlertSink` 落真实通道，限频由推送幂等唯一约束 `UNIQUE(target_type, target_id, channel, push_date)` 承载（今日已告过即命中冲突跳过 ⇒ 跨进程 / 跨重启 / 跨两条链自动去重，**不双响**；高频链每天 72–96 轮只发第一轮）。**两条链都发**是因为整条 P0 车道的回滚路径是 `ALERT_SCAN_ENABLED=false`——只放高频链，一回滚出口即消失；只放日报链，本车道会静默丢源最长 24 小时。**绝不可**改用 Redis 键或进程内 Map 限频（redeploy 复位 ⇒ 永不达标 ⇒ 静默不告警），**亦绝不可**套用日报的「全源返回 0」系统级告警（高频链空轮是常态）
+- **那么** 日报链对**每一个**失败源各发一条告警（`dedupKey = 'source-health:<source>'`，per-source——绝不可把多个失败源塌成一条）。**没有本条，`perSource` 就是一个没有消费者的结构**（`fix-sitemap-published-at` 落地前正是如此：源失败只落 `logError`；该前置已为日报链兑现本条，高频链侧由本变更补齐），否则上面所有「throw → 计入告警」的链路全部落空
+- **且** **高频实时链同样消费 `perSource`**、用**同一个判定与同一个 `dedupKey`** 发告警：经 `createOpsAlertSink` 落真实通道，限频由推送幂等唯一约束承载、判据为**仅 `status='success'` 行算今日已告过**（`DO UPDATE … WHERE status <> 'success'`，失败不占名额可重试；高频链每天 72–96 轮，首个 success 轮后跳过）。**两条链都发**是因为整条 P0 车道的回滚路径是 `ALERT_SCAN_ENABLED=false`——只放高频链，一回滚出口即消失；只放日报链，本车道会静默丢源最长 24 小时。**绝不可**改用 Redis 键或进程内 Map 限频（redeploy 复位 ⇒ 永不达标 ⇒ 静默不告警），**亦绝不可**套用日报的「全源返回 0」系统级告警（高频链空轮是常态）
 
 #### 场景:已见集查询失败时整源失败、不全量重抓
 - **当** 「DB 已见集」查询（`SELECT canonical_url WHERE source='sitemap'`）因 DB 不可达/超时失败
@@ -180,7 +180,7 @@ sitemap 与文章 HTML 的解析 MUST 用确定性方式（如正则提取 `<loc
 
 **词表支路本期不附加 source 谓词（本期决定，非永久禁令）**：`ai_news_events` 的 source 全集当前**恰等于** `REALTIME_NEWS_SOURCES`，故源级谓词今天筛掉 0 行、加了是空操作——本期不加。**但这个等式是两处独立手工维护的字面量之间的巧合，不是被守护的不变量。**
 
-**前向守卫的触发谓词 MUST 按事件塌缩的【实际闸】写，MUST NOT 写成「产出 `raw_type='news'` 的源」**：事件塌缩的候选闸是**黑名单**而非白名单——`src/dedup/collapse.ts:327-329` 为 `raw_type IS DISTINCT FROM 'product' / 'paper' / 'experience'`，且 `raw_items.raw_type` **可空**（`src/db/schema.ts:83` 无 `.notNull()`），`IS DISTINCT FROM` 正是为**有意放行 NULL** 而选（`NULL NOT IN (...)` 求值为 NULL 会放行，注释明写）。故触发谓词 MUST 为：
+**前向守卫的触发谓词 MUST 按事件塌缩的【实际闸】写，MUST NOT 写成「产出 `raw_type='news'` 的源」**：事件塌缩的候选闸是**黑名单**而非白名单——`src/dedup/collapse.ts:445-447` 为 `raw_type IS DISTINCT FROM 'product' / 'paper' / 'experience'`，且 `raw_items.raw_type` **可空**（`src/db/schema.ts:85` 无 `.notNull()`），`IS DISTINCT FROM` 正是为**有意放行 NULL** 而选（`NOT IN` 对 NULL 求值为 UNKNOWN、在 WHERE 里会把 NULL 行**排除**——要放行 NULL 只能用 `IS DISTINCT FROM`，注释明写）。故触发谓词 MUST 为：
 
 > 任何人新增一个源，其产出的 `raw_type` **不在事件塌缩排除集 `{product, paper, experience}` 内**（**含 `raw_type` 为 NULL / 未设置**），却没同步把该源加进 `REALTIME_NEWS_SOURCES`，等式即被打破，该源条目会进 `ai_news_events`、**直接取得词表支路的 P0 资格**——一条从未为 P0 审过的源，一命中就是一次手机震动。
 

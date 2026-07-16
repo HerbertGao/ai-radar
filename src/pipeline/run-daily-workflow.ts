@@ -35,10 +35,9 @@ import {
   type CollectAllOptions,
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
-import { ArxivRateLimitError } from '../collectors/arxiv.js';
-import { ProductHuntRateLimitError } from '../collectors/product-hunt.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
 import { buildOpsAlertSink, consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
+import { isBenignRateLimit } from './source-health.js';
 import {
   semanticMergeEvents,
   type SemanticMergeOptions,
@@ -136,19 +135,9 @@ export { type AlertDetail, type AlertSink } from './ops-alert-sink.js';
 // 未注入真 sink 时回落 stderr。生产装配路径（run()）注入 buildOpsAlertSink()。
 const defaultAlert: AlertSink = consoleAlertSink;
 
-/**
- * 该源失败是否为「良性限流退避」——429 退避达上限、本轮放弃。arxiv/Product Hunt 把它设计为隔离、
- * 不告警的正常背压事件（周期性发生）。源级健康告警据此豁免，只对【异常】失败告警（sitemap 静默死亡
- * 那类）；真正的源死亡（连续多日零新增）由 source-staleness 兜底。cause 链也查（withRetry 可能包一层）。
- */
-function isBenignRateLimit(error: unknown): boolean {
-  let e: unknown = error;
-  for (let depth = 0; e instanceof Error && depth < 5; depth += 1) {
-    if (e instanceof ArxivRateLimitError || e instanceof ProductHuntRateLimitError) return true;
-    e = e.cause;
-  }
-  return false;
-}
+// 良性限流豁免谓词已提为共享叶子（./source-health.ts，p0-alert-lane C1.3）：高频告警链
+// （alert-scan.ts）与本日报链对 perSource.ok=false 用**同一个判定与同一个 dedupKey**，
+// 共享是防两链判定静默漂移的结构要求（行为零变化——函数体逐字迁移）。
 
 /** 工作流被熔断中止时抛出的信号（编排层据此让 BullMQ job 失败/重试）。 */
 export class WorkflowAbortError extends Error {
@@ -664,6 +653,11 @@ export async function runDailyWorkflow(
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。
     //    **正文补全已折进判分入口**（scoreUnscoredEvents 在 claim 之后、judge 之前逐条补全并把正文送入本次
     //    判分）——日报链不再有独立的补全阶段；补全命中/失败数由 judgeResult 返回、并入下面这条日志。
+    //    **日报链 MUST 不传 maxPerRun、保持全量无界（p0-alert-lane A5.2 / design D11）**，两个理由缺一不可：
+    //    ① 一天一次，无界是它的正确形态；② 它是告警链 `first_seen_at DESC` 取序**不饿死老事件**的唯一
+    //    依据——老的未评分事件过不了告警闸的时效地板（判了也不告警，告警链花预算在它们身上是纯浪费），
+    //    由本处的无界判分在 ≤24h 内排空。**将来给本调用也加预算前，MUST 先重新论证告警链的非饥饿性**
+    //    ——顺手加一个界，积压就永久饿死了（回归钉见 run-daily-workflow.integration.test.ts A5.2b 用例）。
     emit('stage.score');
     const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
     const judgeStage: StageDegrade = {

@@ -10,6 +10,7 @@
  */
 import { Queue, Worker, type ConnectionOptions, type Job } from 'bullmq';
 import { env } from '../config/env.js';
+import { DEFAULT_WEEKLY_CRON } from '../config/weekly-cron.js';
 import { buildConnection } from './queue.js';
 import { makeLocalCtx } from './run-context.js';
 import {
@@ -17,16 +18,11 @@ import {
   type RunWeeklyReportResult,
 } from './weekly-report.js';
 
-/**
- * 周报默认 cron（BullMQ repeat.pattern）：每周一 09:07（Asia/Shanghai）。
- * **分钟字段避整点/半点（∉ {0,30}）**降低飞书限流（同日报 DAILY_DIGEST_CRON 默认意图）；
- * 周一触发使汇总窗口恰为「刚结束的完整一周」（上周一→本周一）。
- *
- * 注：周报 cron 配置未引入新 env（本组文件归属边界禁改 config/env.ts）；用本常量作默认，
- * 可经 scheduleWeeklyReport 的 cron/tz 参数覆盖（wiring 层注入）。cron 时区默认与 push_date
- * 同源 Asia/Shanghai，防触发时区与汇总周口径漂移。
- */
-export const DEFAULT_WEEKLY_CRON = '7 9 * * 1';
+// 周报默认 cron 常量本体已提为零依赖叶子 src/config/weekly-cron.ts（p0-alert-lane A1.3）：
+// 「飞书 cron 避整点」守卫（env.test.ts）须直接 import 该常量做展开断言、禁抄字面量副本，
+// 而本 driver 文件 top-level import bullmq，纯函数守卫测试不宜拖入其依赖图。
+// 此处 re-export 保持既有导入路径（'./weekly-queue.js'）不变。
+export { DEFAULT_WEEKLY_CRON };
 /** 周报 cron 时区（与 push_date 同源 Asia/Shanghai，防漂移）。 */
 export const DEFAULT_WEEKLY_CRON_TZ = 'Asia/Shanghai';
 

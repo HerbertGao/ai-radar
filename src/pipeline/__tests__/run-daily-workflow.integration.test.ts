@@ -43,7 +43,9 @@ function runDailyWorkflow(options: RunDailyWorkflowOptions = {}) {
 // 产品段零件模块（供 vi.spyOn 注入塌缩/候选桩，验证日报产品段编排：塌缩只调一次、候选失败降级等）。
 const productDigestModule = await import('../product-digest.js');
 // 已校验 env（可变对象，非 frozen）：6.1 off-switch 用例临时改 SEMANTIC_DEDUP_ENABLED 后还原。
-const { env } = await import('../../config/env.js');
+// ALERT_JUDGE_MAX_PER_RUN：告警链判分预算 N（p0-alert-lane A5）——A5.2b 回归钉直接 import 真值，
+// 断言其 fixture 条数 > N（禁抄字面量副本，常量变了用例跟着红）。
+const { env, ALERT_JUDGE_MAX_PER_RUN } = await import('../../config/env.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
@@ -3011,5 +3013,40 @@ describe('回归护栏：日报链不再独立编排补全（unify-judge-stage 6
     expect(src).not.toMatch(/from ['"]\.\/content-enrichment/);
     expect(src).not.toContain('enrichCandidateContent');
     expect(src).not.toContain('enrichRawItemContent');
+  });
+});
+
+describe.skipIf(!canRun)('回归钉：日报链判分保持全量无界（p0-alert-lane A5.2b）', () => {
+  it('6 条未评分事件（> 告警预算 N）→ 日报链一轮全部判完（不截断）', async () => {
+    // 这是**唯一**能证伪「有人把预算 N 写成 scoreUnscoredEvents 缺省值 / 顺手给日报链传 maxPerRun」
+    // 的用例：条数 ≤ N 的 fixture 在两条链上行为逐字相同、恒绿。6 > ALERT_JUDGE_MAX_PER_RUN ⇒ 日报链
+    // 一旦被截断，本用例立红（要闻段枯竭 + 告警链非饥饿论证坍塌，见 run-daily-workflow.ts 阶段 3 注释）。
+    expect(6).toBeGreaterThan(ALERT_JUDGE_MAX_PER_RUN); // fixture 条数必须压在预算之上，常量变了此处先红。
+    const items = Array.from({ length: 6 }, (_, i) =>
+      item({
+        id: `unbounded-${i + 1}`,
+        url: `https://ex.com/unbounded-${i + 1}`,
+        title: `Unbounded ${i + 1}`,
+      }),
+    );
+    const sender = okSender();
+    const result = await runDailyWorkflow({
+      now: NOW,
+      dbh: db!,
+      collect: { collectors: collectorsReturning(items) },
+      judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
+      digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
+      sender,
+      channels: ['telegram'],
+      lock: LOCK_OPTS,
+      alert: vi.fn(),
+    });
+    // 判分分母 = 6：全量送判、无截断（被截断时 processed 只会是 N）。
+    expect(result.judge).toEqual({ processed: 6, degraded: 0 });
+    // 落库面证据：6 条全被写分（importance 非 NULL 恰为 6，不多不少）。
+    const { rows } = await pool!.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM ai_news_events WHERE importance_score IS NOT NULL`,
+    );
+    expect(rows[0]!.n).toBe('6');
   });
 });
