@@ -8,8 +8,10 @@
  *
  * registry 支持**按 source 筛选子集**（`collectSources(registry, allowed)`）。三视图（design D6）：
  *   - **全集**（`collectAllSources` / `buildRegistry` 全量）：日报工作流采全部已注册源（含 arXiv 仅沉淀）。
- *   - **实时新闻子集** `REALTIME_NEWS_SOURCES = {rss, hacker_news, github}`：实时告警高频链只调这三源
- *     （避免高频链被迫连 arXiv 非实时 / PH 配额受限一起跑，见 realtime-alerts）。
+ *   - **实时新闻子集** `REALTIME_NEWS_SOURCES = {rss, hacker_news, github, sitemap}`：实时告警高频链
+ *     只调这四源（避免高频链被迫连 arXiv 非实时 / PH 配额受限一起跑，见 realtime-alerts）。sitemap 进
+ *     此子集的成本形状已被其增量语义摊薄：「DB 已见集」去重在 per-article fetch **之前** +
+ *     first-fetch-wins ⇒ **稳态每轮 = 1 次 sitemap.xml GET + 1 次已见集查询**（p0-alert-lane 阶段 C）。
  *   - **产品源子集** `PRODUCT_SOURCES = {product_hunt, show_hn}`：product-digest 产品发现链采全部产品源
  *     → 紧接同链产品塌缩（链路显式闭合，见 product-discovery / design D6）。
  * 两子集均为手工维护的字面量，**有意不归属任一子集的源**（如 arXiv 仅日报全集沉淀、无实时/产品消费）。
@@ -167,8 +169,14 @@ export function buildRegistry(
 }
 
 /**
- * 实时新闻源子集（design D6 / realtime-alerts）：高频告警链路只采这三源
+ * 实时新闻源子集（design D6 / realtime-alerts / p0-alert-lane 阶段 C）：高频告警链路只采这四源
  * （排除 arXiv 非实时、Product Hunt 配额受限）。供 `collectSources` 按 source 过滤复用。
+ *
+ * **`sitemap` 在此子集（p0-alert-lane C1.1）**：纳入买到的是**采集延迟**（≤24h → ≤20min），不是
+ * 告警资格——告警候选谓词无 source 条件，sitemap 事件经日报全量采集本就具备告警资格。原排除理由
+ * 「per-article fetch 较重」已被采集器自身的增量语义摊薄：「DB 已见集」去重在 per-article fetch
+ * **之前** + first-fetch-wins（同一文章一生只 fetch 一次 HTML）⇒ **稳态每轮成本 = 1 次
+ * sitemap.xml GET + 1 次已见集查询**，per-article fetch 仅在新文章出现时发生、不随轮次增长。
  *
  * **维护对称性（前向脆弱护栏，design D6）**：本子集与 `PRODUCT_SOURCES`（见下）均为手工维护的
  * `CollectorSource[]` 字面量，与 `buildRegistry` 源全集独立。新增源（如非目标里预告的 Reddit）须显式
@@ -182,6 +190,7 @@ export const REALTIME_NEWS_SOURCES: readonly CollectorSource[] = [
   'rss',
   'hacker_news',
   'github',
+  'sitemap',
 ];
 
 /**
@@ -242,7 +251,7 @@ export async function runRegistry(
 
 /**
  * 按 source 筛选 registry 的子集后并发采集（design D1 / D6）：
- * 供实时告警高频链路只调 `{rss, hacker_news, github}`、日报工作流调全集。
+ * 供实时告警高频链路只调 `{rss, hacker_news, github, sitemap}`、日报工作流调全集。
  * `allowed` 中不在 registry 的 source 被忽略；空交集 → 跑空集（perSource 为空）。
  */
 export async function collectSources(

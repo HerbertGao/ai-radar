@@ -35,6 +35,7 @@ import {
   type RunWeeklyReportOptions,
   type RunWeeklyReportResult,
 } from '../weekly-report.js';
+import { consoleAlertSink } from '../ops-alert-sink.js';
 
 /** 收集 emit 落的 kind 序列（makeLocalCtx.emit → logger.info({ event: kind, ... })）。 */
 function spyCtx(input?: unknown) {
@@ -155,6 +156,21 @@ describe('alert/weekly run(ctx)：ctx→options 映射（emit/now，补齐 daily
     expect(r).toBe(okWeeklyResult);
     expect(captured?.emit).toBe(ctx.emit); // emit: ctx.emit
     expect(captured?.now).toBe(now); // now: ctx.input.now
+  });
+
+  it('alert run(ctx) 生产装配：注入非 consoleAlertSink 的运维告警 sink（buildOpsAlertSink 产物）（C2.7②）', async () => {
+    // 唯一能证伪「alert 字段加了、线没接」的断言（p0-alert-lane C1.3/C2.7，与日报链 run(ctx) 注入同型）：
+    // 源级健康告警的单测自己注入 sink ⇒ 无论生产接没接线那些用例都恒绿；只有本用例证明核心从 run(ctx)
+    // 拿到的是真装配产物、不是 stderr 回落。buildOpsAlertSink 惰性构造真实 sender（首次真告警才装配）
+    // ⇒ 本断言不触发任何真实发送器构造（无 VITEST 守卫冲突、无真发风险）。
+    const ctx = makeLocalCtx({ trigger: 'alert-scan' });
+    let captured: RunAlertScanOptions | undefined;
+    await runAlert(ctx, async (opts: RunAlertScanOptions = {}) => {
+      captured = opts;
+      return okAlertResult;
+    });
+    expect(typeof captured?.alert).toBe('function');
+    expect(captured?.alert).not.toBe(consoleAlertSink);
   });
 });
 

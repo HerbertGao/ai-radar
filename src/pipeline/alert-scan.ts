@@ -3,7 +3,9 @@
  *
  * 一个**独立于 runDailyWorkflow** 的高频轻量工作流（独立 BullMQ 调度入口，频率 env 可配，
  * 默认 4-59/15，15 分钟节奏）。纯顺序确定性流：
- *   采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv 非实时 / PH 配额受限）
+ *   采集（**只跑实时新闻源 {rss, hacker_news, github, sitemap}**，排除 arXiv 非实时 / PH 配额受限；
+ *     sitemap 的稳态每轮成本 = 1 次 sitemap.xml GET + 1 次已见集查询——已见集去重在 per-article
+ *     fetch 之前 + first-fetch-wins，见 collectors/index.ts 的 REALTIME_NEWS_SOURCES 注释）
  *   → 入库 → 去重塌缩
  *   → 对未评分事件评分（与日报链共用 scoreUnscoredEvents，含并发原子 claim 防双评分）
  *   → **评分后**判告警闸 `importance_score IS NOT NULL AND is_ai_related = true AND >= 阈值`
@@ -29,7 +31,10 @@
  *   判断/事件合并）或 runKbIngestion——语义层与 KB 入库**仅日报链**执行。日报链合并产生的 tombstone
  *   仍存于库，故 selectAlertCandidates 仍须排除 `merged_into IS NOT NULL`（已加，组 4.7），但本链不**产生**合并。
  * - **高频链路不套用日报「全源 0」系统级告警**：高频轮询全源 0 / 空轮是常态，本工作流**不调**
- *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。
+ *   classifySystemFailure（否则每天数十次误告警刷屏，见 daily-intel-pipeline）。**但「不做全源 0
+ *   告警」不蕴含「不做源级健康告警」**（p0-alert-lane C1.3 / design D11②）：两条判据不同（前者判
+ *   「整轮全挂」，后者判「某一个源结构性失败」）——本链与日报链都消费 perSource，对 ok=false 的
+ *   结构性失败发 dedupKey='source-health:<source>' 告警（共用同一个判定与同一个 dedupKey，见阶段 1）。
  * - **独立四元组**：`target_type='alert'`、`target_id=event_id`、`push_date=触发当日(Asia/Shanghai)`，
  *   与日报 `event` 互不挤占（日报已推同一事件不吞掉告警）。
  * - **一生一次去重**：候选「该 event_id 从未以该 channel success 告警过」管跨天；
@@ -74,6 +79,12 @@ import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
 import { alertGatePredicate } from './alert-gate.js';
+import {
+  buildOpsAlertSink,
+  consoleAlertSink,
+  type AlertSink,
+} from './ops-alert-sink.js';
+import { isBenignRateLimit } from './source-health.js';
 import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 import type { RunContext } from './run-context.js';
@@ -116,6 +127,13 @@ export interface RunAlertScanOptions {
   digest?: SummarizeOptions;
   /** 运行期日志 sink（默认 console.error）。 */
   log?: AlertLogSink;
+  /**
+   * 运维告警出口（源级健康告警，p0-alert-lane C1.3 / design D11②）：对本轮 perSource.ok=false 的
+   * 结构性失败发 dedupKey='source-health:<source>' 告警。未注入回落 stderr 的 consoleAlertSink
+   * （不静默）；**生产由本文件的 run(ctx) 包装注入 buildOpsAlertSink**（与日报链
+   * run-daily-workflow.ts 的 run() 同型）——只加字段不接线等于把注入口留给测试自己填。
+   */
+  alert?: AlertSink;
   /**
    * 发布时间回填阶段的推断选项（透传给 backfillPublishedAt 的 `infer`）。
    * 注入 mock generateObjectFn / maxAttempts 等，使测试控制推断结果、不依赖真实 LLM。
@@ -325,7 +343,7 @@ function resolveChannelSenders(
 /**
  * 跑一次实时告警高频扫描（纯顺序）。
  *
- * @param options 注入点（now / db / collect mock / judge mock / threshold / channels / senders / lock / log）。
+ * @param options 注入点（now / db / collect mock / judge mock / threshold / channels / senders / lock / log / alert）。
  */
 export async function runAlertScan(
   options: RunAlertScanOptions = {},
@@ -333,6 +351,8 @@ export async function runAlertScan(
   const now = options.now ?? new Date();
   const dbh = options.dbh ?? defaultDb;
   const log = options.log ?? defaultLog;
+  // 源级健康告警出口（C1.3）：未注入回落 stderr 的 consoleAlertSink（不静默）；生产由 run(ctx) 注入。
+  const alert = options.alert ?? consoleAlertSink;
   const threshold = options.threshold ?? env.ALERT_IMPORTANCE_THRESHOLD;
   const windowDays = options.windowDays ?? env.ALERT_FIRST_SEEN_WINDOW_DAYS;
   const maxPerScan = options.maxPerScan ?? env.ALERT_MAX_PER_SCAN;
@@ -340,8 +360,11 @@ export async function runAlertScan(
   const emit = options.emit ?? (() => {});
   const pushDate = getPushDate(now);
 
-  // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv/PH）+ 入库。
+  // ── 阶段 1：采集（**只跑实时新闻源 {rss, hacker_news, github, sitemap}**，排除 arXiv/PH）+ 入库。
   // 高频链路全源 0 / 空轮是常态：**不**调 classifySystemFailure 做系统级告警（防刷屏）。
+  // sitemap 进本子集（p0-alert-lane 阶段 C）买到的是采集延迟（≤24h → ≤20min）、不是告警资格；
+  // 其成本形状被增量语义摊薄：已见集去重在 per-article fetch **之前** + first-fetch-wins ⇒
+  // 稳态每轮 = 1 次 sitemap.xml GET + 1 次已见集查询（见 collectors/index.ts）。
   emit('stage.collect');
   const collected = await collectSources(REALTIME_NEWS_SOURCES, {
     ...options.collect,
@@ -349,6 +372,26 @@ export async function runAlertScan(
   const collectedCount = collected.items.length;
   await storeCollectedItems(collected.items, { dbh });
   log(`实时源采集: 返回 ${collectedCount} 条（仅 ${REALTIME_NEWS_SOURCES.join('/')}）`);
+
+  // ── 源级健康告警（p0-alert-lane C1.3 / design D11②，与日报链 run-daily-workflow.ts 的消费循环
+  //    **同一个判定与同一个 dedupKey**）：对本轮 perSource.ok=false 的**结构性失败**（sitemap 的
+  //    loc_count=0 → 整源 throw 即典型）发 dedupKey='source-health:<source>'（per-source，多源同时
+  //    坏不塌成一条）。良性限流豁免经共享谓词 isBenignRateLimit（arXiv/PH 的 429 退避是设计内背压，
+  //    不告警——共享防两链判定静默漂移）。限频由 createOpsAlertSink 内部的 push_records 唯一约束承载
+  //    （仅 status='success' 行算「今天已告过」：本链每天 72–96 轮，首个 success 轮后其余轮跳过；
+  //    发送失败置 failed 不占名额、可重试——跨进程、跨重启、跨两条链共用同一判据，非进程内状态）。
+  //    **日报链那一份不可删**：整条车道的回滚路径是 ALERT_SCAN_ENABLED=false，只留本链则一回滚
+  //    唯一的告警出口随之消失；共用 dedupKey ⇒ 两条链经同一唯一键自动互相去重、不双响。
+  for (const [source, ps] of Object.entries(collected.perSource)) {
+    if (ps && ps.ok === false && !isBenignRateLimit(ps.error)) {
+      log(`告警: 采集源失败 source=${source}`);
+      await alert(`采集源失败：${source}`, {
+        dedupKey: `source-health:${source}`,
+        source,
+        error: ps.error, // sink 沿 cause 链摘要真正的故障原因。
+      });
+    }
+  }
 
   // ── 阶段 2：去重塌缩（与日报链共用 collapseUncollapsedRawItems，按 collapsed 标记驱动、幂等）。
   emit('stage.dedup');
@@ -560,6 +603,13 @@ export async function run(
   try {
     return await core({
       emit: ctx.emit,
+      // 生产装配的运维告警出口（源级健康告警，p0-alert-lane C1.3）：与日报链 run(ctx) 同型
+      // （run-daily-workflow.ts run()）。不注入则核心回落 consoleAlertSink：告警只进 stderr、
+      // 没人会被叫醒。用 buildOpsAlertSink（自发现并懒构造生产通道——首次真告警才装配，桩核心
+      // 单测不触发真实发送器构造）而非裸 createOpsAlertSink（后者需预构造 senders map）。
+      // `now` 与工作流同源：sink 用它算 push_date（告警当日限频键），防注入 now 的运行（回补/
+      // 演练）里工作流与告警行的日期口径分裂。
+      alert: buildOpsAlertSink(undefined, input.now ? () => input.now! : undefined),
       ...(input.now ? { now: input.now } : {}),
     });
   } catch (err) {

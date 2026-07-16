@@ -35,10 +35,9 @@ import {
   type CollectAllOptions,
 } from '../collectors/index.js';
 import { createLookbackArxivCursorStore } from '../collectors/arxiv-cursor.js';
-import { ArxivRateLimitError } from '../collectors/arxiv.js';
-import { ProductHuntRateLimitError } from '../collectors/product-hunt.js';
 import { collapseUncollapsedRawItems } from '../dedup/collapse.js';
 import { buildOpsAlertSink, consoleAlertSink, type AlertSink } from './ops-alert-sink.js';
+import { isBenignRateLimit } from './source-health.js';
 import {
   semanticMergeEvents,
   type SemanticMergeOptions,
@@ -136,19 +135,9 @@ export { type AlertDetail, type AlertSink } from './ops-alert-sink.js';
 // 未注入真 sink 时回落 stderr。生产装配路径（run()）注入 buildOpsAlertSink()。
 const defaultAlert: AlertSink = consoleAlertSink;
 
-/**
- * 该源失败是否为「良性限流退避」——429 退避达上限、本轮放弃。arxiv/Product Hunt 把它设计为隔离、
- * 不告警的正常背压事件（周期性发生）。源级健康告警据此豁免，只对【异常】失败告警（sitemap 静默死亡
- * 那类）；真正的源死亡（连续多日零新增）由 source-staleness 兜底。cause 链也查（withRetry 可能包一层）。
- */
-function isBenignRateLimit(error: unknown): boolean {
-  let e: unknown = error;
-  for (let depth = 0; e instanceof Error && depth < 5; depth += 1) {
-    if (e instanceof ArxivRateLimitError || e instanceof ProductHuntRateLimitError) return true;
-    e = e.cause;
-  }
-  return false;
-}
+// 良性限流豁免谓词已提为共享叶子（./source-health.ts，p0-alert-lane C1.3）：高频告警链
+// （alert-scan.ts）与本日报链对 perSource.ok=false 用**同一个判定与同一个 dedupKey**，
+// 共享是防两链判定静默漂移的结构要求（行为零变化——函数体逐字迁移）。
 
 /** 工作流被熔断中止时抛出的信号（编排层据此让 BullMQ job 失败/重试）。 */
 export class WorkflowAbortError extends Error {

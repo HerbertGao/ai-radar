@@ -479,7 +479,7 @@ describe('collectAllSources / registry：单源失败不拖垮整批', () => {
 });
 
 describe('collectSources：按 source 筛选子集（实时新闻源）', () => {
-  it('只跑 {rss, hacker_news, github}，不触 arXiv', async () => {
+  it('只跑 {rss, hacker_news, github, sitemap}，不触 arXiv', async () => {
     const arxivSpy = vi.fn(async () => []);
     const result = await mod.collectSources(mod.REALTIME_NEWS_SOURCES, {
       logError: () => {},
@@ -488,6 +488,9 @@ describe('collectSources：按 source 筛选子集（实时新闻源）', () => 
         hackerNews: async () => [hnItem],
         github: async () => [],
         arxiv: arxivSpy,
+        // sitemap 在实时子集（p0-alert-lane C1.1）：不注入桩则 buildRegistry 回退真实
+        // collectSitemaps → 真发 HTTP 到 SITEMAP_SOURCES（默认 Anthropic）。
+        sitemap: async () => [],
       },
     });
     // arXiv 不在子集 → 其 collector 从未被调用（高频链路不被迫连 arXiv 跑）。
@@ -496,17 +499,26 @@ describe('collectSources：按 source 筛选子集（实时新闻源）', () => 
       'github',
       'hacker_news',
       'rss',
+      'sitemap',
     ]);
     expect(result.perSource.arxiv).toBeUndefined();
   });
 });
 
-describe('子集意图负向断言（MINOR-2）：两新源不进实时/产品子集', () => {
-  it('REALTIME_NEWS_SOURCES 不含 hugging_face_papers / sitemap（非实时）', () => {
+describe('子集意图断言：sitemap 进实时子集（p0-alert-lane 阶段 C）、不进产品子集', () => {
+  it('REALTIME_NEWS_SOURCES 含 sitemap（压采集延迟 ≤20min）；仍不含 arxiv / product_hunt / hugging_face_papers / blogger / show_hn', () => {
+    // sitemap 进子集买到的是采集延迟、不是告警资格（候选谓词无 source 条件）；稳态每轮成本
+    // = 1 次 sitemap.xml GET + 1 次已见集查询（已见集去重在 per-article fetch 之前 + first-fetch-wins）。
+    expect(mod.REALTIME_NEWS_SOURCES).toContain('sitemap');
+    // 排除面不变：arXiv 非实时且 ≥3s 串行节流、PH 产品源且 GraphQL 配额受限、hf_papers 非实时、
+    // blogger 仅经验链日报内联消费、show_hn 产品源不进事件塌缩。
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('arxiv');
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('product_hunt');
     expect(mod.REALTIME_NEWS_SOURCES).not.toContain('hugging_face_papers');
-    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('sitemap');
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('blogger');
+    expect(mod.REALTIME_NEWS_SOURCES).not.toContain('show_hn');
   });
-  it('PRODUCT_SOURCES 不含 hugging_face_papers / sitemap（非产品）', () => {
+  it('PRODUCT_SOURCES 不含 hugging_face_papers / sitemap（sitemap 产出 raw_type=news，不进产品塌缩）', () => {
     expect(mod.PRODUCT_SOURCES).not.toContain('hugging_face_papers');
     expect(mod.PRODUCT_SOURCES).not.toContain('sitemap');
   });
