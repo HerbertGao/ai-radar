@@ -428,7 +428,7 @@ const envSchema = z.object({
   // 取 4-59/15（分钟展开集 {4,19,34,49}）而非 */15：*/15 展开 {0,15,30,45}，同时撞整点与半点——
   // 飞书自定义机器人限流（11232）的全网高压时刻；4-59/15 保持同样的 15 分钟节奏但全程错峰
   // （feishu-push 避整点判据：分钟展开集 ∩ {0,30} = ∅，由 env.test.ts 机械断言）。
-  // 高频链路全源 0/空轮是常态、不告警；只采实时新闻源 {rss,hacker_news,github}，不碰 arXiv/PH。
+  // 高频链路全源 0/空轮是常态、不告警；只采实时新闻源 {rss,hacker_news,github,sitemap}，不碰 arXiv/PH。
   ALERT_SCAN_CRON: z.string().min(1).default('4-59/15 * * * *'),
   ALERT_SCAN_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   ALERT_SCAN_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),

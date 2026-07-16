@@ -54,7 +54,7 @@ export function publishedAtInferLockKey(eventId: string): string {
  * 回填作用域（候选条件）——由两条链分别传入：
  * - 日报链：`{ kind: 'daily' }` → `should_push = true`。
  * - 告警链：`{ kind: 'alert', threshold }` → 告警闸共享构造器 alertGatePredicate
- *   （`importance_score IS NOT NULL AND is_ai_related = true AND importance_score >= threshold`）。
+ *   （已评分 ∧ `is_ai_related = true` ∧（importance ≥ threshold **或** 命中精确事实变更词表——支路 B）——两支路终态）。
  */
 export type BackfillScope =
   | { kind: 'daily' }
@@ -109,7 +109,7 @@ function scopePredicate(scope: BackfillScope): SQL {
     return eq(aiNewsEvents.shouldPush, true);
   }
   // 告警链：与告警闸【同一个】共享构造器（alertGatePredicate：已评分 ∧ is_ai_related=true ∧
-  // importance>=threshold）——回填域 == 告警闸的共享谓词段，结构上杜绝两个方向的漂移
+  // (importance>=threshold OR factChangeTitlePredicate())）——回填域 == 告警闸的共享谓词段，结构上杜绝两个方向的漂移
   // （宽 → 闸外事件占掉 LIMIT 名额饿死闸内 NULL 事件；窄 → 闸内 NULL 事件被静默丢弃，design D3）。
   return alertGatePredicate(scope.threshold);
 }
