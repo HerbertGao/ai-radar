@@ -196,7 +196,7 @@ describe.skipIf(!databaseUrl)('B. 并发交错：CAS 自带谓词命中 0 行、
 
     // 再执行 claim CAS：自身 WHERE merged_into IS NULL 不满足 → 'skipped'（命中 0 行，不 claim）。
     const claim = await claimEventForJudging(b, 180000, db!);
-    expect(claim).toBe('skipped');
+    expect(claim.status).toBe('skipped');
     expect((await fetchEvent(b))!.judge_claimed_at).toBeNull(); // 未被 claim，tombstone 未复活
   });
 

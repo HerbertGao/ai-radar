@@ -25,7 +25,7 @@ process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
 const { collapseRawItem } = await import('../../../dedup/collapse.js');
-const { scoreUnscoredEvents, claimEventForJudging } = await import(
+const { scoreUnscoredEvents, claimEventForJudging, releaseJudgeClaim } = await import(
   '../score-events.js'
 );
 
@@ -108,8 +108,8 @@ describe.skipIf(!databaseUrl)('并发评分原子 claim', () => {
       claimEventForJudging(eventId, 180_000, db!),
     ]);
 
-    const claimed = results.filter((r) => r === 'claimed');
-    const skipped = results.filter((r) => r === 'skipped');
+    const claimed = results.filter((r) => r.status === 'claimed');
+    const skipped = results.filter((r) => r.status === 'skipped');
     expect(claimed).toHaveLength(1); // 恰一条 claim 成功。
     expect(skipped).toHaveLength(2); // 其余跳过——不会被任一链路双评分。
 
@@ -145,11 +145,11 @@ describe.skipIf(!databaseUrl)('并发评分原子 claim', () => {
 
     // reclaimMs = 30s：10s < 30s → 未过 T，不应被重新 claim（防误回收正在评分的事件）。
     const notYet = await claimEventForJudging(eventId, 30_000, db!);
-    expect(notYet).toBe('skipped');
+    expect(notYet.status).toBe('skipped');
 
     // reclaimMs = 5s：10s > 5s → 已过 T，僵尸 claim 被重新 claim（不致永久漏评）。
     const reclaimed = await claimEventForJudging(eventId, 5_000, db!);
-    expect(reclaimed).toBe('claimed');
+    expect(reclaimed.status).toBe('claimed');
   });
 
   it('评分+写分总时长 < T：claim 后立即写分，并发链路不重新 claim 误覆写', async () => {
@@ -157,12 +157,12 @@ describe.skipIf(!databaseUrl)('并发评分原子 claim', () => {
 
     // 链路 1 claim 成功（reclaimMs 大，模拟正常 T>L+W）。
     const claim1 = await claimEventForJudging(eventId, 180_000, db!);
-    expect(claim1).toBe('claimed');
+    expect(claim1.status).toBe('claimed');
 
     // 此刻链路 2 并发尝试 claim：链路 1 刚 claim（judge_claimed_at = now()，远未到 now()-T）
     // → 链路 2 不满足回收条件 → skipped（不双评分）。
     const claim2 = await claimEventForJudging(eventId, 180_000, db!);
-    expect(claim2).toBe('skipped');
+    expect(claim2.status).toBe('skipped');
 
     // 链路 1 写分（模拟 LLM 返回后写 *_score，总时长 < L+W < T）。写分后 importance_score 非 NULL。
     await pool!.query(
@@ -172,8 +172,46 @@ describe.skipIf(!databaseUrl)('并发评分原子 claim', () => {
 
     // 写分后再 claim（即便小 T）也不再 claim：importance_score 非 NULL，不满足 `*_score IS NULL`。
     const afterScore = await claimEventForJudging(eventId, 1, db!);
-    expect(afterScore).toBe('skipped');
+    expect(afterScore.status).toBe('skipped');
     const after = await fetchScores(dedupKey);
     expect(Number(after.importance_score)).toBe(88);
+  });
+
+  it('6.12 claim 凭据往返：claim → claimToken → 立即 release → 命中 1 行、judge_claimed_at 置 NULL（微秒完整）', async () => {
+    // 凭据走 JS Date 会截到毫秒、与微秒的 judge_claimed_at 比较不命中 → release 永久 no-op。此断言在真 PG 上暴露。
+    const { eventId } = await seedEvent('token-roundtrip');
+    const claim = await claimEventForJudging(eventId, 180_000, db!);
+    expect(claim.status).toBe('claimed');
+    const token = claim.status === 'claimed' ? claim.claimToken : '';
+    await releaseJudgeClaim(eventId, token, db!);
+    const { rows } = await pool!.query<{ judge_claimed_at: Date | null }>(
+      `SELECT judge_claimed_at FROM ai_news_events WHERE event_id = $1`,
+      [eventId],
+    );
+    expect(rows[0]!.judge_claimed_at).toBeNull(); // 自己那次 claim 被成功释放。
+  });
+
+  it('6.12 属主校验：E 被 D 合法回收（新 claim）后，A 用旧 token release → 命中 0 行、不清 D 的活 claim', async () => {
+    const { eventId } = await seedEvent('owner-check');
+    const claimA = await claimEventForJudging(eventId, 180_000, db!);
+    expect(claimA.status).toBe('claimed');
+    const tokenA = claimA.status === 'claimed' ? claimA.claimToken : '';
+    // 模拟 D 合法回收：写入一个不同的 judge_claimed_at（≠ tokenA）。
+    await pool!.query(
+      `UPDATE ai_news_events SET judge_claimed_at = now() + interval '1 second' WHERE event_id = $1`,
+      [eventId],
+    );
+    const before = await pool!.query<{ t: string }>(
+      `SELECT judge_claimed_at::text AS t FROM ai_news_events WHERE event_id = $1`,
+      [eventId],
+    );
+    // A 判分失败调 release(E, tokenA)——属主不符 → 0 行、D 的活 claim 一行不动。
+    await releaseJudgeClaim(eventId, tokenA, db!);
+    const after = await pool!.query<{ t: string | null }>(
+      `SELECT judge_claimed_at::text AS t FROM ai_news_events WHERE event_id = $1`,
+      [eventId],
+    );
+    expect(after.rows[0]!.t).not.toBeNull(); // D 的活 claim 未被清。
+    expect(after.rows[0]!.t).toBe(before.rows[0]!.t); // 且正是 D 写入的那个值。
   });
 });

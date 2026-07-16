@@ -42,3 +42,7 @@ coverage/
 
 # impeccable design-skill local cache（任意层级）
 .impeccable/
+
+# pnpm (not used by this project)
+pnpm-lock.yaml
+pnpm-workspace.yaml

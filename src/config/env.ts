@@ -240,6 +240,14 @@ const stalenessOverrideMap = z
     return overrides;
   });
 
+/**
+ * Value Judge 单条判分的最大尝试次数 A（含首次；judgeRawItem 每次尝试各自一个 `AbortSignal.timeout(L)`）。
+ * **单一定义**：`value-judge/index.ts` import 此常量，`env.ts` 的 claim 回收阈值 superRefine 亦用它——
+ * 两处若各写字面量 `3` 必漂移（改了重试次数忘了改阈值）。方向 `agents → config` 与既有 `llm-client → env`
+ * 同向、无环。
+ */
+export const JUDGE_MAX_ATTEMPTS = 3;
+
 const envSchema = z.object({
   DATABASE_URL: z
     .string()
@@ -414,14 +422,15 @@ const envSchema = z.object({
 
   // --- 并发评分原子 claim 回收阈值 T（daily-intel-pipeline「降级逐条容错」/ realtime-alerts，design D6）---
   // 日报链与告警高频链可能并发对同一未评分事件评分；送 LLM 前原子 claim（写 judge_claimed_at），
-  // 仅 claim 成功者评分。一个被 claim 的事件停在「score NULL + 已 claim」的总时长 = L（单条 LLM 硬超时
-  // LLM_TIMEOUT_MS）+ W（LLM 返回后写分/事务提交延迟上界）。回收阈值 T 必须 **> L + W**——否则
-  // 慢评分会被另一链路误回收双写；过短则误回收，过长则僵尸 claim 回收慢。
-  // 默认 = LLM_TIMEOUT_MS(60s) + 写分裕量 W(60s) 后再留余量，取 180000（180s > 60 + 60）。
-  // 启动期跨字段校验 T > LLM_TIMEOUT_MS + JUDGE_WRITE_BUDGET_MS（见 superRefine）。
-  JUDGE_CLAIM_RECLAIM_MS: z.coerce.number().int().positive().default(180000),
+  // 仅 claim 成功者评分。**正文补全折进判分入口后**，一个被 claim 的事件停在「score NULL + 已 claim」
+  // 的总时长 = F（补全整次抓取 COLLECTOR_FETCH_TIMEOUT_MS）+ A×L（judge 重试整个 LLM 调用 A 次、每次
+  // 各一个 LLM_TIMEOUT_MS）+ W（LLM 返回后写分/事务提交延迟上界）。回收阈值 T 必须 **> F + A×L + W**——
+  // 否则正在合法补全/评分/写分的事件会被另一链路误回收双写；过短则误回收，过长则僵尸 claim 回收慢。
+  // 默认取 300000（300s > 15 + 3×60 + 60 = 255s，留 45s 余量）。**F 因补全落进 claim 而进预算；A×L 因
+  // judge 重试的是整个 LLM 调用而必须乘**。启动期跨字段校验见下方 superRefine。
+  JUDGE_CLAIM_RECLAIM_MS: z.coerce.number().int().positive().default(300000),
   // 写分提交延迟上界 W（毫秒）：LLM 返回后写 *_score / 事务提交的延迟上界（含 DB 写排队与进程暂停容限）。
-  // 仅用于启动期校验 T > L + W；默认 60000。
+  // 仅用于启动期校验 T > F + A×L + W；默认 60000。
   JUDGE_WRITE_BUDGET_MS: z.coerce.number().int().positive().default(60000),
 
   // --- P3 语义去重 + 知识库 embedding（add-semantic-dedup-and-store-hardening，design D1/D2/D4）---
@@ -616,20 +625,27 @@ const envSchema = z.object({
     }
   })
   // 并发评分原子 claim 回收阈值不变量（realtime-alerts / daily-intel-pipeline「降级逐条容错」）：
-  // 回收阈值 T 必须 **严格 > L + W**（L=LLM_TIMEOUT_MS 单条 LLM 硬超时，W=JUDGE_WRITE_BUDGET_MS
-  // 写分提交延迟上界）。否则正在合法评分/写分（总时长 < L+W）的事件可能被另一链路误回收 → 双评分覆写。
-  // 启动期快速失败，禁止配出「会误回收慢评分」的危险阈值。
+  // 正文补全折进判分入口后，一个被 claim 的事件的合法停留时长 = F + A×L + W
+  //   F = COLLECTOR_FETCH_TIMEOUT_MS（补全整次抓取超时）
+  //   A = JUDGE_MAX_ATTEMPTS（judge 重试整个 LLM 调用的次数）
+  //   L = LLM_TIMEOUT_MS（单次 LLM 硬超时）—— A×L 因重试的是整个调用而必须乘
+  //   W = JUDGE_WRITE_BUDGET_MS（LLM 返回后写分/事务提交延迟上界）
+  // T 必须 **严格 > F + A×L + W**——否则正在合法补全/评分/写分的事件会被另一链路误回收 → 双写。
+  // 启动期快速失败，禁止配出「会误回收」的危险阈值。
   .superRefine((data, ctx) => {
-    const minReclaim = data.LLM_TIMEOUT_MS + data.JUDGE_WRITE_BUDGET_MS;
+    const F = data.COLLECTOR_FETCH_TIMEOUT_MS;
+    const AL = JUDGE_MAX_ATTEMPTS * data.LLM_TIMEOUT_MS;
+    const W = data.JUDGE_WRITE_BUDGET_MS;
+    const minReclaim = F + AL + W;
     if (data.JUDGE_CLAIM_RECLAIM_MS <= minReclaim) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['JUDGE_CLAIM_RECLAIM_MS'],
         message:
-          `并发评分 claim 回收阈值 T（JUDGE_CLAIM_RECLAIM_MS=${data.JUDGE_CLAIM_RECLAIM_MS}ms）` +
-          `必须严格大于 L + W = LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}) + JUDGE_WRITE_BUDGET_MS(${data.JUDGE_WRITE_BUDGET_MS}) = ${minReclaim}ms。` +
-          `否则正在合法评分/写分（总时长 < L+W）的事件会被另一链路误回收 → 双评分覆写。` +
-          `请上调 JUDGE_CLAIM_RECLAIM_MS 到 > ${minReclaim}。`,
+          `并发评分 claim 回收阈值 T（JUDGE_CLAIM_RECLAIM_MS=${data.JUDGE_CLAIM_RECLAIM_MS}ms）必须严格大于 ` +
+          `F + A×L + W = COLLECTOR_FETCH_TIMEOUT_MS(${F}) + JUDGE_MAX_ATTEMPTS(${JUDGE_MAX_ATTEMPTS})×LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}) ` +
+          `+ JUDGE_WRITE_BUDGET_MS(${W}) = ${minReclaim}ms。补全折进判分入口后 F 进预算、A×L 因重试整个 LLM 调用而必须乘。` +
+          `否则正在合法补全/评分/写分的事件会被另一链路误回收 → 双评分覆写。请上调 JUDGE_CLAIM_RECLAIM_MS 到 > ${minReclaim}。`,
       });
     }
   })

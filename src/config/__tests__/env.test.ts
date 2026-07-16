@@ -729,3 +729,27 @@ describe('parseEnv —— 首次启用发布时间基线水位 fail-fast（add-h
     expect(alertMinPublishedAt(unset)).toBeNull(); // undefined（未设）→ 无水位。
   });
 });
+
+describe('parseEnv —— claim 回收阈值 T > F + A×L + W（unify-judge-stage）', () => {
+  // 补全折进判分入口后 T 的下界 = COLLECTOR_FETCH_TIMEOUT_MS(15000) + JUDGE_MAX_ATTEMPTS(3)×
+  // LLM_TIMEOUT_MS(60000) + JUDGE_WRITE_BUDGET_MS(60000) = 255000（validEnv 全默认）。
+  it('T = F+A×L+W（相等，非严格 >）→ 启动 fail-fast', () => {
+    const source = { ...validEnv(), JUDGE_CLAIM_RECLAIM_MS: '255000' } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('T = 180000（旧默认，不满足真实下界）→ 启动 fail-fast（本次修的 bug 的回归钉）', () => {
+    const source = { ...validEnv(), JUDGE_CLAIM_RECLAIM_MS: '180000' } as NodeJS.ProcessEnv;
+    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
+  });
+
+  it('T = 300000（新默认）→ 通过', () => {
+    const env = parseEnv({ ...validEnv(), JUDGE_CLAIM_RECLAIM_MS: '300000' } as NodeJS.ProcessEnv);
+    expect(env.JUDGE_CLAIM_RECLAIM_MS).toBe(300000);
+  });
+
+  it('未显式设置 → 默认 300000、通过', () => {
+    const env = parseEnv(validEnv());
+    expect(env.JUDGE_CLAIM_RECLAIM_MS).toBe(300000);
+  });
+});

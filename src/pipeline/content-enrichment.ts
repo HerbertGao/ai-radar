@@ -1,13 +1,15 @@
 /**
- * 判分/摘要前的确定性正文补全（source-content-enrichment，任务 2.2/2.3，仅新闻）。
+ * 判分前的确定性正文补全（source-content-enrichment，仅新闻）——**折进判分入口**：本模块只导出**单条**
+ * 补全函数 `enrichRawItemContent`，由 `scoreUnscoredEvents` 在 claim 成功之后、`judgeRawItem` 之前逐条调用，
+ * 并把返回的正文**显式送入本次判分**。不再自带工作集 SELECT、不再由任一条链独立编排——补全的**能力**与
+ * **可注入性**都下沉到判分入口那一个地方，两条判分链（日报 / 告警）自动共享，杜绝「某条链只判分不补全 ⇒
+ * 补全工作集被清空 ⇒ 补全沦为死代码」。
  *
- * 对「待判新闻事件代表 raw_item `content` 为空/纯空白且有可抓 URL」者，抓取文章 HTML、取
- * `og:description` 写回 `raw_items.content`，供 Value Judge 判分与摘要器 grounding。
+ * 对「代表 raw_item `content` 为空/纯空白且有可抓 URL」者，抓取文章 HTML、取 `og:description` 原子写回
+ * `raw_items.content`，并**经返回值**供 Value Judge 判分 grounding。
  *
  * 关键不变量（spec source-content-enrichment / design D1/D3，逐条守住）：
- * - **工作集与 `scoreUnscoredEvents` 判分集同口径**：`importance_score IS NULL AND
- *   merged_into IS NULL` 的事件，其代表 raw_item content 为空/纯空白且有 canonical_url/url。
- *   窄于判分集会致漏补事件仍被判分却退化仅标题（违反 value-judge 普遍约束）。
+ * - **正文经返回值进入本次判分**：只写库不回传 = DB 补了、这次判分仍 title-only（评分一生一次、没有下次）。
  * - **空定义单一谓词、选取与写回一字不差**：`content IS NULL OR content !~ '\S'`（无非空白
  *   字符即空白，等价 `btrim(content, E' \t\n\r\f\v')=''`）。禁止一处 JS `String.trim()`、
  *   一处 Postgres `trim()`——前者剥 tab/换行/Unicode 空白、后者仅 ASCII 空格，对 '\t\n' 分歧
@@ -29,9 +31,9 @@
  */
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
-import { aiNewsEvents, rawItems } from '../db/schema.js';
+import { rawItems } from '../db/schema.js';
 import { env } from '../config/env.js';
 import { extractOgTag, isSiteBoilerplate, MAX_BODY_BYTES } from '../collectors/sitemap.js';
 
@@ -70,19 +72,27 @@ export interface EnrichContentOptions {
   maxRedirects?: number | undefined;
 }
 
-export interface EnrichContentResult {
-  /** 成功抓取 og:description 并原子写回（命中非 0 行）的条目数。 */
-  hit: number;
-  /** 失败条目数（网络错误/非 2xx/非 HTML/超限/超时/og 缺失/**被 SSRF 守卫拒绝**）。 */
-  fail: number;
+export interface EnrichRawItemResult {
+  /**
+   * `'hit'`：本次成功拿到可用正文（新抓+原子写回，或写回命中 0 行但 DB 里已有并发填充的正文）；
+   * `'fail'`：网络错误/非 2xx/非 HTML/超限/超时/og 缺失/命中全站样板/被 SSRF 守卫拒绝。
+   */
+  status: 'hit' | 'fail';
+  /**
+   * 供**本次判分**使用的正文——**MUST 由返回值进入判分输入**（判分入口是先把 content SELECT 进内存
+   * 再送 LLM 的，`UPDATE` 不改内存那个值 ⇒ 只写库不回传 = DB 补全了、这一次判分仍 title-only，而评分
+   * 一生一次、没有下一次）。`'fail'` 时为 `null`（判分如实回退仅标题）。
+   */
+  content: string | null;
 }
 
 /**
  * 空/纯空白单一谓词（Postgres POSIX：`!~ '\S'` = 无非空白字符 = 空/纯空白）。
- * **工作集选取与原子写回复用同一 SQL 对象**，保证「一字不差」、杜绝 JS/Postgres trim 方言分歧。
+ * **全仓唯一定义**：本模块原子写回 WHERE、score-events 候选 SELECT 的 `isEmpty` 投影列--三处共用同一
+ * SQL 对象，保证「一字不差」、杜绝 JS/Postgres trim 方言分歧（NBSP 时 TS trim 判空->白抓、写回 0 行）。
  * 源码 `'\\S'` → 生成 SQL `'\S'`（drizzle 用 cooked 模板串）。
  */
-const EMPTY_CONTENT = sql`(${rawItems.content} IS NULL OR ${rawItems.content} !~ '\\S')`;
+export const EMPTY_CONTENT = sql<boolean>`(${rawItems.content} IS NULL OR ${rawItems.content} !~ '\\S')`;
 
 /** 被 SSRF 出网守卫拒绝（私网/环回/链路本地/元数据/非公网主机）时抛出，供日志区分。 */
 export class SsrfBlockedError extends Error {
@@ -188,10 +198,35 @@ async function assertHostAllowed(urlStr: string, resolve: ResolveFn): Promise<vo
   }
 }
 
-/** dns.lookup(all) 默认解析实现：返回主机的全部 A/AAAA 地址。 */
+/**
+ * dns.lookup(all) 默认解析实现：返回主机的全部 A/AAAA 地址。
+ * **测试守卫**（钉在函数体内，与 embed-clean.ts / telegram-callback.ts 同形）：`process.env.VITEST` 下
+ * throw——`assertHostAllowed` 先于 fetchImpl 调 resolve，只挡 HTTP 而不挡 DNS 会让未注入桩的测试仍对真实
+ * 域名发 DNS 查询。生产恒不设此变量。
+ */
 const defaultResolve: ResolveFn = async (host) => {
+  if (process.env.VITEST) {
+    throw new Error(
+      'content-enrichment: 测试环境（VITEST）禁止真实 DNS 解析——未注入 resolve 桩而走到默认 dns.lookup。' +
+        '请经 options.resolve（或 scoreUnscoredEvents 的 options.enrich.resolve）注入固定 IP 桩。',
+    );
+  }
   const results = await lookup(host, { all: true });
   return results.map((r) => r.address);
+};
+
+/**
+ * 默认单跳 fetch 实现（global fetch）。**测试守卫**同 defaultResolve：`process.env.VITEST` 下 throw，
+ * 防未注入 fetchImpl 桩的测试真实出网。
+ */
+const defaultFetchImpl: FetchImplFn = (url, init) => {
+  if (process.env.VITEST) {
+    throw new Error(
+      'content-enrichment: 测试环境（VITEST）禁止真实 HTTP 抓取——未注入 fetchImpl 桩而走到默认 global fetch。' +
+        '请经 options.fetchImpl（或 scoreUnscoredEvents 的 options.enrich.fetchImpl）注入桩。',
+    );
+  }
+  return (globalThis.fetch as unknown as FetchImplFn)(url, init);
 };
 
 /**
@@ -205,14 +240,22 @@ async function fetchArticleGuarded(
   resolve: ResolveFn,
   maxRedirects: number,
 ): Promise<string> {
+  // **整次补全一条 deadline**：signal 在循环外只建一次、所有跳共用（否则每跳各一个 signal ⇒ 一次补全
+  // 真实上限 = (maxRedirects+1)×F，而 claim 回收阈值按 F 记账、会误回收）。deadline 兜住不受 signal
+  // 约束的部分（assertHostAllowed 里的 dns.lookup）。deadline 仅在循环顶检查、兜住跨跳累计时长；但单次
+  // dns.lookup 若挂起（尤其 hop 0、0 时长已过）不被中断--F 非严格壁钟上界，此残窗由 design 2.5 记录、
+  // 数据正确性靠写 CAS 兜底（成本/活泛性影响，非数据正确性）。
+  const signal = AbortSignal.timeout(env.COLLECTOR_FETCH_TIMEOUT_MS);
+  const deadline = Date.now() + env.COLLECTOR_FETCH_TIMEOUT_MS;
   let current = urlStr;
   for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (Date.now() > deadline) throw new Error(`补全总超时（>${env.COLLECTOR_FETCH_TIMEOUT_MS}ms）for ${urlStr}`);
     // 每一跳发起前重校验 host（防 302 跳内网/元数据绕过首跳校验）。
     await assertHostAllowed(current, resolve);
     const res = await fetchImpl(current, {
       headers: { 'User-Agent': 'ai-radar (content enrichment)' },
       redirect: 'manual',
-      signal: AbortSignal.timeout(env.COLLECTOR_FETCH_TIMEOUT_MS),
+      signal, // 全部跳共用同一个 signal（整次一条 deadline）。
     });
     // 3xx：读 Location、拼绝对 URL，进入下一跳（循环顶部重校验新 host）。
     if (res.status >= 300 && res.status < 400) {
@@ -242,88 +285,87 @@ async function fetchArticleGuarded(
 }
 
 /**
- * 对待判新闻事件代表 raw_item 做一次确定性正文补全。
+ * 对**单条**待判事件的代表 raw_item 做一次确定性正文补全（判分入口在 claim 之后、judge 之前逐条调用；
+ * 工作集选取已归并到判分入口的候选 SELECT，本函数不再自带工作集查询）。
  *
- * @param dbh 可注入 db 或事务句柄（默认全局 db）。
- * @returns `{hit, fail}` 命中/失败计数。整阶段永不抛错（逐条 try/catch 隔离）。
+ * **MUST 返回正文**（不只 status）：判分入口先把 content SELECT 进内存再送 LLM、`UPDATE` 不改内存那个值
+ * ⇒ 只写库不回传 = DB 补了、这一次判分仍 title-only（评分一生一次、没有下次）。故补全的正文经【返回值】
+ * 进入本次判分输入（value-judge-agent 不变量）。
+ *
+ * 单条失败一律 try/catch 隔离、返回 `{ status:'fail', content:null }`、**绝不抛出**（含 `SsrfBlockedError`）——
+ * 由调用方 fail-open 照常送 LLM 仅标题判分。
+ *
+ * @param input.rawItemId 代表 raw_item 主键；`input.target` 抓取 URL（调用方已算 `canonical_url ?? url`）。
+ * @param dbh 可注入 db/事务句柄（默认全局 db）。
  */
-export async function enrichCandidateContent(
+export async function enrichRawItemContent(
+  input: { rawItemId: bigint; target: string },
   dbh: DbLike = defaultDb,
   options: EnrichContentOptions = {},
-): Promise<EnrichContentResult> {
-  const fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchImplFn);
+): Promise<EnrichRawItemResult> {
+  const fetchImpl = options.fetchImpl ?? defaultFetchImpl;
   const resolve = options.resolve ?? defaultResolve;
   const logError =
     options.logError ??
     ((message, detail) => console.error(`[content-enrichment] ${message}`, detail));
   const maxRedirects = options.maxRedirects ?? 5;
+  const { rawItemId, target } = input;
 
-  // 工作集：与 scoreUnscoredEvents 判分集同口径（importance_score IS NULL AND merged_into IS NULL），
-  // 其代表 raw_item content 为空/纯空白（EMPTY_CONTENT）且有可抓 URL（canonical_url 或 url 非空）。
-  const candidates = await dbh
-    .select({
-      rawItemId: rawItems.id,
-      canonicalUrl: rawItems.canonicalUrl,
-      url: rawItems.url,
-    })
-    .from(aiNewsEvents)
-    .innerJoin(rawItems, eq(aiNewsEvents.representativeRawItemId, rawItems.id))
-    .where(
-      and(
-        isNull(aiNewsEvents.importanceScore),
-        isNull(aiNewsEvents.mergedInto),
-        EMPTY_CONTENT,
-        sql`(${rawItems.canonicalUrl} IS NOT NULL OR ${rawItems.url} IS NOT NULL)`,
-      ),
-    );
-
-  let hit = 0;
-  let fail = 0;
-
-  for (const cand of candidates) {
-    // 优先 canonical_url（已去追踪参数、规范化），回退原始 url。
-    const target = cand.canonicalUrl ?? cand.url;
-    if (!target) continue; // WHERE 已保证有 URL；防御性跳过、不产生外部请求。
-    try {
-      const html = await fetchArticleGuarded(target, fetchImpl, resolve, maxRedirects);
-      const description = extractOgTag(html, 'og:description');
-      if (!description || isSiteBoilerplate(description)) {
-        // og:description 缺失/空、或命中全站样板 → 按失败处理，content 保持为空，下游退化仅标题。
-        //
-        // 样板必须在写回【之前】判：采集器已把样板 og:description 置 content=null（见 sitemap.ts），
-        // 这些行恰因此落进本补全工作集；本阶段重抓的是【同一张页面】、拿回【同一段样板】，而它非空、
-        // extractOgTag 视为成功。若原样写回：content 由 null 变回非空样板 → digest 的 hasContent 护栏
-        // 不触发 → LLM 拿全站公司简介当正文 grounding；且 content 一旦非空该行永久离开工作集、样板
-        // 成为终身正文、无路径再修正。故必与采集器共享【同一个】isSiteBoilerplate（单一定义、两处引用），
-        // 绝不各写一份——两份必漂移，样板串变更时只改一处、另一处照旧放行，本洞从漂移那侧重开。
-        fail += 1;
+  try {
+    const html = await fetchArticleGuarded(target, fetchImpl, resolve, maxRedirects);
+    const description = extractOgTag(html, 'og:description');
+    if (!description || isSiteBoilerplate(description)) {
+      // og:description 缺失/空、或命中全站样板 → 按 fail 计、不写回，下游退化仅标题。
+      //
+      // 样板必须在写回【之前】判：采集器已把样板 og:description 置 content=null（见 sitemap.ts），这些行恰
+      // 因此落进补全工作集；本函数重抓的是【同一张页面】、拿回【同一段样板】，它非空、extractOgTag 视为成功。
+      // 若原样写回：content 由 null 变回非空样板 → digest 的 hasContent 护栏不触发 → LLM 拿全站公司简介当正文
+      // grounding；且 content 一旦非空该行永久离开工作集、样板成为终身正文、无路径再修正。故必与采集器共享
+      // 【同一个】isSiteBoilerplate（单一定义、两处引用），绝不各写一份——两份必漂移，本洞从漂移那侧重开。
+      try {
         logError(`补抓 og:description 缺失或命中全站样板（content 保持为空，退化仅标题）：${target}`, null);
-        continue;
+      } catch {
+        // logError 抛错不改变返回值（仍 fail/null）。
       }
-      // 原子判空写回：命中 0 行 = 已被并发填充（RSS/Ask HN 再抓），跳过、良性、不计 hit/fail。
-      const updated = await dbh
-        .update(rawItems)
-        .set({ content: description })
-        .where(and(eq(rawItems.id, cand.rawItemId), EMPTY_CONTENT))
-        .returning({ id: rawItems.id });
-      if (updated.length === 0) {
+      return { status: 'fail', content: null };
+    }
+    // 原子判空写回：命中 0 行 = 已被并发填充。**返回 DB 里既有正文（不是 null）**——该事件确有正文，判分
+    // 不该退化仅标题。RETURNING content：命中 1 行时即新写入的 description。
+    const updated = await dbh
+      .update(rawItems)
+      .set({ content: description })
+      .where(and(eq(rawItems.id, rawItemId), EMPTY_CONTENT))
+      .returning({ content: rawItems.content });
+    if (updated.length === 0) {
+      const existing = await dbh
+        .select({ content: rawItems.content })
+        .from(rawItems)
+        .where(eq(rawItems.id, rawItemId))
+        .limit(1);
+      const content = existing[0]?.content ?? null;
+      try {
         logError(
-          `补抓写回命中 0 行（已被并发填充，跳过，不覆盖）：raw_item ${cand.rawItemId}`,
+          `补抓写回命中 0 行（已被并发填充，返回既有正文、不覆盖）：raw_item ${rawItemId}`,
           null,
         );
-        continue;
+      } catch {
+        // logError 抛错不可改变返回值--concurrent-fill 正文必须按 hit 回传。
       }
-      hit += 1;
-    } catch (err) {
-      // 单条失败（网络/非 2xx/非 HTML/超限/超时/SSRF 拒绝）：隔离、记日志、content 保持为空、继续。
-      fail += 1;
-      const prefix =
-        err instanceof SsrfBlockedError
-          ? '补抓被 SSRF 守卫拒绝（不抓内网/元数据，content 保持为空）'
-          : '补抓失败（跳过该条，content 保持为空）';
-      logError(`${prefix}：${target}`, err);
+      // 写回被 EMPTY_CONTENT 挡下 ⇒ 该行已有非空白正文（同一谓词）；返之供判分（视作 hit）。异常空 → fail。
+      return content ? { status: 'hit', content } : { status: 'fail', content: null };
     }
+    return { status: 'hit', content: updated[0]!.content };
+  } catch (err) {
+    // 单条失败（网络/非 2xx/非 HTML/超限/超时/SSRF 拒绝）：隔离、记日志、绝不抛出，返回 fail 供 fail-open。
+    const prefix =
+      err instanceof SsrfBlockedError
+        ? '补抓被 SSRF 守卫拒绝（不抓内网/元数据，content 保持为空）'
+        : '补抓失败（跳过该条，content 保持为空）';
+    try {
+      logError(`${prefix}：${target}`, err);
+    } catch {
+      // logError 自身抛错不拖垮补全--吞掉、照常返回 fail。
+    }
+    return { status: 'fail', content: null };
   }
-
-  return { hit, fail };
 }

@@ -21,6 +21,8 @@ import * as schema from '../../db/schema.js';
 import type { CollectedItem } from '../../collectors/types.js';
 import type { MessageSender } from '../../push/dispatcher.js';
 import type { RedisLike } from '../../push/lock.js';
+import { NO_NETWORK_ENRICH } from './enrichment-test-helpers.js';
+import type { EnrichContentOptions } from '../content-enrichment.js';
 
 process.env.TELEGRAM_BOT_TOKEN ||= 'test-token';
 process.env.TELEGRAM_CHAT_ID ||= 'test-chat';
@@ -203,7 +205,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('Big launch', 'https://x.com/big')]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -220,6 +222,56 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     expect(rows[0]!.status).toBe('success');
   });
 
+  it('告警链正文补全：空 content + 可抓 URL -> 补全后正文经返回值送入判分（任务 6.5）', async () => {
+    // 补全折进判分入口后，告警链与日报链同口径补全。本用例验证：空 content 的事件在告警链上被补全、
+    // 补全后正文经返回值送入 judgeRawItem 的 prompt（不是只写库不回传）。
+    const enriched = `ENRICHED-ALERT-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const prompts: string[] = [];
+    const generateObjectFn = vi.fn(async (args: { prompt: string }) => {
+      prompts.push(args.prompt);
+      return {
+        object: {
+          is_ai_related: true,
+          type: 'news',
+          category: 'AI',
+          importance: 90,
+          novelty: 80,
+          developer_relevance: 80,
+          hype_risk: 10,
+          should_push: true,
+        },
+      };
+    });
+    const enrichStub: EnrichContentOptions = {
+      resolve: async () => ['93.184.216.34'],
+      fetchImpl: (async () => ({
+        status: 200,
+        ok: true,
+        headers: { get: (n: string) => (n.toLowerCase() === 'content-type' ? 'text/html' : null) },
+        text: async () =>
+          `<html><head><meta property="og:description" content="${enriched}"></head></html>`,
+      })) as NonNullable<EnrichContentOptions>['fetchImpl'],
+      logError: () => {},
+    };
+    const sender = okSender();
+    await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([rssItem('Alert enrich', 'https://x.com/alert-enrich')]) },
+        judge: { judge: { generateObjectFn, logError: () => {} }, enrich: enrichStub, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+      }),
+    );
+    // 断言落在 judge 的输入（不是只断言 DB 写入--只写库不回传时那也为绿、无证伪力）。
+    expect(prompts.some((p) => p.includes(enriched))).toBe(true);
+    // DB 也写回了补全正文。
+    const { rows } = await pool!.query<{ content: string | null }>(
+      `SELECT content FROM raw_items WHERE content = $1`,
+      [enriched],
+    );
+    expect(rows).toHaveLength(1);
+  });
+
   it('阶段 emit 序列（5 阶段 collect→dedup→score→select→push，无 kb/无 digest）+ 确定性面 parity（5.1）', async () => {
     // 经 options.emit（核心级）捕获粗粒度阶段序列。alert 五阶段（design D4，无 kb），前向断言（before=0）。
     const emitted: string[] = [];
@@ -227,7 +279,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('Emit seq alert', 'https://x.com/emitseq')]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
         emit: (kind: string) => emitted.push(kind),
@@ -257,7 +309,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
       const result = await runAlertScan(
         opts({
           collect: { collectors: collectorsReturning([rssItem('Alert no semantic', 'https://x.com/ns')]) },
-          judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+          judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
           senders: { telegram: sender },
           threshold: 85,
         }),
@@ -280,7 +332,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
       opts({
         channels: ['telegram', 'feishu'] as const,
         collect: { collectors: collectorsReturning([rssItem('Major release', 'https://x.com/major')]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: tg, feishu: fs },
         threshold: 85,
       }),
@@ -302,7 +354,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('Minor update', 'https://x.com/minor')]) },
-        judge: { judge: { generateObjectFn: judgeMock(80), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(80), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -360,7 +412,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -383,7 +435,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     await runAlertScan(
       opts({
         collect: { collectors: items },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s1 },
         threshold: 85,
       }),
@@ -395,7 +447,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const r2 = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) }, // 无新条目。
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s2 },
         threshold: 85,
       }),
@@ -411,7 +463,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('No summary event', 'https://x.com/nosum')]) },
-        judge: { judge: { generateObjectFn: judgeMock(95), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(95), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -435,7 +487,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('Concurrent alert', 'https://x.com/conc')]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s0 },
         threshold: 85,
       }),
@@ -446,7 +498,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 实时重大发布告警', () => {
     const r1 = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s1 },
         threshold: 85,
       }),
@@ -628,7 +680,7 @@ describe.skipIf(!databaseUrl)('runAlertScan 发布时间回填阶段（4.4）', 
     windowDays: WINDOW_DAYS,
     maxPerScan: 100,
     collect: { collectors: collectorsReturning([]) }, // 不采新条目，只回填 + 选既有 seed。
-    judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+    judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
     threshold: 85,
     publishedAtLock: { redis: memoryRedis(), ttlMs: 30_000 },
     // 抛错桩使回填后达阈值候选的摘要确定性降级为 headline 回退链，不真调 LLM。
@@ -789,7 +841,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) }, // 不采新条目，只选既有 seed。
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
         // 覆盖默认抛错桩：摘要成功桩（返回经 digestOutputSchema 校验的中文标题/摘要）+ 捕获 prompt 验 grounding。
@@ -834,7 +886,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -859,7 +911,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
       }),
@@ -884,7 +936,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     const result = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([rssItem('Observable P0', 'https://x.com/obs')]) },
-        judge: { judge: { generateObjectFn: judgeMock(92), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(92), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
         emit: (kind: string, payload?: unknown) => events.push({ kind, payload }),
@@ -934,7 +986,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
       opts({
         dbh: failingSummaryDb,
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: sender },
         threshold: 85,
         // 摘要生成成功（校验通过的中文）→ 流程走到 updateSummaryZh → 由上面 Proxy 抛错触发持久化失败分支。
@@ -986,7 +1038,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     await runAlertScan(
       opts({
         collect: { collectors: items },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s1 },
         threshold: 85,
       }),
@@ -998,7 +1050,7 @@ describe.skipIf(!databaseUrl)('add-high-freq-p0-push 组C：告警渲染 + 基�
     const r2 = await runAlertScan(
       opts({
         collect: { collectors: collectorsReturning([]) },
-        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, logError: () => {} },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
         senders: { telegram: s2 },
         threshold: 85,
       }),
