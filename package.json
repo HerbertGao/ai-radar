@@ -37,7 +37,7 @@
     "grammy": "^1.44.0",
     "hono": "^4.12.28",
     "ioredis": "^5.11.1",
-    "opencc-js": "^1.4.0",
+    "opencc-js": "^1.4.1",
     "pg": "^8.22.0",
     "playwright": "^1.61.1",
     "rss-parser": "^3.13.0",
