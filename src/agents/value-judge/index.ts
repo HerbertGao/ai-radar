@@ -58,7 +58,11 @@ export interface JudgeRawItemInput {
 export interface JudgeOptions {
   /** 注入的 generateObject 实现，默认真实 SDK。 */
   generateObjectFn?: GenerateObjectFn;
-  /** 最大尝试次数（含首次），默认 3（首次 + 2 次重试）。 */
+  /**
+   * 最大尝试次数（含首次），默认 JUDGE_MAX_ATTEMPTS（3）。运行时被 JUDGE_MAX_ATTEMPTS 封顶--
+   * claim 回收阈值 superRefine 按 JUDGE_MAX_ATTEMPTS 校验 `T > F + A×L + W`，超过此值的 maxAttempts
+   * 会使实际判分时长越过 T 被另一链路误回收（重复补全/LLM 工作）。测试可注入更小值（如 1）加速用例。
+   */
   maxAttempts?: number;
   /** 错误日志 sink，默认 console.error；便于测试断言。 */
   logError?: (message: string, detail: unknown) => void;
@@ -91,7 +95,9 @@ export async function judgeRawItem(
   options: JudgeOptions = {},
 ): Promise<ValueJudgeOutput> {
   const run = options.generateObjectFn ?? defaultGenerateObject;
-  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  // 封顶在 JUDGE_MAX_ATTEMPTS：claim 回收阈值 superRefine 按此常量校验 T > F + A×L + W，
+  // 运行时超过此值的 maxAttempts 会使判分时长越过 T 被误回收。Math.min 保 T 校验恒充分。
+  const maxAttempts = Math.min(options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS, JUDGE_MAX_ATTEMPTS);
   const logError =
     options.logError ??
     ((message, detail) => console.error(`[value-judge] ${message}`, detail));
