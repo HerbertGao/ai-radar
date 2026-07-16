@@ -161,18 +161,32 @@
 
 系统在 Value Judge 与中文摘要逐条处理时，单条失败必须跳过该条并记录错误日志、累加降级计数，整批继续（局部容错），失败条目对应的 `raw_item` 已入库可在后续运行重判。Value Judge 阶段必须**只处理尚未评分的事件**（`*_score IS NULL`），已评分事件跳过不重判。
 
-**并发评分必须原子 claim（P2 新增，绝不可省）**：自 P2 起，日报工作流与实时告警高频工作流（见 realtime-alerts）可能**并发**对同一未评分事件跑 Value Judge。仅靠「只处理 `*_score IS NULL`」无法防并发双评分——两条链路可同时 `SELECT` 到同一未评分事件、各自送 LLM 评分并互相覆写。故送 LLM 前必须做**确定性原子 claim**：用 `UPDATE ai_news_events SET judge_claimed_at=now() WHERE event_id=? AND *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now() - interval 'T') RETURNING`（或 `SELECT ... FOR UPDATE SKIP LOCKED`），**只有 claim 成功者送 LLM 评分**，未 claim 到的链路跳过该事件。
+**并发评分必须原子 claim（绝不可省）**：日报工作流与实时告警高频工作流（见 realtime-alerts）可能**并发**对同一未评分事件跑 Value Judge。仅靠「只处理 `*_score IS NULL`」无法防并发双评分——两条链路可同时 `SELECT` 到同一未评分事件、各自送 LLM 评分并互相覆写。故送 LLM 前必须做**确定性原子 claim**：用 `UPDATE ai_news_events SET judge_claimed_at=now() WHERE event_id=? AND *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now() - interval 'T') RETURNING`（或 `SELECT ... FOR UPDATE SKIP LOCKED`），**只有 claim 成功者送 LLM 评分**，未 claim 到的链路跳过该事件。
 
 **超时回收语义必须显式（否则僵尸 claim 永久漏评分）**：claim 条件**必须含 `OR judge_claimed_at < now() - interval 'T'`**——否则 claim 后崩溃留下的事件（`judge_claimed_at` 非空但 `*_score` 仍 NULL）将不满足 `judge_claimed_at IS NULL`、**永远无法被任一链路重新 claim**，结构性漏评分→漏日报漏告警（反而比双评分更糟）。
 
-**回收阈值 `T` 必须覆盖端到端「claim→写分提交」最坏时长（绝不可省）**：一个被 claim 的事件停留在「`*_score IS NULL` 且 `judge_claimed_at` 已写」的总时长 = `L`（单条 LLM 硬超时，如 `LLM_TIMEOUT_MS`，超时即失败计入降级、释放该事件）+ `W`（LLM 返回后写 `*_score`/事务提交的延迟上界，含 DB 写排队与进程暂停容限）。**仅 `T > L` 不够**——若 LLM 在逼近 `L` 返回后遭遇 GC 暂停/写排队 > `(T−L)`，另一链路会满足 `judge_claimed_at < now()-T` 重新 claim → 双评分覆写。故回收阈值必须满足 **`T > L + W`**（或等价地：把 `L` 定义为「claim→写分提交」的端到端预算、写分与 claim 释放在同一事务原子完成，使「正在进行」的总时长恒 `< L < T`）。如此 `judge_claimed_at < now() - interval 'T'` 只可能命中**已崩溃/已超时释放**的僵尸 claim，绝不会误回收仍在合法评分/写分中的事件。由此保证「一事件只被评一次分、永不覆写、且崩溃不致永久漏评」跨日报/告警两链路成立。
+**回收阈值 `T` 必须覆盖端到端「claim→写分提交」最坏时长，该时长自本变更起含正文补全的抓取超时，且 LLM 侧必须按【重试次数 × 单次超时】记账（本需求修改点，绝不可省）**：正文补全内联在判分入口内、位于**原子 claim 之后**（见 source-content-enrichment「补全必须是判分入口内的第一步」），故一个被 claim 的事件停留在「`*_score IS NULL` 且 `judge_claimed_at` 已写」的总时长 =
 
-降级率必须**按阶段分别计算、各自独立熔断**：Value Judge 阶段分母 = 本轮实际送判（未评分）的事件数，中文摘要阶段分母 = 进入摘要的事件数（Top N）；二者各自独立判定，禁止合并计算。某阶段分母 > 0 且其降级率严格超过阈值（`> ratio`，如 `> 0.5`）时，系统必须中止并告警，禁止推送残缺日报。**多通道分发阶段的发送失败不计入 Value Judge / 摘要熔断分母**——分发失败由「单通道隔离 + 该 channel failed 记录 + 下次重试」承载（见每日编排与 telegram-push），不与判断/摘要熔断混算。
+- `F` = **一次补全**的硬超时（`COLLECTOR_FETCH_TIMEOUT_MS`）——**以「整次补全一条 deadline、贯穿全部跳转与 DNS 解析」为前提**（见 source-content-enrichment「一次补全 = 一条 deadline」）。若受控抓取按**每跳各建一个** `AbortSignal.timeout` 实现，真实上限是 `(maxRedirects+1) × F`，本记账即失效——故该实现约束是本不变量的**前提条件**，不是可选优化。超时即按补全失败计、事件照常以仅标题判分。
+- `A × L` = 判分 LLM 的最坏耗时。**`A`（最大尝试次数）绝不可省**：判分的重试重试的是**整个 LLM 调用**，每次尝试**各自**新建一个 `AbortSignal.timeout(L)`，故 `A=3` 时最坏是 **3L**、不是 `L`。超时/失败即计入降级、释放该事件。
+- `W` = LLM 返回后写 `*_score`/事务提交的延迟上界（含 DB 写排队与进程暂停容限）。
+
+故回收阈值必须满足 **`T > F + A×L + W`**。**该下界必须由启动期跨字段校验强制**（`JUDGE_CLAIM_RECLAIM_MS > COLLECTOR_FETCH_TIMEOUT_MS + JUDGE_MAX_ATTEMPTS × LLM_TIMEOUT_MS + JUDGE_WRITE_BUDGET_MS`，不满足即 fail-fast），**禁止**只写在文档里；`A` **必须**从判分模块的那一个常量 **import** 进校验，**禁止**在校验里抄一份字面量副本（两份必然漂移：改了重试次数、忘了改阈值）。
+
+**原不变量 `T > L + W` 在本变更之前就已不成立**（它把 `A×L` 写成了 `L`，且未含 `F`）：按默认值，改动前的真实最坏 = `3 × 60000 + 60000 = 240000 > T = 180000`。它今天只是**潜伏**——`ALERT_SCAN_ENABLED=false`，只有一条判分链，不存在第二个回收者。**开启第二条判分链的变更（`p0-alert-lane`）正是把它引爆的那一个**，故本变更**必须**在开闸之前把它修对，而不是把「默认值组合通过校验」当作正确性的证明。
+
+**claim 的释放必须校验属主（只释放自己那一次 claim，绝不可省）**：判分失败/降级后主动释放 claim（清 `judge_claimed_at`）时，释放的 CAS **必须**同时匹配**本链路 claim 时写入的那个时间戳**（`WHERE event_id=? AND judge_claimed_at=?<本次 claim 值> AND *_score IS NULL`），故 claim 的 CAS **必须**把写入的 `judge_claimed_at` 一并 `RETURNING` 回调用方作为**claim 凭据**。仅以 `WHERE *_score IS NULL` 释放**不足够**：慢链 A claim 事件 E 后卡在补全/LLM 上超过 `T`，链 D **合法回收** E 并重新 claim、开始判分；此时 A 的 LLM 失败并释放 claim——`*_score` 仍为 NULL（D 尚未写分）⇒ A **清掉了 D 的活 claim**，下一 tick 第三条链得以进入、与 D **并发判同一条**，多付一次抓取 + 一次 LLM。写分 CAS 保证了**数据**不被覆写，但**重复判分的成本**只能由属主校验挡住。相应地，「一事件只被评一次分」**禁止**被表述为由 claim 单独保证：claim（含属主校验）**降低**重复判分的概率，「只评一次、永不覆写」的**结构**保证是下面的写分 CAS。
+
+**claim 凭据的形态必须能逐微秒往返，禁止经 JS `Date` 传递（绝不可省）**：`judge_claimed_at` 是 `timestamptz`、由 `now()` 写入，精度为**微秒**（生产实测约 99.9% 的行带非零微秒位）；而 ORM 默认把它映射为**毫秒**精度的 JS `Date`。若 claim 凭据以 JS `Date` 回传、再以该值做等值比较，微秒位在往返中被**截断**⇒ 释放的 CAS **几乎恒不命中**⇒ 属主校验退化为**永久 no-op**：判分失败的事件再也无法提前释放，每一条都必须锁满整个回收阈值 `T`，本应「省成本」的修复反而变成「更慢」的回归。故 claim 凭据 **必须**以**能保全微秒的形态**往返（如 `RETURNING judge_claimed_at::text`，释放侧再由 PG 解析回 `timestamptz` 比较；或改用独立的 token 列），**禁止**以 JS `Date` 承载。该形态要求 **必须**由跑在**真实 PostgreSQL** 上的往返测试守住（claim → 取凭据 → 立即释放 → 断言 `judge_claimed_at` 确已置 NULL）：内存桩会喂给它整毫秒的时间戳，使截断不暴露、测试**假绿**。
+
+**写分 CAS 必须自带 `*_score IS NULL` 守卫（永不覆写的最后一道结构保证，绝不可省）**：即便回收阈值算对，「一事件只被评一次分、永不覆写」也**禁止**只由时间阈值担保——时间不变量依赖于「所有超时都真的被 `AbortSignal` 兜住」这一实现前提（DNS 解析、进程 STW 暂停、容器被冻结等均可越过它）。故评分写回的 CAS **必须**在 `WHERE` 中同时含 **`importance_score IS NULL`**（与 `merged_into IS NULL` 并列）：即使误回收真的发生，后写者也只会命中 0 行（无害空写、按既有 0 行路径处理），**绝不覆写先写者已落库的分数**。
+
+降级率必须**按阶段分别计算、各自独立熔断**：Value Judge 阶段分母 = 本轮实际送判（未评分）的事件数，中文摘要阶段分母 = 进入摘要的事件数（Top N）；二者各自独立判定，禁止合并计算。某阶段分母 > 0 且其降级率严格超过阈值（`> ratio`，如 `> 0.5`）时，系统必须中止并告警，禁止推送残缺日报。**正文补全的失败绝不计入任何熔断分母**（它是 best-effort 富化，失败即仅标题回退、事件照常判分——把它计入分母会让一次上游站点故障熔断整条日报）。**多通道分发阶段的发送失败不计入 Value Judge / 摘要熔断分母**——分发失败由「单通道隔离 + 该 channel failed 记录 + 下次重试」承载（见每日编排与 telegram-push），不与判断/摘要熔断混算。
 
 某阶段分母为 0 时（本轮无未评分事件、或 Top N 为空）必须禁止按 `0/0` 计算降级率；但**分母为 0 本身不是错误、不得据此中止**——Value Judge 分母 = 0 时直接进入 Top N 选择（已评分常青事件仍可入选），中文摘要分母 = 0（Top N 为空）时无可推、正常不推。禁止把「Value Judge 分母 = 0」误判为「今日无候选」而中止。
 
 「系统级故障」告警必须以**采集/规范化层**为准而非以 judge 分母为准，**且仅适用于日报工作流（`runDailyWorkflow`）**——实时告警高频工作流（每 15–30min 跑、全源返回 0 是常态）**不套用**本告警，否则会每天数十次误告警刷屏（见 realtime-alerts）。以下两种情形日报工作流必须以可观测方式告警，而非静默空跑：
-1. 本轮采集返回条数为 0（**registry 全部源**失败——P2 由 P1 的「三源」扩为 registry 注册的全部源 RSS/HN/GitHub/arXiv/Product Hunt，单个源失败如 arXiv 持续 429 被 allSettled 隔离、不触发本告警，唯有全部源返回 0 才告警）；
+1. 本轮采集返回条数为 0（**registry 全部源**失败——单个源失败如 arXiv 持续 429 被 allSettled 隔离、不触发本告警，唯有全部源返回 0 才告警）；
 2. 本轮采集返回条数 > 0 但**新闻类可处理条目数为 0**（全部 `unprocessable`，即无任何**新闻类**条目能构造 `dedup_key`）——提示采集器采空或归一函数故障。
 
 注意告警分母只统计**新闻类**条目：`raw_type IN ('product','paper')` 的产品/论文条目**不计入**「新闻类可处理条目数」（它们不进事件塌缩，见 dedup-and-normalization 类型路由）——否则某轮仅 arXiv 返回 paper、新闻源全空时，paper 会掩盖新闻真空使告警失灵；反之新闻真空必须照常告警。「可处理条目数」必须包含「塌缩进已存在新闻事件」的条目；「当日全部新闻条目命中既有事件、无新事件」属正常无新闻情形、不告警；唯有「全部新闻条目 unprocessable 或无新闻条目」才告警。
@@ -183,19 +197,23 @@
 
 #### 场景:并发评分只评一次不覆写
 - **当** 日报链与实时告警高频链同时取到同一未评分事件送评分
-- **那么** 仅原子 claim（`UPDATE ... judge_claimed_at WHERE *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now()-T) RETURNING`）成功的一条链路送 LLM，另一条跳过，该事件只被评一次、`*_score` 不被覆写
+- **那么** 仅原子 claim（`UPDATE ... judge_claimed_at WHERE *_score IS NULL AND (judge_claimed_at IS NULL OR judge_claimed_at < now()-T) RETURNING`）成功的一条链路执行「补全 + 送 LLM」，另一条跳过；且评分写 CAS 自带 `importance_score IS NULL` 守卫，故该事件只被评一次、`*_score` **在任何交错下**都不被覆写
 
 #### 场景:claim 后崩溃的事件经 T 后被重新评分
 - **当** 某事件被 claim（`judge_claimed_at` 已写）后进程崩溃、`*_score` 仍为 NULL
-- **那么** 经回收阈值 `T`（满足 `T > L + W`，见上）后，后续运行因 `judge_claimed_at < now()-T` 重新 claim 到该事件并评分，不形成永久漏评分
+- **那么** 经回收阈值 `T`（满足 `T > F + A×L + W`，见上）后，后续运行因 `judge_claimed_at < now()-T` 重新 claim 到该事件并评分，不形成永久漏评分
 
 #### 场景:正在评分的长事件不被误回收
-- **当** 某事件正被一条链路合法评分中（LLM 调用受硬超时 `L`，写分提交延迟上界 `W`，回收阈值 `T > L + W`）
-- **那么** 该事件停在「score NULL + 已 claim」的总时长恒 `< L + W < T`，不可能存活到 `now()-T`，故另一链路不会因超时回收误重新 claim 它、不双评分覆写
+- **当** 某事件正被一条链路合法处理中：补抓受**整次一条** deadline `F`（`COLLECTOR_FETCH_TIMEOUT_MS`，含全部跳转与 DNS 解析）、LLM 的 `A` 次尝试各受硬超时 `L`（`JUDGE_MAX_ATTEMPTS × LLM_TIMEOUT_MS`）、写分提交延迟上界 `W`（`JUDGE_WRITE_BUDGET_MS`），回收阈值 `T > F + A×L + W`（启动期跨字段校验，不满足即 fail-fast）
+- **那么** 该事件停在「score NULL + 已 claim」的总时长恒 `< F + A×L + W < T`，不可能存活到 `now()-T`，故另一链路不会因超时回收误重新 claim 它、不双评分覆写；`T > L + W`（漏乘重试次数 `A`、未含补抓）**不足以**保证这一点——它是改动前就已不成立的假不变量
+
+#### 场景:误回收真的发生时写分 CAS 兜住不覆写
+- **当** 某事件因超出任何时间不变量的兜底范围（如 DNS 解析挂起、进程长 STW 暂停、容器被冻结）被另一链路误回收并重新 claim、送 LLM 后回来写分，而先写者已把 `*_score` 落库
+- **那么** 后写者的评分写 CAS（`WHERE event_id=? AND importance_score IS NULL AND merged_into IS NULL`）**命中 0 行**、按既有 0 行路径处理（不计 scored、不稀释熔断分母），先写者的分数**不被覆写**——「一事件只被评一次分、永不覆写」不依赖时间阈值算得准
 
 #### 场景:任一阶段降级率过高时中止告警
 - **当** Value Judge 或中文摘要任一阶段分母 > 0 且其降级率严格超过阈值
-- **那么** 系统中止本次流水线并告警，不推送残缺日报；摘要阶段的少量失败不因 judge 阶段大分母被稀释而漏判
+- **那么** 系统中止本次流水线并告警，不推送残缺日报；摘要阶段的少量失败不因 judge 阶段大分母被稀释而漏判；正文补全的失败不计入任一分母、不参与熔断判定
 
 #### 场景:Value Judge 分母为 0 时仍推送已评分常青事件
 - **当** 本轮塌缩后无任何未评分事件（Value Judge 分母 = 0），但存在已评分、`should_push=true`、从未 success 的常青事件
@@ -283,19 +301,32 @@
 
 ### 需求:日报链在 Value Judge 之前运行正文补全阶段
 
-`runDailyWorkflow()` 的顺序链**必须**在硬去重塌缩**之后**、Value Judge 判分（`scoreUnscoredEvents`）**之前**插入一个正文补全阶段（source-content-enrichment），对**待判事件**代表 raw_item 中 `content` 为空且有可抓 URL 的行补抓正文写回 `raw_items.content`。该阶段**必须** best-effort、逐条隔离、永不向上抛错中止流水线，**禁止**计入任何降级率熔断分母（熔断分母仍只含 Value Judge 与中文摘要两阶段，既有口径不变）。补全阶段失败或整体跳过时，判分与摘要按各自的仅标题回退路径继续。
+`runDailyWorkflow()` **禁止**把正文补全作为**独立编排的阶段**（原阶段 2.6）挂在顺序链上。正文补全（source-content-enrichment）**必须**内联在**共享判分入口** `scoreUnscoredEvents` 之内、位于每个事件**原子 claim 成功之后、送 LLM 之前**（见 source-content-enrichment「补全必须是判分入口内的第一步」）。日报链只调判分入口，补全随之发生。
 
-**位序须按阶段名锚定、非按行号**：塌缩之后、判分之前的窗口内**还含语义合并阶段（阶段 2.5，`semanticMergeEvents`）**，其灰区 LLM 合并判也消费 `raw_items.content`。补全阶段**放在语义合并之后、Value Judge 之前**（即链序为「塌缩 → 语义合并 → 正文补全 → Value Judge」）：此为**有意选择**——① 语义去重是明确非目标，合并判维持仅标题现状、本变更不改；② 补全放在合并之后只富化**存活代表事件**、不对随即被 tombstone 的事件浪费抓取。故语义合并的合并判**仍仅标题**，是已知且接受的取舍（须在 design 记录），**不**视作补全缺陷。
+**为何删掉这个阶段（结构 > 编排）**：补全工作集与判分工作集**同键**（`importance_score IS NULL ∧ merged_into IS NULL`），前者是后者的**真子集**；而评分**一生一次**。判分入口是**共享的**（日报链 + 实时告警链 `alert-scan`，后者每 15–20 分钟一轮）。只要有一条链**只判分不补全**，被它先判的事件就**永久离开补全工作集** ⇒ 日报链的补全阶段**永久空转**、source-content-enrichment 沦为死代码。把补全折进判分入口，使「先补全再判分」成为**单一函数内的语句顺序**而非跨链的散文约定，任何调用方（含未来的第三个）**不可能漏**。
 
-**补全工作集须与判分集同口径**：补全的待判集**必须**等于 `scoreUnscoredEvents` 将判的集合（`importance_score IS NULL AND merged_into IS NULL`，其中空 content + 可抓 URL 者），以保证「凡被判事件皆先补全（除非补全失败）」这一 value-judge-agent 普遍约束不被工作集口径差漏穿（见 source-content-enrichment「待判工作集」）。
+**日报链内的链序不变**：仍为「塌缩 → 语义合并（阶段 2.5） → 判分入口（补全 → Value Judge）」。补全依然发生在语义合并之后、判分之前；`ALERT_SCAN_ENABLED` 关闭时（日报链为唯一调用方），本变更**行为等价于**改动前。
 
-放在判分之前的原因：`is_ai_related` 与各项评分、以及中文摘要都必须以真实正文而非仅标题为依据；补全先行才能同时 grounding 判分（value-judge-agent）与摘要（chinese-digest-agent）。
+补全**必须** best-effort、逐条隔离、**永不向上抛错中止任何调用链**（不止 `runDailyWorkflow()`），**禁止**计入任何降级率熔断分母（熔断分母仍只含 Value Judge 与中文摘要两阶段，既有口径不变）。补全失败时该事件**照常判分**（仅标题回退，绝不 fail-closed 跳过），摘要按其仅标题回退路径继续。补全的命中/失败计数**必须**随判分入口的结果返回，并由**每一条**调用链各自的日志暴露（日报链与告警链都要看得见）。
 
-**作用域仅日报链、实时告警链不在本期范围（须显式记录）**：`scoreUnscoredEvents` 为日报链与**实时告警链（`alert-scan`）共用**，且评分为一生一次（`importance_score IS NULL` + 原子 claim 防双评分）。本补全阶段**只编排在日报链**内；被告警链**先**判分的事件将得到**仅标题**的 `is_ai_related`（日报补全无法再回灌，因评分不重跑）。此外告警推送候选走 `alert-scan` 自有查询、**本期不加 `is_ai_related` 闸门**。二者均为**本期显式非目标**：本变更只硬化**日报**要闻/新品段的「非 AI 泄漏」与错误简介；告警链的 grounding 缺口与非 AI 事件经告警泄漏属独立后续（如需，另起提案对告警候选加同一 fail-closed 闸门或在告警链前置补全）。此边界**必须**在 proposal 非目标与 design 显式记录，避免把「enrichment grounding 提升闸门质量」误呈为对所有入口普适。
+**「补全只富化存活代表事件」的取序理由已失效（本需求修改点，MUST 显式接受）**：原规范以「补全放在语义合并之后 ⇒ 只富化存活代表、不对随即被 tombstone 的事件浪费抓取」为取序依据，并据此断言「语义合并的合并判**仍仅标题**」。补全内联进共享判分入口后，这两条在**存在第二条判分链**时**均不再成立**：
+
+- **白抓**：告警链的补全先于日报链的语义合并，可能为随后被合并成 tombstone 的事件白抓一次 HTTP。**代价有界**（每事件至多一次、best-effort、不入熔断分母），**接受**；**不**为它加「先看会不会被合并」的前置查询。
+- **语义合并的灰区判输入变了（用户可见的行为变化，MUST 显式接受而非泄漏）**：语义合并的灰区 LLM 判消费 `raw_items.content`。今天日报链的语义合并跑在补全之前，本轮新事件恒无 `content`、灰区判**仅标题**；开启第二条判分链后，事件可能**已被该链补全并写回** `raw_items.content`，故灰区判的输入由「**仅标题**」变为「**标题 + Content**」。**误并率会动、方向不明**（正文让真同事件更易判同，也让不同事件因共享样板/模板正文更易判同）。故：本变更**不动**任何语义去重阈值与合并逻辑；且**因 `ALERT_SCAN_ENABLED` 保持关闭，该变化不随本变更上线**；**开启该门的变更——即 `p0-alert-lane`（它是本仓开启 `ALERT_SCAN_ENABLED` 的那一个变更）——MUST 把「灰区判输入含正文后的误并率」列入其观察项，且 MUST 以可执行的 DB 复算 SQL 给出（观察窗内 `merged_into IS NOT NULL` 占比 vs 开闸前基线），MUST NOT 只写散文**；MUST NOT 默认「语义合并输入未变」。
+
+**作用域不再仅日报链（本需求修改点）**：原规范把「告警链先判分的事件只得到仅标题 `is_ai_related`」列为**显式非目标**；该缺口**由本需求闭合**——告警链调用同一判分入口，自动获得补全。仍为非目标的是：**告警推送候选查询不加 `is_ai_related` 闸门**（属独立提案）。
 
 #### 场景:正文补全阶段编排在语义合并后判分前
-- **当** `runDailyWorkflow()` 执行到 Value Judge 判分之前
-- **那么** 系统在语义合并阶段之后、判分之前运行正文补全阶段（对判分集内空 content 且有可抓 URL 的代表 raw_item 补抓），再进入判分；补全失败不阻塞后续阶段、不进熔断分母；语义合并判维持仅标题（有意取舍）
+- **当** `runDailyWorkflow()` 执行到 Value Judge 判分
+- **那么** 日报链**不再**有独立的正文补全阶段；补全作为判分入口的第一步（claim 之后、送 LLM 之前）发生，故仍在语义合并阶段之后、判分之前；补全失败不阻塞该事件的判分、不阻塞后续阶段、不进熔断分母
+
+#### 场景:告警链无需自行编排即获得正文补全
+- **当** `ALERT_SCAN_ENABLED=true`，实时告警链每 15–20 分钟调一次 `scoreUnscoredEvents`，其自身**未**编排任何补全步骤
+- **那么** 它判分的空正文事件仍先经补全再送 LLM；日报链的补全域**不被它清空**（source-content-enrichment 不沦为死代码），亦**不需要**在 `alert-scan` 里抄第二份补全编排
+
+#### 场景:告警链先补全致语义合并灰区判拿到正文（显式接受的行为变化）
+- **当** `ALERT_SCAN_ENABLED=true`，某事件已被告警链补全并写回 `raw_items.content`，随后日报链的语义合并对它做灰区 LLM 判
+- **那么** 该灰区判的输入含 `Content:` 段（而非改动前的仅标题）；这是**已显式接受**的行为变化，本变更不因此调整任何语义去重阈值或合并逻辑；开启 `ALERT_SCAN_ENABLED` 的那个变更（`p0-alert-lane`）须把由此产生的误并率变化列入观察项，并给出可执行的 DB 复算 SQL
 
 ### 需求:要闻候选须 AI 相关
 
