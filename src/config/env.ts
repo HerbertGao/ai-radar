@@ -3,6 +3,9 @@
 // 本地 `cp .env.example .env` 填好后 `npm run dev` 等脚本即可读到（修复 README 快速开始）。
 import 'dotenv/config';
 import { z } from 'zod';
+// cron 分钟展开器（零依赖叶子 cron-minutes.ts，与 env.test.ts 的避整点判据同一份文法，绝不抄第二份）：
+// 本文件只消费「cron 周期计算」这一个生产路径（告警侧判分预算 superRefine，p0-alert-lane A5.1c）。
+import { expandCronMinutes } from './cron-minutes.js';
 // 仅取类型（verbatimModuleSyntax 下 import type 编译期擦除）：不引入 collectors 运行期依赖，
 // 保 env.ts 作为基础配置模块不被 opencc-js/emoji-regex 等采集侧重依赖污染、且无循环依赖。
 import type { CollectorSource } from '../collectors/types.js';
@@ -248,6 +251,43 @@ const stalenessOverrideMap = z
  */
 export const JUDGE_MAX_ATTEMPTS = 3;
 
+/**
+ * 告警高频链每轮判分工作预算 N（p0-alert-lane A5.1b / design D11）。**只对告警链生效**：
+ * alert-scan.ts 判分调用显式传 `{ ...options.judge, maxPerRun: N }`；日报链不传、保持全量无界——
+ * 绝不可把 N 写成 scoreUnscoredEvents 的缺省值（日报链会被一并截到 N 条/天：要闻段枯竭，且
+ * 「告警链取序不饿死老事件」的论证——老事件由无界日报链排空——当场坍塌）。
+ *
+ * 取值 MUST 满足 `N × (F + A×L + W) < ALERT_SCAN_CRON 周期`（由下方 superRefine 启动期强制）：
+ *   F = COLLECTOR_FETCH_TIMEOUT_MS（15s，补全整次抓取）
+ *   A×L = JUDGE_MAX_ATTEMPTS(3) × LLM_TIMEOUT_MS（60s）
+ *   W = JUDGE_WRITE_BUDGET_MS（60s）——与 T > F+A×L+W 的 claim 回收阈值同一口径
+ *   ⇒ 每条最坏 255s（末次尝试成功仍要写分）⇒ 15 分钟 cron ⇒ N ≤ 3。
+ * 反例：取 20（回填上限 PUBLISHED_AT_INFERENCE_MAX_PER_RUN 的「自然」量级）⇒ 单轮最坏 85 分钟
+ * ≈ 周期的 6 倍 ⇒ alert-queue concurrency:1 下队列越积越长 ⇒ 车道仍不可用——不满足上式的 N
+ * 兑现不了「判分有界」的目的。
+ * 口径区分：预算口径每条最坏 = F+A×L+W（成功仍写分）；「重渲染风暴 11.5h」口径 = F+A×L
+ * （LLM 全挂无写分）——两者各自正确，绝不互相替换。
+ * 常量落本文件（与该 superRefine 同文件 ⇒ 无 import 环；expandCronMinutes 在零依赖叶子）。
+ */
+export const ALERT_JUDGE_MAX_PER_RUN = 3;
+
+/**
+ * 分钟集在 mod-60 环上的最小相邻间隔（分钟）：单元素环绕到下一小时 ⇒ 60。
+ * 该环间隔是任意 cron 真实最小触发间隔的【下界】（小时字段收窄只会拉大真实间隔）⇒ 以它作
+ * 周期做 `<` 校验对任何 cron 形态都只会偏严、绝不偏松（fail-closed 方向正确）——小时字段
+ * 非 `*` 时判据仍安全，无需另设守卫。
+ */
+function minRingGapMinutes(minutes: Set<number>): number {
+  const sorted = [...minutes].sort((a, b) => a - b);
+  if (sorted.length === 1) return 60;
+  // 环绕间隔（末元素 → 下一小时的首元素）与相邻差取最小。
+  let gap = sorted[0]! + 60 - sorted[sorted.length - 1]!;
+  for (let i = 1; i < sorted.length; i++) {
+    gap = Math.min(gap, sorted[i]! - sorted[i - 1]!);
+  }
+  return gap;
+}
+
 const envSchema = z.object({
   DATABASE_URL: z
     .string()
@@ -385,8 +425,11 @@ const envSchema = z.object({
   ALERT_IMPORTANCE_THRESHOLD: z.coerce.number().min(0).max(100).default(85),
   // 实时告警高频轮询 cron（BullMQ repeat.pattern）。默认每 15 分钟（落 base spec「15–30 分钟」保守窗口内、
   // 对稀有 P0 已足够即时；仍 env 可配，靠真实数据调）。
+  // 取 4-59/15（分钟展开集 {4,19,34,49}）而非 */15：*/15 展开 {0,15,30,45}，同时撞整点与半点——
+  // 飞书自定义机器人限流（11232）的全网高压时刻；4-59/15 保持同样的 15 分钟节奏但全程错峰
+  // （feishu-push 避整点判据：分钟展开集 ∩ {0,30} = ∅，由 env.test.ts 机械断言）。
   // 高频链路全源 0/空轮是常态、不告警；只采实时新闻源 {rss,hacker_news,github}，不碰 arXiv/PH。
-  ALERT_SCAN_CRON: z.string().min(1).default('*/15 * * * *'),
+  ALERT_SCAN_CRON: z.string().min(1).default('4-59/15 * * * *'),
   ALERT_SCAN_CRON_TZ: z.string().min(1).default('Asia/Shanghai'),
   ALERT_SCAN_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
   // 告警单例锁 `alert:{event_id}`（per-event，覆盖该事件向所有通道的分发）TTL（毫秒）：job 级短时持有，
@@ -624,6 +667,30 @@ const envSchema = z.object({
       });
     }
   })
+  // 不支持的配置组合 fail-fast（p0-alert-lane A4.1，守 policy-push-timeliness）：
+  // ALERT_SCAN_ENABLED='true' ∧ ALERT_FIRST_SEEN_WINDOW_DAYS=0（旁路时效下界）∧
+  // ALERT_MIN_PUBLISHED_AT=''（显式 opt-out 基线水位）——同时旁路时效下界与基线水位后，告警候选
+  // 谓词只剩「published_at 非 NULL 且 <= now」，候选域扩成【全表历史】，每条历史事件都可能被当作
+  // P0 批量推送（直撞「禁止上线后批量推旧消息」红线）。规范只写「MUST NOT 在生产使用」不构成保证，
+  // 须启动期拒绝。不新增 env——这是既有三个变量之间的跨字段不变量（同上一条 superRefine 先例）。
+  .superRefine((data, ctx) => {
+    if (
+      data.ALERT_SCAN_ENABLED === 'true' &&
+      data.ALERT_FIRST_SEEN_WINDOW_DAYS === 0 &&
+      data.ALERT_MIN_PUBLISHED_AT === ''
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ALERT_FIRST_SEEN_WINDOW_DAYS'],
+        message:
+          `不支持的配置组合：ALERT_SCAN_ENABLED='true' 且 ALERT_FIRST_SEEN_WINDOW_DAYS=0（旁路时效下界）` +
+          `且 ALERT_MIN_PUBLISHED_AT=''（显式放弃基线水位）。三者同时成立使告警候选域扩成全表历史，` +
+          `任何历史旧事件都可能被当作 P0 批量推送（违反 policy-push-timeliness）。请任改其一：` +
+          `① ALERT_FIRST_SEEN_WINDOW_DAYS 设 > 0（恢复时效下界）；` +
+          `② ALERT_MIN_PUBLISHED_AT 设为 ISO 基线时刻；③ 关闭 ALERT_SCAN_ENABLED。`,
+      });
+    }
+  })
   // 并发评分原子 claim 回收阈值不变量（realtime-alerts / daily-intel-pipeline「降级逐条容错」）：
   // 正文补全折进判分入口后，一个被 claim 的事件的合法停留时长 = F + A×L + W
   //   F = COLLECTOR_FETCH_TIMEOUT_MS（补全整次抓取超时）
@@ -646,6 +713,52 @@ const envSchema = z.object({
           `F + A×L + W = COLLECTOR_FETCH_TIMEOUT_MS(${F}) + JUDGE_MAX_ATTEMPTS(${JUDGE_MAX_ATTEMPTS})×LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}) ` +
           `+ JUDGE_WRITE_BUDGET_MS(${W}) = ${minReclaim}ms。补全折进判分入口后 F 进预算、A×L 因重试整个 LLM 调用而必须乘。` +
           `否则正在合法补全/评分/写分的事件会被另一链路误回收 → 双评分覆写。请上调 JUDGE_CLAIM_RECLAIM_MS 到 > ${minReclaim}。`,
+      });
+    }
+  })
+  // 告警侧判分预算不变量（p0-alert-lane A5.1c / design D11）：N × (F + A×L + W) < ALERT_SCAN_CRON 周期。
+  // 五项里四项是 env（F / L / W / cron 周期）——把 N 硬编码 + 约束留在散文里 ⇒ 生产上调 LLM_TIMEOUT_MS
+  // （或把 cron 调密）时约束静默失效 ⇒ 单轮判分又超周期 ⇒ alert-queue concurrency:1 下队列积压 ⇒
+  // P0 车道回到不可用，无一处变红。与上面 T > F+A×L+W 同一标准：启动期强制，禁止只写在文档里。
+  // **以 ALERT_SCAN_ENABLED='true' 为合取门**（同 A4.1 先例）：N 约束只对告警链有意义，纯日报部署
+  // （车道关）不得因 alert cron × LLM 超时组合被拒启动。（T 的 superRefine 不门控——claim 不变量对
+  // 两条链都成立，本条不是。）N ≥ 1 同为约束：N=0（周期短于单条最坏时长，如 */3）意味着告警链每轮
+  // 判 0 条、车道静默退化为「等日报链判分」，MUST fail-fast 而非静默接受。
+  .superRefine((data, ctx) => {
+    if (data.ALERT_SCAN_ENABLED !== 'true') return;
+    const N = ALERT_JUDGE_MAX_PER_RUN;
+    const F = data.COLLECTOR_FETCH_TIMEOUT_MS;
+    const AL = JUDGE_MAX_ATTEMPTS * data.LLM_TIMEOUT_MS;
+    const W = data.JUDGE_WRITE_BUDGET_MS;
+    // cron 周期 = expandCronMinutes（与避整点判据同一份文法）展开分钟集在 mod-60 环上的最小相邻间隔。
+    let periodMs: number;
+    try {
+      periodMs = minRingGapMinutes(expandCronMinutes(data.ALERT_SCAN_CRON)) * 60_000;
+    } catch (err) {
+      // 展开器对生产 cron 值抛错（文法/数值非法）⇒ 同样 fail-fast（fail-closed，与避整点判据同向）——
+      // 绝不静默跳过校验（跳过 = 预算不变量在非法 cron 下无人守）。
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ALERT_SCAN_CRON'],
+        message:
+          `ALERT_SCAN_CRON="${data.ALERT_SCAN_CRON}" 的分钟字段无法展开` +
+          `（${err instanceof Error ? err.message : String(err)}），` +
+          `无法校验告警侧判分预算不变量 N × (F + A×L + W) < cron 周期——fail-closed 拒绝启动。`,
+      });
+      return;
+    }
+    if (!(N >= 1 && N * (F + AL + W) < periodMs)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ALERT_SCAN_CRON'],
+        message:
+          `告警侧判分预算不变量不成立：须 N ≥ 1 且 N × (F + A×L + W) < ALERT_SCAN_CRON 周期，` +
+          `当前 ${N} × (${F} + ${AL} + ${W}) = ${N * (F + AL + W)}ms ≥ 周期 ${periodMs}ms。五项当前值：` +
+          `N=ALERT_JUDGE_MAX_PER_RUN(${N})、F=COLLECTOR_FETCH_TIMEOUT_MS(${F}ms)、` +
+          `A×L=JUDGE_MAX_ATTEMPTS(${JUDGE_MAX_ATTEMPTS})×LLM_TIMEOUT_MS(${data.LLM_TIMEOUT_MS}ms)=${AL}ms、` +
+          `W=JUDGE_WRITE_BUDGET_MS(${W}ms)、cron 周期=${periodMs}ms（ALERT_SCAN_CRON="${data.ALERT_SCAN_CRON}"）。` +
+          `单轮判分最坏时长 ≥ cron 周期 ⇒ concurrency:1 下队列越积越长 ⇒ P0 车道不可用。` +
+          `请下调 LLM_TIMEOUT_MS / COLLECTOR_FETCH_TIMEOUT_MS / JUDGE_WRITE_BUDGET_MS，或把 ALERT_SCAN_CRON 周期调宽。`,
       });
     }
   })

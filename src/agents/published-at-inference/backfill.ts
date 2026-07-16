@@ -32,6 +32,7 @@ import {
   acquireAlertLock,
   type AcquireAlertLockOptions,
 } from '../../pipeline/alert-lock.js';
+import { alertGatePredicate } from '../../pipeline/alert-gate.js';
 import {
   inferPublishedAt,
   DEFAULT_MAX_ATTEMPTS,
@@ -52,7 +53,8 @@ export function publishedAtInferLockKey(eventId: string): string {
 /**
  * 回填作用域（候选条件）——由两条链分别传入：
  * - 日报链：`{ kind: 'daily' }` → `should_push = true`。
- * - 告警链：`{ kind: 'alert', threshold }` → `importance_score IS NOT NULL AND >= threshold`。
+ * - 告警链：`{ kind: 'alert', threshold }` → 告警闸共享构造器 alertGatePredicate
+ *   （`importance_score IS NOT NULL AND is_ai_related = true AND importance_score >= threshold`）。
  */
 export type BackfillScope =
   | { kind: 'daily' }
@@ -106,11 +108,10 @@ function scopePredicate(scope: BackfillScope): SQL {
     // 日报链：Value Judge 写过 should_push=true 的事件才进回填域（评分后才有 should_push）。
     return eq(aiNewsEvents.shouldPush, true);
   }
-  // 告警链：评分后达阈值（importance_score 非 NULL 且 >= threshold）。
-  return and(
-    sql`${aiNewsEvents.importanceScore} IS NOT NULL`,
-    gte(aiNewsEvents.importanceScore, String(scope.threshold)),
-  ) as SQL;
+  // 告警链：与告警闸【同一个】共享构造器（alertGatePredicate：已评分 ∧ is_ai_related=true ∧
+  // importance>=threshold）——回填域 == 告警闸的共享谓词段，结构上杜绝两个方向的漂移
+  // （宽 → 闸外事件占掉 LIMIT 名额饿死闸内 NULL 事件；窄 → 闸内 NULL 事件被静默丢弃，design D3）。
+  return alertGatePredicate(scope.threshold);
 }
 
 /**

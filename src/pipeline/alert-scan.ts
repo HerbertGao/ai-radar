@@ -2,11 +2,12 @@
  * 实时重大发布告警高频工作流（realtime-alerts，design D6）。
  *
  * 一个**独立于 runDailyWorkflow** 的高频轻量工作流（独立 BullMQ 调度入口，频率 env 可配，
- * 默认每 20min）。纯顺序确定性流：
+ * 默认 4-59/15，15 分钟节奏）。纯顺序确定性流：
  *   采集（**只跑实时新闻源 {rss, hacker_news, github}**，排除 arXiv 非实时 / PH 配额受限）
  *   → 入库 → 去重塌缩
  *   → 对未评分事件评分（与日报链共用 scoreUnscoredEvents，含并发原子 claim 防双评分）
- *   → **评分后**判 `importance_score IS NOT NULL AND >= 阈值`（默认 85，env 可配，纯程序阈值）
+ *   → **评分后**判告警闸 `importance_score IS NOT NULL AND is_ai_related = true AND >= 阈值`
+ *     （阈值默认 85，env 可配，纯程序判定；AI 闸 fail-closed，见 alert-gate.ts 共享构造器）
  *   → 对达阈值且「从未以该 channel success 告警过」的事件推送告警
  *
  * 关键不变量（绝不可违背，realtime-alerts / design D6）：
@@ -43,7 +44,12 @@
 import { and, desc, eq, gte, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../db/index.js';
 import { aiNewsEvents, pushRecords, rawItems } from '../db/schema.js';
-import { env, isFeishuEnabled, alertMinPublishedAt } from '../config/env.js';
+import {
+  env,
+  isFeishuEnabled,
+  alertMinPublishedAt,
+  ALERT_JUDGE_MAX_PER_RUN,
+} from '../config/env.js';
 import { digestEvent } from '../agents/digest/persistence.js';
 import type { SummarizeOptions } from '../agents/digest/index.js';
 import {
@@ -67,6 +73,7 @@ import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
 import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
+import { alertGatePredicate } from './alert-gate.js';
 import { backfillPublishedAt } from '../agents/published-at-inference/backfill.js';
 import type { InferPublishedAtOptions } from '../agents/published-at-inference/index.js';
 import type { RunContext } from './run-context.js';
@@ -167,7 +174,9 @@ interface AlertCandidate {
  * 查「评分后达阈值且从未以任一通道 success 告警过」的候选事件（realtime-alerts 一生一次）。
  *
  * 条件（全在 SQL 程序层，无 LLM）：
- *   importance_score IS NOT NULL AND importance_score >= 阈值   ← 判定必在评分后（NULL 不误判）
+ *   告警闸（alertGatePredicate 共享构造器）：importance_score IS NOT NULL（判定必在评分后，NULL
+ *     不误判）AND is_ai_related = true（AI 闸 fail-closed，false/NULL 一律排除，不含 should_push）
+ *     AND importance_score >= 阈值
  *   AND NOT EXISTS (push_records WHERE target_type='alert' AND target_id=event_id
  *                     AND status='success')   ← 任一通道从未 success 告警（channel-agnostic）
  *   AND 时效闸（闭区间）：windowDays>0 → lowerBound <= published_at <= now（下界隐含非 NULL）；
@@ -235,9 +244,10 @@ export async function selectAlertCandidates(
     .leftJoin(rawItems, eq(aiNewsEvents.representativeRawItemId, rawItems.id))
     .where(
       and(
-        // 判定必在评分后：importance_score 非 NULL（评分前为 NULL，`NULL >= 阈值` 恒假，不误判）。
-        isNotNull(aiNewsEvents.importanceScore),
-        gte(aiNewsEvents.importanceScore, String(threshold)),
+        // 告警闸（共享构造器，p0-alert-lane A3）：已评分（NULL 不误判）∧ is_ai_related=true
+        // （fail-closed，false/NULL 一律排除）∧ importance>=阈值。与回填域（backfill.ts scopePredicate
+        // alert 分支）同调同一构造器——回填域 == 告警闸的共享谓词段，结构上杜绝漂移（design D3）。
+        alertGatePredicate(threshold),
         // P3 tombstone 排除（合并核心闭环）：不对已被日报链合并掉的死 event_id 告警（spec「tombstone
         // 对所有下游消费者不可见」）。注：告警链不调语义合并，但日报链合并的 tombstone 仍存于库中。
         isNull(aiNewsEvents.mergedInto),
@@ -346,12 +356,32 @@ export async function runAlertScan(
 
   // ── 阶段 3：对未评分事件评分（与日报链共用，含并发原子 claim 防双评分）。
   //    评分必在阈值判定**之前**：保证下一步判定时 importance_score 已写（不 NULL 误判）。
+  //    **判分预算（p0-alert-lane A5.2 / design D11）**：告警链是高频车道，判分 MUST 有界——每轮最多
+  //    判 ALERT_JUDGE_MAX_PER_RUN 条（N × (F + A×L + W) < cron 周期，env.ts superRefine 启动期强制），
+  //    余量下一轮续判（超预算事件从未被 claim，见 score-events.ts 候选 SELECT 注释）。显式值放 spread
+  //    之【后】：将来某个 judge 注入体若带 maxPerRun，预算恒胜、车道不会静默回到无界（前瞻性防御——
+  //    spread 只复制自有属性，今日注入体不含该键时反序也不会覆盖成 undefined）。
+  //    日报链（run-daily-workflow.ts）**不传** ⇒ 保持全量无界，两个理由缺一不可：① 一天一次，无界是
+  //    它的正确形态；② 它是本链 first_seen_at DESC 取序不饿死老事件的唯一依据——老的未评分事件过
+  //    不了下方告警闸的时效地板（判了也不告警、花预算是纯浪费），由无界的日报链在 ≤24h 内排空。
   emit('stage.score');
-  const judgeResult = await scoreUnscoredEvents(options.judge, dbh);
+  const judgeResult = await scoreUnscoredEvents(
+    { ...options.judge, maxPerRun: ALERT_JUDGE_MAX_PER_RUN },
+    dbh,
+  );
   log(
     `评分: 送判 ${judgeResult.judged} 条, 降级 ${judgeResult.degradedCount} 条, claim 跳过 ${judgeResult.claimSkipped} 条` +
-      `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}`,
+      `, 正文补全命中 ${judgeResult.enrichHit} / 失败 ${judgeResult.enrichFail}` +
+      `, 判分预算 ${judgeResult.candidateCount}/${ALERT_JUDGE_MAX_PER_RUN}` +
+      (judgeResult.budgetExhausted ? '（触顶，余量下轮续判）' : ''),
   );
+  // 触顶结构化可观测（A5.3）：经既有 emit 通道发射 p0.judge_budget（不新建通道、不改 p0.observed
+  // 既有 schema、绝不静默截断）。budgetExhausted = 候选 SELECT（LIMIT N+1）取回行数 > N；
+  // candidateCount = 本轮实际处理条数（≤ N）。被挡下的事件 importance_score 仍 NULL、留在工作集。
+  emit('p0.judge_budget', {
+    budgetExhausted: judgeResult.budgetExhausted,
+    candidateCount: judgeResult.candidateCount,
+  });
 
   // ── 阶段 3.5：发布时间回填（published-at-inference，realtime-alerts spec / design D2/D4）。
   // **必在 selectAlertCandidates 之前**：对「评分后达阈值（importance_score 非 NULL 且 >= threshold）

@@ -18,7 +18,7 @@
  * 熔断（降级率阈值判断）本身归编排组（G7）：本模块只产出 degraded_count 与逐条容错，
  * 不在此处中止整批。
  */
-import { and, eq, isNull, or, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, or, lt, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
 import { aiNewsEvents, rawItems } from '../../db/schema.js';
 import { env } from '../../config/env.js';
@@ -84,6 +84,15 @@ export interface ScoreEventsResult {
    * 绝不计入 `degradedCount`（熔断分母仍只含 judge、digest 两阶段）——补全失败照常 fail-open 送判仅标题。
    */
   enrichFail: number;
+  /**
+   * 判分预算触顶信号（p0-alert-lane A5.3 / design D11）：`maxPerRun` 给出且候选 SELECT（`LIMIT N+1`）
+   * 取回行数 > N 时为 true——单靠 `LIMIT N` 无法区分「恰好 N 条」与「超过 N 条」，第 N+1 行只作
+   * 信号、不 claim 不判分。未传预算（日报链全量）恒为 false。由 alert-scan.ts 读取后经其既有
+   * emit 通道发射 `p0.judge_budget`——**绝不**给本模块加 emit（那是新建通道）。
+   */
+  budgetExhausted: boolean;
+  /** 本轮实际进入处理循环的候选条数（给预算时 ≤ maxPerRun；无预算 = 全量候选数）。 */
+  candidateCount: number;
 }
 
 export interface ScoreEventsOptions {
@@ -104,6 +113,22 @@ export interface ScoreEventsOptions {
    * 测试可注入小值快速验证「claim 后崩溃经 T 重评」。
    */
   reclaimMs?: number;
+  /**
+   * 每轮判分工作预算（p0-alert-lane A5.1 / design D11，只有告警高频链显式传入）：给出时候选
+   * SELECT 加确定性取序 + `LIMIT maxPerRun + 1`（+1 仅作触顶信号，只处理前 maxPerRun 条）：
+   *
+   *   ORDER BY first_seen_at DESC NULLS LAST, event_id DESC   LIMIT maxPerRun + 1
+   *
+   * **🔴 默认值 MUST 为 undefined（＝无 ORDER BY、无 LIMIT、全量），MUST NOT 写成
+   * `options.maxPerRun ?? N`**：日报链（run-daily-workflow.ts）不传本项 ⇒ 必须保持全量无界。
+   * 「日报链无界」承载两个理由、缺一不可：
+   *   ① 一天一次，无界是它的正确形态；
+   *   ② 它是告警链 `first_seen_at DESC` 取序**不饿死老事件**的唯一依据——老的未评分事件过不了
+   *      告警闸的时效地板（判了也不告警，告警链花预算在它们身上是纯浪费），它们由无界的日报链
+   *      在 ≤24h 内排空。把 N 写成缺省值 ⇒ 日报链每天只判 N 条 ⇒ 要闻段枯竭 + 该论证当场坍塌
+   *      ⇒ 老事件永久积压；且条数 ≤ N 的 fixture 在两条链上行为逐字相同 ⇒ 测试恒绿、看不见。
+   */
+  maxPerRun?: number;
 }
 
 /**
@@ -211,7 +236,9 @@ export async function releaseJudgeClaim(
  * 对所有「尚未评分」的真实事件逐条评分并写分。
  *
  * 流程：
- * 1. 查 `importance_score IS NULL` 的事件（本轮塌缩新建 + 此前降级未评分者）。
+ * 1. 查 `importance_score IS NULL` 的事件（本轮塌缩新建 + 此前降级未评分者）；
+ *    告警链传 `maxPerRun` 时按确定性取序 `LIMIT maxPerRun + 1` 只处理前 maxPerRun 条
+ *    （日报链不传、保持全量，见 ScoreEventsOptions.maxPerRun 注释）。
  * 2. 逐条调用 judgeRawItem（代表标题作 prompt 输入）。
  * 3. 成功 → 按 mapping 映射后 `UPDATE ... WHERE event_id = ?`，set 仅含 *_score + should_push。
  * 4. 单条降级（ValueJudgeFailureError）→ 跳过 + 记日志 + degradedCount++，整批继续。
@@ -235,11 +262,13 @@ export async function scoreUnscoredEvents(
   };
   const reclaimMs = options.reclaimMs ?? env.JUDGE_CLAIM_RECLAIM_MS;
 
+  const maxPerRun = options.maxPerRun;
+
   // 候选集：尚未评分的事件（importance_score IS NULL 即「未被本 Agent 写过分」）。
   // 这是**候选**而非「已 claim 必送判」——每条送 LLM 前还要逐条原子 claim（claimEventForJudging）；
   // 仅 claim 成功者送判，未抢到（被另一链路 claim 且未过 T）的跳过（claimSkipped++、不计入熔断分母）。
   // 防并发双评分：日报链与告警高频链可能同时 SELECT 到同一未评分事件，靠 claim 而非 SELECT 去重。
-  const events: UnscoredEvent[] = await dbh
+  const candidateQuery = dbh
     .select({
       eventId: aiNewsEvents.eventId,
       representativeTitle: aiNewsEvents.representativeTitle,
@@ -264,6 +293,33 @@ export async function scoreUnscoredEvents(
     // 前 importance_score 为 NULL）若不排除会被 value-judge 重新选中评分「复活」、进而被 Top N 选中独立
     // 推送，使合并比不合并更糟（spec「tombstone 对所有下游消费者不可见」）。claim/评分写 CAS 另各自加。
     .where(and(isNull(aiNewsEvents.importanceScore), isNull(aiNewsEvents.mergedInto)));
+
+  // 判分预算（p0-alert-lane A5.1/A5.4 / design D11）——**仅在 maxPerRun 给出时**加确定性取序 + LIMIT，
+  // 形态唯一：`ORDER BY first_seen_at DESC NULLS LAST, event_id DESC LIMIT maxPerRun + 1`。
+  // - **ORDER BY 不可省**：只加 LIMIT 时 PG 返回**任意** N 行（哪 N 条被判每轮随物理扫描序漂移）。
+  // - **NULLS LAST 不可省**：first_seen_at 可空（schema 无 .notNull()）而 PG `ORDER BY x DESC` 默认
+  //   NULLS FIRST ⇒ 一行 NULL 即恒排第一、每轮吃掉一个名额且永不老化（工作集无时间剪枝）——静默的
+  //   永久饥饿。仓内他处均已写 DESC NULLS LAST（experience-chain.ts）。
+  // - **event_id 不可省**：同一轮采集入库的事件 first_seen_at 常见同秒，单列排序仍是部分序。
+  // - **LIMIT 取 maxPerRun + 1**：第 N+1 行只作触顶信号（budgetExhausted），不 claim 不判分——预算界
+  //   天然落在 claim 之【前】，超预算事件从未被 claim，下一轮即刻可取（若落在 claim 之后要等满
+  //   JUDGE_CLAIM_RECLAIM_MS 才被回收）。不做墙钟 deadline 变体 ⇒ 无飞行中止、无需释放 claim。
+  // - **「不加 LIMIT、循环内数到 N 就 break」不等效、MUST NOT 用**：全量无序 SELECT 的物理扫描序
+  //   轮间稳定 ⇒ 排头的 N 条毒事件（判分恒失败 → 释放 claim → 仍 NULL → 下轮又排头）每轮吃满预算，
+  //   其后健康事件永久饿死（工作集无时间剪枝，毒事件永不老化出局）。
+  const fetched: UnscoredEvent[] =
+    maxPerRun === undefined
+      ? await candidateQuery
+      : await candidateQuery
+          .orderBy(
+            sql`${aiNewsEvents.firstSeenAt} DESC NULLS LAST`,
+            desc(aiNewsEvents.eventId),
+          )
+          .limit(maxPerRun + 1);
+  const budgetExhausted = maxPerRun !== undefined && fetched.length > maxPerRun;
+  // 只处理前 maxPerRun 条（无预算 = 全量）：被预算挡在本轮外的事件 importance_score 仍为 NULL ⇒
+  // 留在工作集里、下一轮继续——预算只裁单轮工作量，不丢事件、不改「一事件只评一次分」。
+  const events = maxPerRun !== undefined ? fetched.slice(0, maxPerRun) : fetched;
 
   let scored = 0;
   let degradedCount = 0;
@@ -420,5 +476,15 @@ export async function scoreUnscoredEvents(
 
   // judged = 本链路实际 claim 成功并送判的数（熔断分母）；claimSkipped 不计入分母（非降级）。
   // enrichHit/enrichFail 供每条调用链各自日志暴露（补全失败不计入 degradedCount）。
-  return { judged, scored, degradedCount, claimSkipped, enrichHit, enrichFail };
+  // budgetExhausted/candidateCount 供告警链经其既有 emit 通道发 p0.judge_budget（绝不静默截断）。
+  return {
+    judged,
+    scored,
+    degradedCount,
+    claimSkipped,
+    enrichHit,
+    enrichFail,
+    budgetExhausted,
+    candidateCount: events.length,
+  };
 }

@@ -3,7 +3,7 @@
  *
  * 与日报 daily-digest（queue.ts/worker.ts）**并列、独立**——**不嵌入 runDailyWorkflow**，也不与
  * 日报阶段相互投递构成复杂队列图。BullMQ 在此仅充当两件事（不拆阶段队列）：
- * 1. 高频定时触发器：一个 cron 重复任务按 env.ALERT_SCAN_CRON（默认每 20min）投递 alert-scan job；
+ * 1. 高频定时触发器：一个 cron 重复任务按 env.ALERT_SCAN_CRON（默认 4-59/15，15 分钟节奏）投递 alert-scan job；
  * 2. 整 job 重试外壳：job 失败按 attempts 整条重试。
  *
  * 实际业务全在 runAlertScan（纯顺序，见 ./alert-scan.ts），worker 只 await 调用它。
@@ -63,7 +63,7 @@ export function createAlertScanQueue(
 /**
  * 注册高频 cron 重复任务（幂等：稳定 jobId 防重复注册同一 cron）。
  *
- * BullMQ 按 env.ALERT_SCAN_CRON（默认每 20min）+ ALERT_SCAN_CRON_TZ（默认 Asia/Shanghai，
+ * BullMQ 按 env.ALERT_SCAN_CRON（默认 4-59/15，15 分钟节奏）+ ALERT_SCAN_CRON_TZ（默认 Asia/Shanghai，
  * 与 push_date 同源防漂移）定点投递 alert-scan job。
  */
 export async function scheduleAlertScan(
