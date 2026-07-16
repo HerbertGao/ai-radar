@@ -8,13 +8,14 @@
  *     fetch 之前 + first-fetch-wins，见 collectors/index.ts 的 REALTIME_NEWS_SOURCES 注释）
  *   → 入库 → 去重塌缩
  *   → 对未评分事件评分（与日报链共用 scoreUnscoredEvents，含并发原子 claim 防双评分）
- *   → **评分后**判告警闸 `importance_score IS NOT NULL AND is_ai_related = true AND >= 阈值`
- *     （阈值默认 85，env 可配，纯程序判定；AI 闸 fail-closed，见 alert-gate.ts 共享构造器）
- *   → 对达阈值且「从未以该 channel success 告警过」的事件推送告警
+ *   → **评分后**判告警闸（两支路，见 alert-gate.ts 共享构造器 alertGatePredicate）：共用前提
+ *     `importance_score IS NOT NULL AND is_ai_related = true`（AI 闸 fail-closed），支路 A
+ *     `importance_score >= 阈值`（默认 85，env 可配）OR 支路 B 标题命中精确事实变更词表；纯程序判定
+ *   → 对过闸且「从未以该 channel success 告警过」的事件推送告警
  *
  * 关键不变量（绝不可违背，realtime-alerts / design D6）：
- * - **判定必在评分后**：importance_score 评分前为 NULL（`NULL >= 85` 恒假），阈值判定查 SQL
- *   `importance_score IS NOT NULL AND >= 阈值`——评分阶段已先于本判定执行，绝不以 NULL 误判。
+ * - **判定必在评分后**：importance_score 评分前为 NULL，闸的共用前提 `importance_score IS NOT NULL`
+ *   在 OR 之外（alertGatePredicate）——未评分事件两支路都进不了闸；评分阶段已先于本判定执行，绝不以 NULL 误判。
  * - **候选时效闸键于 `published_at`（绝不基于 `first_seen_at`）**：候选窗口为闭区间
  *   `lowerBound <= published_at <= now`——下界 `gte(published_at, lowerBound)` 拦超窗老文（lowerBound
  *   与日报候选同源 startOfDayInTimeZone，防冷启动/新增源把历史老文误当重大发布刷屏），上界
@@ -25,7 +26,7 @@
  *   published_at <= now`（须显式 isNotNull + lte，否则旧 NULL/未来事件会绕过修复刷屏）。单次扫描
  *   上限取序按 `published_at DESC`（取最新发布）。`first_seen_at` 语义不变（仍记首次抓取，供调试/
  *   僵尸 claim 回收），**不再**用于告警时效过滤。
- * - **非 LLM 决定**：是否告警完全由程序阈值决定，禁止 LLM 参与。
+ * - **非 LLM 决定**：是否告警完全由程序判定（阈值 / 词表两支路均确定性），禁止 LLM 参与。
  * - **不做语义去重 / 不做 KB 入库**（add-semantic-dedup-and-store-hardening 6.3，spec「语义去重仅作用于
  *   日报链新闻事件」）：本高频链恒走硬去重快路径，**绝不**调 semanticMergeEvents（embedding/LLM 二次
  *   判断/事件合并）或 runKbIngestion——语义层与 KB 入库**仅日报链**执行。日报链合并产生的 tombstone
@@ -79,6 +80,7 @@ import type { SelectedEvent } from '../selection/top-n.js';
 import { getPushDate, startOfDayInTimeZone } from '../push/push-date.js';
 import { acquireAlertLock, type AcquireAlertLockOptions } from './alert-lock.js';
 import { alertGatePredicate } from './alert-gate.js';
+import { matchFactChangeKeywords } from '../keywords/fact-change-gate.js';
 import {
   buildOpsAlertSink,
   consoleAlertSink,
@@ -303,6 +305,50 @@ export async function selectAlertCandidates(
     content: r.content,
     source: r.source,
   }));
+}
+
+/** p0.observed 归因取值（D2.3/design D6）：候选由哪条支路取得告警资格，定死三元。 */
+export type AlertTrigger = 'importance' | 'fact-change' | 'unknown';
+
+/**
+ * 告警候选的触发支路归因（p0-alert-lane D2.3 / design D6）——**支路 A 优先**：
+ *   trigger = (importanceScore >= threshold) ? 'importance' : 'fact-change'
+ *
+ * - `matchedKeywords` **仅在 trigger='fact-change' 时记录**，由与告警闸同一词表构造器的 TS 出口
+ *   （matchFactChangeKeywords）对该候选标题复算（≤ 单轮上限条，成本可忽略）。**绝不可用
+ *   `matchedKeywords.length > 0` 反推 trigger**——那是纯标题函数，一条经支路 A 正常入选的高分
+ *   事件若标题恰含词表词也会返回非空 → 误标 fact-change → 误触发回滚判据（把正常功能当噪音关掉）。
+ * - `importanceScore === null` 按构造不可达（闸的「已评分」前提在 OR 之外），MUST 走**显式分支**：
+ *   记 error 级结构化日志 + trigger='unknown'。陷阱在三元表达式本身、不在缺省值——JS 的
+ *   `null >= 85` 静默求值为 false，不加任何 ?? 兜底它就会把 NULL 静默归成 'fact-change'、污染
+ *   以 trigger='fact-change' 计的回滚判据；'unknown' 的全部意义是让这条静默路径在日志里显形。
+ * - **MUST NOT 抛错**：p0.observed 的 emit 在全部 dispatch 之后且不在 try/catch 内——抛错 =
+ *   副作用已发生后炸掉整轮 → run.failed → BullMQ 重试整轮重跑（采集/补全/评分/回填）。
+ *
+ * 归因为纯附加字段：只写观测、不改变告警行为。
+ */
+export function attributeAlertTrigger(
+  candidate: Pick<
+    AlertCandidate,
+    'eventId' | 'representativeTitle' | 'importanceScore'
+  >,
+  threshold: number,
+  log: AlertLogSink = defaultLog,
+): { trigger: AlertTrigger; matchedKeywords?: string[] } {
+  if (candidate.importanceScore === null) {
+    // 显式 NULL 分支（按构造不可达）：error 级结构化日志 + unknown，绝不抛错、绝不静默归支路 B。
+    log(
+      `归因异常: 告警候选 importanceScore=NULL（按构造不可达，标 trigger=unknown）`,
+      { level: 'error', eventId: candidate.eventId },
+    );
+    return { trigger: 'unknown' };
+  }
+  // 支路 A 优先：高分事件标题恰含词表词时归因仍为 importance、不记 matchedKeywords。
+  if (candidate.importanceScore >= threshold) return { trigger: 'importance' };
+  return {
+    trigger: 'fact-change',
+    matchedKeywords: matchFactChangeKeywords(candidate.representativeTitle),
+  };
 }
 
 /** 把告警候选映射为 dispatcher 输入的 SelectedEvent（headline 缺失走 dispatcher 渲染回退链）。 */
@@ -571,6 +617,10 @@ export async function runAlertScan(
     hits: candidates.map((c) => ({
       eventId: c.eventId,
       importanceScore: c.importanceScore,
+      // 归因为纯附加字段（p0-alert-lane D2.3，阶段 D 的 spec 内附加、非 schema 冻结不变量）：
+      // trigger 三元 {'importance','fact-change','unknown'}（支路 A 优先、NULL 走显式 unknown
+      // 分支且绝不抛错），matchedKeywords 仅 fact-change 时带。见 attributeAlertTrigger。
+      ...attributeAlertTrigger(c, threshold, log),
     })),
   });
   log(

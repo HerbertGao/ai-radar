@@ -32,7 +32,7 @@ process.env.LLM_BASE_URL ||= 'https://example.invalid/v1';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
-const { runAlertScan, selectAlertCandidates } = await import('../alert-scan.js');
+const { runAlertScan, selectAlertCandidates, attributeAlertTrigger } = await import('../alert-scan.js');
 // 告警链判分预算 N（p0-alert-lane A5）：直接 import 真值，fixture 条数钉在 N+2 上——常量变了用例跟着变。
 const { ALERT_JUDGE_MAX_PER_RUN } = await import('../../config/env.js');
 // 6.3：语义合并 / KB 入库模块，供 vi.spyOn 断言**告警链不调用**它们（保持硬去重快路径）。
@@ -153,7 +153,9 @@ async function cleanup() {
  */
 async function seedScoredEvent(args: {
   title: string;
-  importance?: number;
+  /** importance_score（默认 90；显式传 null 可 seed 未评分事件——「已评分」前提在 OR 之外的
+   *  D2.4② 用例，故不能用 `?? 90` 合并）。 */
+  importance?: number | null;
   publishedAt: Date | null;
   firstSeenAt?: Date;
   /** AI 闸取值（默认 true——与 tombstone-visibility / top-n 套件 seed 同约定，保既有用例行为不变）。
@@ -161,17 +163,20 @@ async function seedScoredEvent(args: {
   isAiRelated?: boolean | null;
   /** Judge 的 should_push（告警闸绝不含它；默认 NULL，「should_push 不入闸」用例显式传 false）。 */
   shouldPush?: boolean | null;
+  /** developer_relevance_score（默认 NULL；D2.4③「高开发者相关不入闸」用例显式传 95）。 */
+  developerRelevance?: number;
 }): Promise<string> {
   const { rows } = await pool!.query<{ event_id: string }>(
     // published_at 与 published_at_authority 必须同写：CHECK ((published_at IS NULL) = (authority = 0))。
     `INSERT INTO ai_news_events
-       (representative_title, importance_score, published_at, published_at_authority, first_seen_at,
-        is_ai_related, should_push)
-     VALUES ($1, $2, $3, CASE WHEN $3::timestamptz IS NULL THEN 0 ELSE 1 END, $4, $5, $6)
+       (representative_title, importance_score, developer_relevance_score, published_at,
+        published_at_authority, first_seen_at, is_ai_related, should_push)
+     VALUES ($1, $2, $3, $4, CASE WHEN $4::timestamptz IS NULL THEN 0 ELSE 1 END, $5, $6, $7)
      RETURNING event_id`,
     [
       args.title,
-      String(args.importance ?? 90),
+      args.importance === null ? null : String(args.importance ?? 90),
+      args.developerRelevance !== undefined ? String(args.developerRelevance) : null,
       args.publishedAt,
       args.firstSeenAt ?? new Date(),
       args.isAiRelated === undefined ? true : args.isAiRelated,
@@ -1429,5 +1434,323 @@ describe.skipIf(!databaseUrl)('runAlertScan 源级健康告警（高频链消费
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+/**
+ * p0-alert-lane D2.4：告警闸支路 B（精确事实变更词表 OR 支路，alertGatePredicate 阶段 D 形态）。
+ *
+ * 闸 = 已评分 ∧ is_ai_related=true ∧ (importance >= 阈值 OR 标题命中词表 ∧ NOT 器物名否定项)。
+ * 每条用例都钉死 is_ai_related / should_push 的取值（不靠 seed 默认）。词表命中标题取自
+ * precise-fact.ts 的真实词条（用量上限 / pricing / 速率限制 / rate limit 等），断言全部落在
+ * selectAlertCandidates 的 SQL 侧（LIMIT 先于应用层执行——支路 B 若放 TS 侧根本进不了结果集）。
+ */
+describe.skipIf(!databaseUrl)('告警闸支路 B：精确事实变更词表（D2.4）', () => {
+  const WINDOW_DAYS = 3;
+  const dayInWindow = new Date(NOW.getTime() - 1 * 24 * 60 * 60 * 1000); // 昨天，必在近 3 天窗口内。
+  const dayTooOld = new Date(NOW.getTime() - 30 * 24 * 60 * 60 * 1000); // 30 天前，必出窗。
+  const dayFuture = new Date(NOW.getTime() + 24 * 60 * 60 * 1000); // 明天，未来。
+
+  it('① 低 importance(30) + 命中词表 + is_ai_related=true → 告警（支路 B 取得资格）', async () => {
+    const id = await seedScoredEvent({
+      title: '周用量上限提升 50%', // 核心词「用量上限」命中（招牌用例）。
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands.map((c) => c.eventId)).toContain(id);
+  });
+
+  it('② importance_score IS NULL + 命中词表 → 不告警（「已评分」前提在 OR 之外）', async () => {
+    await seedScoredEvent({
+      title: 'OpenAI 调整 API 定价', // 命中核心词「定价」。
+      importance: null, // 未评分（评分失败 / claim 被抢 / LLM 降级）——命中词表也绝不入闸。
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands).toHaveLength(0);
+  });
+
+  it('③ 高 developer_relevance(95) + 低 importance + 未命中词表 → 不告警（该轴绝不入闸）', async () => {
+    await seedScoredEvent({
+      title: 'Agent 教程：如何写好系统提示词', // 不含任何词表词。
+      importance: 30,
+      developerRelevance: 95, // 开发者相关性极高——但它衡量「是否开发者内容」，不改变告警资格。
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands).toHaveLength(0);
+  });
+
+  it('④ 命中词表但 超窗 / NULL 未回填 / 未来 / 早于基线 / tombstone → 均不告警（其余候选条件一条不减）', async () => {
+    // 超窗（published_at 30 天前、first_seen=今天——RSS 归档重投老公告的形态）。
+    await seedScoredEvent({
+      title: 'Beyond rate limits: scaling access to Codex and Sora',
+      importance: 30,
+      publishedAt: dayTooOld,
+      firstSeenAt: new Date(),
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    // published_at NULL（AI 推断仍判不出、未回填）。
+    await seedScoredEvent({
+      title: 'OpenAI 调整 API 定价',
+      importance: 30,
+      publishedAt: null,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    // 未来日期（上界 lte(now) 排除）。
+    await seedScoredEvent({
+      title: 'Claude 新增 token 包',
+      importance: 30,
+      publishedAt: dayFuture,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    // tombstone（merged_into 非 NULL）：survivor 造成不入闸形态（无词表词 + NULL published_at）。
+    const survivor = await seedScoredEvent({
+      title: 'survivor event without keywords',
+      importance: 30,
+      publishedAt: null,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const tomb = await seedScoredEvent({
+      title: '周用量上限提升 50%',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    await pool!.query(`UPDATE ai_news_events SET merged_into = $1 WHERE event_id = $2`, [survivor, tomb]);
+    // 无基线：以上 5 条（超窗/NULL/未来/survivor(NULL)/tombstone）全部被各自的候选条件排除。
+    expect(await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null)).toHaveLength(0);
+
+    // 早于基线水位：先证明无基线时它入候选（隔离基线为唯一变量），叠加基线后被排除。
+    const preBaseline = await seedScoredEvent({
+      title: 'GPT-5 周用量上限提升 50%',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    expect(
+      (await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null)).map((c) => c.eventId),
+    ).toEqual([preBaseline]);
+    // 基线 = NOW（启用时刻）：published_at(昨天) < 基线 → 排除（守 policy-push-timeliness）。
+    expect(await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, NOW)).toHaveLength(0);
+  });
+
+  it('⑤ 命中词表但 Model B 已投递全通道 → 不重推（一生一次去重不因支路 B 松动）', async () => {
+    const id = await seedScoredEvent({
+      title: 'Beyond rate limits: scaling access to Codex and Sora',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    await pool!.query(
+      `INSERT INTO push_records (target_type, target_id, channel, push_date, status)
+       VALUES ('alert', $1, 'telegram', $2, 'success')`,
+      [id, ALERT_PUSH_DATE],
+    );
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands.map((c) => c.eventId)).not.toContain(id);
+  });
+
+  it('⑥ 高 importance(90) + 标题恰含词表词 → trigger=importance 且不记 matchedKeywords（支路 A 优先）', async () => {
+    // 端到端走 p0.observed：证明归因接在 emit 的 hits[] 上、且绝不以「标题含词」反推 fact-change
+    // （matchFactChangeKeywords 对该标题返回非空——若实现用 length>0 反推，本断言变红）。
+    await seedScoredEvent({
+      title: 'OpenAI 发布新模型并调整 pricing',
+      importance: 90,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const emitted: Array<{ kind: string; payload?: unknown }> = [];
+    const sender = okSender();
+    await runAlertScan(
+      opts({
+        windowDays: WINDOW_DAYS,
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        emit: (kind: string, payload?: unknown) => emitted.push({ kind, payload }),
+      }),
+    );
+    const p0 = emitted.find((e) => e.kind === 'p0.observed');
+    expect(p0).toBeDefined();
+    const hits = (p0!.payload as { hits: Array<Record<string, unknown>> }).hits;
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!['trigger']).toBe('importance'); // 支路 A 优先。
+    expect('matchedKeywords' in hits[0]!).toBe(false); // 仅 fact-change 时记录。
+    expect(sender.calls).toBe(1);
+  });
+
+  it('⑦ 低 importance + 命中词表 + is_ai_related=false → 不告警（AI 闸为两支路共用）', async () => {
+    await seedScoredEvent({
+      title: 'Introducing our new pricing', // 随机 SaaS 定价帖——支路 B 无 importance 地板，AI 闸是噪音下限。
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: false,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands).toHaveLength(0);
+  });
+
+  it('⑧ 低 importance + 命中词表 + is_ai_related=NULL → 不告警（fail-closed）', async () => {
+    await seedScoredEvent({
+      title: 'Introducing our new pricing',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: null, // 历史 NULL：`= true` 对 NULL 为假——若有人改成 IS NOT FALSE 本断言变红。
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands).toHaveLength(0);
+  });
+
+  it('⑨ 低 importance + 命中词表 + should_push=false + is_ai_related=true → 告警（支路 B 有意覆盖 LLM 否决）', async () => {
+    const id = await seedScoredEvent({
+      title: 'Claude 重置 Fable 5 额度', // 生产唯一命中样本的形态：importance=30 / should_push=false。
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: false, // 加 should_push 入闸则支路 B 恒为空——这正是它要推翻的 LLM 否决。
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands.map((c) => c.eventId)).toContain(id);
+  });
+
+  it('⑪ 低 importance + is_ai_related=true + 标题 Show HN: A Rate Limiter for LLM APIs（Title Case）→ 不告警', async () => {
+    // NEGATIVE_PATTERNS 否定合取项含 lower()（D2.1b）：否定侧漏 lower() 时恰在 Title Case 上失效
+    //（正向命中 %rate limit%、否定匹配不到 %rate limiter% ⇒ NOT(false)=true ⇒ 手机照震），本断言即证伪用例。
+    await seedScoredEvent({
+      title: 'Show HN: A Rate Limiter for LLM APIs',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands).toHaveLength(0);
+  });
+
+  it('⑫ 低 importance + is_ai_related=true + 标题 Improved rate limiting（动名词）→ 告警', async () => {
+    // rate limiting 不在否定项内（D1.10 裁决）：它是公告常用动名词——挡它就是漏掉真的限流变更公告。
+    const id = await seedScoredEvent({
+      title: 'Improved rate limiting',
+      importance: 30,
+      publishedAt: dayInWindow,
+      isAiRelated: true,
+      shouldPush: null,
+    });
+    const cands = await selectAlertCandidates(85, db!, ['telegram'], NOW, WINDOW_DAYS, 100, null);
+    expect(cands.map((c) => c.eventId)).toContain(id);
+  });
+});
+
+/**
+ * p0-alert-lane D2.3（⑩ 归因函数直测，纯函数、无 DB）：importanceScore=NULL 按构造不可达，
+ * MUST 走显式分支——error 日志 + trigger='unknown'、绝不抛错（emit 在全部 dispatch 之后且不在
+ * try/catch 内，抛错 = 副作用已发生后炸掉整轮 → BullMQ 整轮重跑）。
+ */
+describe('告警归因 attributeAlertTrigger（D2.3 直测）', () => {
+  it('⑩ importanceScore=null → trigger=unknown + 记 error 日志 + 不抛错', () => {
+    const logged: Array<[string, unknown]> = [];
+    let out: ReturnType<typeof attributeAlertTrigger> | undefined;
+    expect(() => {
+      out = attributeAlertTrigger(
+        // 标题故意命中词表：显式 NULL 分支必须优先于任何词表复算（绝不静默归成 fact-change）。
+        { eventId: 'evt-null-importance', representativeTitle: 'OpenAI 调整 pricing', importanceScore: null },
+        85,
+        (message, detail) => logged.push([message, detail]),
+      );
+    }).not.toThrow();
+    expect(out!.trigger).toBe('unknown');
+    expect(out!.matchedKeywords).toBeUndefined(); // 绝不可用 matchedKeywords 反推/伴生 trigger。
+    expect(logged).toHaveLength(1); // error 级结构化日志（经注入的 log sink 落盘，非静默）。
+    expect(logged[0]![0]).toContain('importanceScore=NULL');
+    expect(logged[0]![1]).toMatchObject({ level: 'error', eventId: 'evt-null-importance' });
+  });
+
+  it('低分命中词表 → trigger=fact-change + matchedKeywords 由同一词表出口复算', () => {
+    const out = attributeAlertTrigger(
+      { eventId: 'evt-b', representativeTitle: '周用量上限提升 50%', importanceScore: 30 },
+      85,
+      () => {},
+    );
+    expect(out.trigger).toBe('fact-change');
+    expect(out.matchedKeywords).toContain('用量上限');
+  });
+});
+
+/**
+ * p0-alert-lane D3.1 招牌 e2e：低分精确事实变更走完「判分 →（回填跳过）→ 支路 B 闸 → 推送」。
+ * 事件形态取生产唯一命中样本：importance=30 + should_push=false + is_ai_related=true + 命中词表
+ * + 近日 published_at。**全部注入 sender mock、钉死 channels——绝不真发（test-no-prod-sends）。**
+ */
+describe.skipIf(!databaseUrl)('D3.1 招牌 e2e：支路 B 低分事实变更成功告警', () => {
+  it('importance=30 + should_push=false + is_ai_related=true + 命中词表 + 近日 published_at → 成功告警；幂等键行为不变', async () => {
+    const id = await seedScoredEvent({
+      title: '周用量上限提升 50%',
+      importance: 30,
+      publishedAt: NOW, // 近日（<= now 且非 NULL：回填阶段应跳过它）。
+      isAiRelated: true,
+      shouldPush: false, // Judge 否决——支路 B 有意覆盖。
+    });
+    // 推断器 spy：published_at 非 NULL ⇒ 不进回填域 ⇒ 推断器零调用（回填「跳过」的证据）。
+    const inferSpy = vi.fn(async () => ({ object: { publishedAt: null } }));
+    const emitted: Array<{ kind: string; payload?: unknown }> = [];
+    const sender = okSender();
+    const result = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
+        senders: { telegram: sender },
+        threshold: 85,
+        publishedAtInfer: { generateObjectFn: inferSpy, maxAttempts: 1 },
+        emit: (kind: string, payload?: unknown) => emitted.push({ kind, payload }),
+      }),
+    );
+
+    // 走完整条链并成功告警（不因 importance 低 / should_push=false 而漏推）。
+    expect(result.alertCandidateCount).toBe(1);
+    expect(sender.calls).toBe(1);
+    expect(inferSpy).not.toHaveBeenCalled(); // 回填跳过：published_at 非 NULL。
+    // 归因：支路 B 候选记 trigger=fact-change + 命中词（p0.observed 旁路信号）。
+    const p0 = emitted.find((e) => e.kind === 'p0.observed');
+    const hits = (p0!.payload as { hits: Array<Record<string, unknown>> }).hits;
+    expect(hits[0]!['trigger']).toBe('fact-change');
+    expect(hits[0]!['matchedKeywords']).toContain('用量上限');
+    // 幂等键 UNIQUE(target_type='alert', target_id, channel, push_date) 行为不变：落一行 success。
+    const rows1 = await alertRecords();
+    expect(rows1).toHaveLength(1);
+    expect(rows1[0]!.target_id).toBe(id);
+    expect(rows1[0]!.status).toBe('success');
+
+    // 同 push_date 再扫：已 alert-success → 候选窗口排除、不重发、仍只一行。
+    const s2 = okSender();
+    const r2 = await runAlertScan(
+      opts({
+        collect: { collectors: collectorsReturning([]) },
+        judge: { judge: { generateObjectFn: judgeMock(90), logError: () => {} }, enrich: NO_NETWORK_ENRICH, logError: () => {} },
+        senders: { telegram: s2 },
+        threshold: 85,
+      }),
+    );
+    expect(r2.alertCandidateCount).toBe(0);
+    expect(s2.calls).toBe(0);
+    expect(await alertRecords()).toHaveLength(1);
   });
 });

@@ -380,6 +380,12 @@ describe.skipIf(!databaseUrl)('判分预算 maxPerRun（p0-alert-lane A5）', ()
     await pool!.query(`TRUNCATE TABLE push_records, ai_news_events, raw_items RESTART IDENTITY`);
   });
 
+  // 收尾清理（与 beforeEach 同一批表、同一写法）：最后一个用例留下的已评分事件（embedding NULL）
+  // 会被后续 semantic-merge 套件的全局 embed 扫描卷进合并，制造顺序依赖 flake。
+  afterAll(async () => {
+    await pool!.query(`TRUNCATE TABLE push_records, ai_news_events, raw_items RESTART IDENTITY`);
+  });
+
   /**
    * 直接 INSERT 一条未评分事件（importance NULL），显式控制 event_id（varchar 列，可控值使
    * `event_id DESC` 断言不依赖 uuid 的 collation 序）与 first_seen_at（可 NULL——NULLS LAST 用例）。
