@@ -128,6 +128,10 @@ function extractNumbersDetailed(text: string): { nums: Set<number>; unverifiable
   // ② 千分位分隔仅在 \d{1,3}(,\d{3})+ 模式内剔除（「20, 25」不并成 2025）。
   const work = work0.replace(/\d{1,3}(,\d{3})+/g, (m) => m.replace(/,/g, ''));
 
+  // ②' 科学计数法 fail-closed（比对侧）：`4.6e1` 会被 ③ 拆成 {4.6,1}，二者若均在白名单（如候选名 GLM-4.6 + 框架值 1）
+  // 则放行显示为 `46` 的新数字。prompt 已明令叙述段只用平记法，含科学计数法记号即视为不可验证、整段弃用（同 T4 口径）。
+  if (/\d[eE][-+]?\d/.test(work)) unverifiable = true;
+
   // ③ 提取 + 符号上下文。
   const re = /[-+]?(?:\d+(?:\.\d+)?|\.\d+)/g;
   let m: RegExpExecArray | null;

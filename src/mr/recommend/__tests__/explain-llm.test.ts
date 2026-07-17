@@ -378,6 +378,11 @@ describe('T4 守卫① fail-closed 于不可验证数字', () => {
     expect(out).toBe(templateSeg);
     expect(renderLog(logs)!.discardReason).toBe('guard1-unverifiable-number');
   });
+  it('科学计数法 4.6e1（拆成 {4.6,1} 显示为 46）⇒ fail-closed 弃用', async () => {
+    const { out, templateSeg, logs } = await render('降到 4.6e1 元');
+    expect(out).toBe(templateSeg);
+    expect(renderLog(logs)!.discardReason).toBe('guard1-unverifiable-number');
+  });
 });
 
 describe('T5 日期正则数字边界', () => {
