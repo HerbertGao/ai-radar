@@ -1,7 +1,7 @@
 # model-radar-recommender 规范
 
 ## 目的
-Model Radar（P5 / 5e）推荐器：在 compare-api 只读快照之上对编程订阅（coding_plan 桶）做确定性「比价 + 选型」——规则硬筛召回（经 vetted `queryModelRadarSnapshot`、currency/budget 均不喂 query）、撞窗判定（snapshot 层纯数值原语 `fitsWindow`、按 limitType 分派、口径未知不假装）、四态 ordered-total verdict（`insufficient_data`/`not_recommended`/`primary`/`alternative`）输出 flat candidates、模板解释层（带规则依据 + per-fact provenance、v1 LLM/RAG 不参与、接口对 v2 留证据缝），并经既有 MCP server 单工具 `recommend_coding_subscription` 暴露（env-clean 动态现 build 快照、只读 fail-closed、stale 如实暴露）。价格/兼容/额度是 DB 精确事实、绝不交 LLM 判定，LLM 只解释。横切检索（`search_coding_plans`）、v2 LLM 解释、其他桶推荐不在本规范。
+Model Radar（P5 / 5e）推荐器：在 compare-api 只读快照之上对编程订阅（coding_plan 桶）做确定性「比价 + 选型」——规则硬筛召回（经 vetted `queryModelRadarSnapshot`、currency/budget 均不喂 query）、撞窗判定（snapshot 层纯数值原语 `fitsWindow`、按 limitType 分派、口径未知不假装）、四态 ordered-total verdict（`insufficient_data`/`not_recommended`/`primary`/`alternative`）输出 flat candidates、模板解释层（带规则依据 + per-fact provenance、v1 LLM/RAG 不参与、接口对 v2 留证据缝），并经既有 MCP server 单工具 `recommend_coding_subscription` 暴露（env-clean 动态现 build 快照、只读 fail-closed、stale 如实暴露）。价格/兼容/额度是 DB 精确事实、绝不交 LLM 判定，LLM 只解释。解释层 v2（可选 LLM 证据叙述段：复用检索核心的 KB 证据 + 变更流，恒可回落模板、结论与数字产出权恒在程序侧）在本规范解释层需求内。横切检索（`search_coding_plans`）、其他桶推荐不在本规范。
 ## 需求
 ### 需求:规则硬筛召回经 vetted money-path、currency/budget 均不喂 query、未核/待核标 insufficient_data
 

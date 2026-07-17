@@ -22,6 +22,14 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 vi.mock('../../../mr/snapshot/build.js');
 import { buildModelRadarSnapshot } from '../../../mr/snapshot/build.js';
 
+// 5e 解释层：mock explain-llm.js 的 buildExplainer——handler 在 llm 模式（四 key 齐）动态 import 它。默认返回 stub
+// explainer（直返固定叙述，证注入 recommend 第三参）；构造抛错测用 mockImplementationOnce 令其 throw。embed-clean.js
+// 不 mock（真 env-clean、缺 key 分支不触其调用）。template 模式的既有测试恒不进 llm 分支 → 本 mock 对其惰性。
+vi.mock('../../../mr/recommend/explain-llm.js', () => ({
+  buildExplainer: vi.fn(() => async () => 'MOCK_NARRATIVE'),
+}));
+import { buildExplainer } from '../../../mr/recommend/explain-llm.js';
+
 const PROV = {
   sourceUrl: 'https://open.bigmodel.cn/pricing',
   sourceConfidence: 'official_pricing' as const,
@@ -81,6 +89,19 @@ const env: McpEnv = {
 const db = {} as unknown as McpDb;
 
 const mockedBuild = vi.mocked(buildModelRadarSnapshot);
+const mockedBuildExplainer = vi.mocked(buildExplainer);
+
+/** llm 模式 + 四 key 齐（chat=LLM_MODEL、embed=EMBEDDING_MODEL）。 */
+const llmEnvFull: McpEnv = {
+  ...env,
+  MR_RECOMMEND_EXPLAIN: 'llm',
+  LLM_API_KEY: 'k',
+  LLM_BASE_URL: 'https://ex.com/v1',
+  LLM_MODEL: 'chat-m',
+  EMBEDDING_MODEL: 'embed-m',
+};
+/** llm 模式但四 key 全缺。 */
+const llmEnvMissing: McpEnv = { ...env, MR_RECOMMEND_EXPLAIN: 'llm' };
 
 beforeEach(() => {
   setContext({ env, db });
@@ -193,5 +214,79 @@ describe('3.1 inputSchema 边界校验（SDK 自动校验、handler 前拦非法
     expect(schema.safeParse({ tool: '' }).success).toBe(false);
     expect(schema.safeParse({ protocol: '' }).success).toBe(false);
     expect(schema.safeParse({ tool: 'claude-code' }).success).toBe(true);
+  });
+});
+
+describe('4.2/4.4 解释层装配（env-clean、四 key 判定、fail-open、模板回落）', () => {
+  it('MR_RECOMMEND_EXPLAIN=llm 但四 key 缺 → 模板回落 + stderr 列缺失变量名、不构造 explainer', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setContext({ env: llmEnvMissing, db });
+    mockedBuild.mockResolvedValue(exitSnapshot);
+
+    const res = (await recommendCodingTool.handler(
+      { model: 'glm:4.6', tool: 'claude-code' },
+      {},
+    )) as CallToolResult;
+
+    expect(res.isError).not.toBe(true);
+    expect(recommendationResultSchema.safeParse(res.structuredContent).success).toBe(true);
+    expect(mockedBuildExplainer).not.toHaveBeenCalled(); // 缺 key ⇒ 不构造
+    // stderr 一行列出全部缺失变量名（诊断「配了 llm 却永远模板」）。
+    const msg = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    for (const v of ['LLM_API_KEY', 'LLM_BASE_URL', 'LLM_MODEL', 'EMBEDDING_MODEL']) expect(msg).toContain(v);
+    errSpy.mockRestore();
+  });
+
+  it('MR_RECOMMEND_EXPLAIN=llm + 四 key 齐 → 构造 explainer（chat 凭据=LLM_MODEL、dbh=db）并注入 recommend 第三参', async () => {
+    setContext({ env: llmEnvFull, db });
+    mockedBuild.mockResolvedValue(exitSnapshot);
+
+    const res = (await recommendCodingTool.handler(
+      { model: 'glm:4.6', tool: 'claude-code' },
+      {},
+    )) as CallToolResult;
+
+    expect(res.isError).not.toBe(true);
+    expect(mockedBuildExplainer).toHaveBeenCalledTimes(1);
+    const opts = mockedBuildExplainer.mock.calls[0]![0];
+    expect(opts.credentials).toEqual({ apiKey: 'k', baseUrl: 'https://ex.com/v1', model: 'chat-m' });
+    expect(opts.dbh).toBe(db);
+    // stub explainer 返 'MOCK_NARRATIVE' → recommend 拼进 explanation（证注入第三参、非默认模板）。
+    const result = recommendationResultSchema.parse(res.structuredContent);
+    expect(result.explanation).toContain('MOCK_NARRATIVE');
+  });
+
+  it('MR_RECOMMEND_EXPLAIN=llm + 四 key 齐但构造抛错 → fail-open 模板层 + stderr 记错（不使工具失败）', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockedBuildExplainer.mockImplementationOnce(() => {
+      throw new Error('construct boom');
+    });
+    setContext({ env: llmEnvFull, db });
+    mockedBuild.mockResolvedValue(exitSnapshot);
+
+    const res = (await recommendCodingTool.handler(
+      { model: 'glm:4.6', tool: 'claude-code' },
+      {},
+    )) as CallToolResult;
+
+    expect(res.isError).not.toBe(true);
+    const result = recommendationResultSchema.parse(res.structuredContent);
+    expect(result.explanation).not.toContain('MOCK_NARRATIVE'); // 回落模板、无 stub 叙述
+    const msg = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(msg).toContain('解释层构造失败');
+    errSpy.mockRestore();
+  });
+
+  it('未配置 llm（默认 template）→ 不构造 explainer、不刷 stderr（recommend 走默认模板）', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setContext({ env, db }); // base env 无 MR_RECOMMEND_EXPLAIN
+    mockedBuild.mockResolvedValue(exitSnapshot);
+
+    const res = (await recommendCodingTool.handler({ tool: 'claude-code' }, {})) as CallToolResult;
+
+    expect(res.isError).not.toBe(true);
+    expect(mockedBuildExplainer).not.toHaveBeenCalled();
+    expect(errSpy).not.toHaveBeenCalled(); // 未配 llm 不刷 stderr
+    errSpy.mockRestore();
   });
 });

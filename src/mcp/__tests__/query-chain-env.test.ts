@@ -37,6 +37,10 @@ const embedClean = resolve(repoRoot, 'src/kb/embed-clean.ts');
 const mcpEnv = resolve(repoRoot, 'src/mcp/env.ts');
 const mcpContext = resolve(repoRoot, 'src/mcp/context.ts');
 const searchKbTool = resolve(repoRoot, 'src/mcp/tools/search-kb.ts');
+// add-model-radar-recommender-rag-explanation 组 D：v2 解释层 env-clean 前向脆弱性守卫 + recommend-coding handler 实跑守护。
+const explainLlm = resolve(repoRoot, 'src/mr/recommend/explain-llm.ts');
+const evidence = resolve(repoRoot, 'src/mr/recommend/evidence.ts');
+const recommendCodingTool = resolve(repoRoot, 'src/mcp/tools/recommend-coding.ts');
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -130,6 +134,27 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
             `${kbFile}: ${spec} 须 import type：${stmt.replace(/\s+/g, ' ').trim()}`,
           ).toBe(true);
         }
+      }
+    }
+
+    // add-model-radar-recommender-rag-explanation 组 D（task 4.3①）：v2 解释层 env-clean 前向脆弱性守卫。
+    // explain-llm.ts / evidence.ts 被 recommend-coding.ts 在 handler 内动态 import（llm 模式，缺 key 分支亦过此边界）；
+    // 二者 MUST NOT 值 import config/env、agents/llm-client（触全局 parseEnv 崩纯查询进程），db/index 若出现须 import type。
+    // 文件在 src/mr/recommend/ → 相对 specifier 前缀 `../../`。
+    for (const explainFile of [explainLlm, evidence]) {
+      const src = await readFile(explainFile, 'utf8');
+      const stmts = src.match(/^import\b[\s\S]*?from\s+['"][^'"]+['"]/gm) ?? [];
+      for (const spec of ['../../config/env.js', '../../agents/llm-client.js']) {
+        expect(
+          stmts.some((s) => s.includes(spec)),
+          `${explainFile}: 顶层不得 import ${spec}（env-clean）`,
+        ).toBe(false);
+      }
+      for (const stmt of stmts.filter((s) => s.includes('../../db/index.js'))) {
+        expect(
+          stmt.trimStart().startsWith('import type'),
+          `${explainFile}: db/index 须 import type：${stmt.replace(/\s+/g, ' ').trim()}`,
+        ).toBe(true);
       }
     }
   });
@@ -297,5 +322,53 @@ describe.skipIf(!databaseUrl)('查询链仅 DATABASE_URL 可加载（N2 / 子进
     expect(stderr).not.toContain('UNEXPECTED_LLM_KEY');
     expect(stderr).not.toContain('NOT_FAILCLOSED');
     expect(stderr).not.toContain('BAD_TOOLCOUNT');
+  }, 70_000);
+
+  // add-model-radar-recommender-rag-explanation 组 D（task 4.3②）：recommend_coding 的 llm 分支 handler-execution
+  // 守护——裁剪 env（DATABASE_URL + MR_RECOMMEND_EXPLAIN=llm、**无四 key**）实跑。装载期测只 import tools/index.ts
+  //（注册 handler、不执行），抓不到 handler 运行期 `await import` explain-llm.js / embed-clean.js 时的 parseEnv 崩溃，
+  // 故须实跑：缺 key 分支也须过动态 import 边界（若二者未 env-clean，`await import` 即触全局 parseEnv → 抛 → exit 1）。
+  it('剪裁 env（DATABASE_URL + MR_RECOMMEND_EXPLAIN=llm、无四 key）实跑 recommend_coding handler：过动态 import 边界不触 parseEnv、缺 key 回落模板、正常返回 + stderr 列缺失变量名', async () => {
+    const prunedEnv: NodeJS.ProcessEnv = {
+      DATABASE_URL: databaseUrl,
+      MR_RECOMMEND_EXPLAIN: 'llm',
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+    };
+
+    const script = `(async () => {
+      const envMod = await import(${JSON.stringify(mcpEnv)});
+      const dbMod = await import(${JSON.stringify(mcpDb)});
+      const ctxMod = await import(${JSON.stringify(mcpContext)});
+      const toolMod = await import(${JSON.stringify(recommendCodingTool)});
+      const parsed = envMod.parseMcpEnv(process.env);
+      if (!parsed.ok) { console.error('ENV_PARSE_FAILED: ' + parsed.message); process.exit(3); }
+      if (parsed.env.MR_RECOMMEND_EXPLAIN !== 'llm') { console.error('EXPLAIN_NOT_LLM'); process.exit(5); }
+      if (parsed.env.LLM_API_KEY) { console.error('UNEXPECTED_LLM_KEY'); process.exit(6); }
+      const db = dbMod.getMcpDb(process.env.DATABASE_URL);
+      ctxMod.setContext({ env: parsed.env, db });
+      const res = await toolMod.recommendCodingTool.handler({ tool: 'claude-code' }, {});
+      await dbMod.closeMcpDb();
+      if (!res || res.isError === true) { console.error('UNEXPECTED_ISERROR'); process.exit(2); }
+      if (!res.structuredContent) { console.error('NO_STRUCTURED'); process.exit(4); }
+      process.exit(0);
+    })().catch((e) => {
+      console.error('HANDLER_THREW: ' + (e && e.message ? e.message : String(e)));
+      process.exit(1);
+    });`;
+
+    const { stderr } = await execFileAsync('npx', ['tsx', '-e', script], {
+      cwd: repoRoot,
+      env: prunedEnv,
+      timeout: 60_000,
+    });
+    expect(stderr).not.toContain('HANDLER_THREW');
+    expect(stderr).not.toContain('ENV_PARSE_FAILED');
+    expect(stderr).not.toContain('EXPLAIN_NOT_LLM');
+    expect(stderr).not.toContain('UNEXPECTED_LLM_KEY');
+    expect(stderr).not.toContain('UNEXPECTED_ISERROR');
+    expect(stderr).not.toContain('NO_STRUCTURED');
+    // 缺 key 提示行确应出现（诊断「配了 llm 却永远模板」）——证明确走了 llm 分支的动态 import + 缺 key 回落。
+    expect(stderr).toContain('MR_RECOMMEND_EXPLAIN=llm 但缺少凭据');
   }, 70_000);
 });

@@ -21,10 +21,12 @@
 import { z } from 'zod';
 import { mrCurrencySchema } from '../../db/mr-schema.zod.js';
 import { recommend, type RecommendInput } from '../../mr/recommend/recommend.js';
+import { safeLog } from '../../mr/recommend/evidence.js';
 import {
   rankedCandidateSchema,
   recommendQuerySchema,
   usageProfileSchema,
+  type Explainer,
   type RecommendationResult,
 } from '../../mr/recommend/schema.js';
 import { getContext } from '../context.js';
@@ -109,8 +111,62 @@ export const recommendCodingTool: McpToolDescriptor = {
         `快照不可用，无法生成推荐（snapshot unavailable）：${e instanceof Error ? e.message : String(e)}`,
       );
     }
+
+    // 解释层装配（层选择不进 recommend() 本体，5e / task 4.2）：仅 `MR_RECOMMEND_EXPLAIN==='llm'` 时**动态 import**
+    // env-clean 渲染器 + embed 变体（守 env-clean：顶层 static import 会触全局 parseEnv；缺 key 分支也须过此动态
+    // 边界，见 query-chain-env 4.3② 守护），四 key（LLM_API_KEY/LLM_BASE_URL/LLM_MODEL/EMBEDDING_MODEL）齐才构造；
+    // log sink 注 **stderr**（`console.error`——stdout 是 JSON-RPC 通道，MUST NOT 写观测）。**构造包 fail-open**：
+    // 加载/构造抛错 ⇒ 模板层 + stderr 记错；四 key 任一缺 ⇒ 模板层 + stderr 列缺失变量名；未配 llm 不刷 stderr。
+    // 工具签名/返回 schema 不变、recommend.ts 零改动。
+    let explainer: Explainer | undefined;
+    if (env.MR_RECOMMEND_EXPLAIN === 'llm') {
+      try {
+        const explainLlm = await import('../../mr/recommend/explain-llm.js');
+        const embedClean = await import('../../kb/embed-clean.js');
+        const missing = (
+          [
+            ['LLM_API_KEY', env.LLM_API_KEY],
+            ['LLM_BASE_URL', env.LLM_BASE_URL],
+            ['LLM_MODEL', env.LLM_MODEL],
+            ['EMBEDDING_MODEL', env.EMBEDDING_MODEL],
+          ] as const
+        )
+          .filter(([, v]) => !v)
+          .map(([k]) => k);
+        if (missing.length > 0) {
+          // best-effort stderr（safeLog 吞 sink 抛错，如 EPIPE）：绝不破 fail-open。
+          safeLog(
+            (m) => console.error(m),
+            `[recommend-coding] MR_RECOMMEND_EXPLAIN=llm 但缺少凭据 ${missing.join(' / ')}，解释层回落模板（配齐后启用 LLM 证据叙述）。`,
+          );
+        } else {
+          // embed 用 EMBEDDING_MODEL、chat（generateObject）用 LLM_MODEL（同 search-kb / config-env 分工）。
+          const embedCredentials = {
+            apiKey: env.LLM_API_KEY!,
+            baseURL: env.LLM_BASE_URL!,
+            model: env.EMBEDDING_MODEL!,
+          };
+          explainer = explainLlm.buildExplainer({
+            credentials: { apiKey: env.LLM_API_KEY!, baseUrl: env.LLM_BASE_URL!, model: env.LLM_MODEL! },
+            dbh: db,
+            embed: (texts) => embedClean.embedTextsClean(texts, embedCredentials),
+            log: (message, detail) => console.error(`[recommend-coding-explain] ${message}`, detail ?? ''),
+          });
+        }
+      } catch (e) {
+        // fail-open：加载/构造抛错 ⇒ 模板层，绝不使工具失败。safeLog 吞 sink 抛错（EPIPE 等），不得逃逸。
+        safeLog(
+          (m) => console.error(m),
+          `[recommend-coding] 解释层构造失败，回落模板：${e instanceof Error ? e.message : String(e)}`,
+        );
+        explainer = undefined;
+      }
+    }
+
     try {
-      const result = await recommend(snapshot, args as RecommendInput);
+      const result = explainer
+        ? await recommend(snapshot, args as RecommendInput, explainer)
+        : await recommend(snapshot, args as RecommendInput);
       return {
         structuredContent: result,
         content: [{ type: 'text', text: summarize(result) }],
