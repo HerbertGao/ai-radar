@@ -10,7 +10,9 @@
  * - telegram / feishu / product_hunt / redis / llm 等一律 optional（缺也能启查询）；
  * - `PUSH_TIMEZONE` optional、default `Asia/Shanghai`（与主链 push_date 写入口径同源、防时区漂移）。
  *
- * 本模块**零外部副作用**：不建连接、不读取除 process.env 外的任何资源；可被查询链 top-level 安全 import。
+ * 本模块**无 I/O 副作用**：不建连接、不读取除 process.env 外的任何资源；可被查询链 top-level 安全 import。
+ * （`parseMcpEnv` 的唯一副作用：对非法可选枚举值 best-effort 写**一行 stderr**——见其 doc 后置检查段——
+ * stdout 是 JSON-RPC 专用通道，观测只能走 stderr；不写连接、不 exit。）
  */
 import { z } from 'zod';
 
@@ -41,6 +43,14 @@ const mcpEnvSchema = z.object({
     .url('LLM_BASE_URL 必须是合法 URL（OpenAI 兼容端点，如 https://openrouter.ai/api/v1）')
     .optional(),
   EMBEDDING_MODEL: z.string().min(1).optional(),
+  // recommend_coding_subscription 的 llm 解释层需模型名（add-model-radar-recommender-rag-explanation 5e）。
+  // 与其余 LLM 凭据同款：optional、不设 default（不硬编码模型名裸常量、防与 config/env 口径漂移）。
+  LLM_MODEL: z.string().min(1).optional(),
+  // 解释层选择开关（同 config/env）。**非致命款式**：mcpEnvSchema 是整对象 safeParse，非法枚举值（如 'LLM'）
+  // 若直接 z.enum().optional() 会产 issue、连累 required 字段一起炸掉纯查询进程。故 `.catch(undefined)` 兜底——
+  // 非法值落 undefined 而不产 issue；「原始串非空却解析 undefined」由 parseMcpEnv 后置检查识别为非法值、发一行 stderr、
+  // 按未设置处理（server 照常启动）。default 语义在调用方（缺 ⇒ 走模板层），此处 optional 保持三态可分。
+  MR_RECOMMEND_EXPLAIN: z.enum(['template', 'llm']).optional().catch(undefined),
 });
 
 /** MCP 宽松 env 类型。 */
@@ -53,6 +63,10 @@ export type McpEnv = z.infer<typeof mcpEnvSchema>;
  * （由 server.ts 在 connect 之前写 stderr + exit(1)，**绝不经 stdout**）。
  * 不在此处直接 throw / exit，留给调用方控制启动期 fail-fast 路径与文案。
  *
+ * **后置检查（非致命枚举）**：`MR_RECOMMEND_EXPLAIN` 以 `.catch(undefined)` 兜底，非法枚举值不炸整解析而落
+ * undefined；此处判「原始串非空却解析 undefined」= 非法值 ⇒ best-effort 写**一行 stderr**、按未设置处理，
+ * server 照常启动（stdout 是 JSON-RPC 通道，观测只能走 stderr）。合法/未设置均不刷 stderr。
+ *
  * @param raw 原始环境变量（默认 process.env；测试可注入）。
  */
 export function parseMcpEnv(
@@ -64,6 +78,13 @@ export function parseMcpEnv(
       .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
       .join('; ');
     return { ok: false, message };
+  }
+  const rawExplain = raw.MR_RECOMMEND_EXPLAIN;
+  if (typeof rawExplain === 'string' && rawExplain.length > 0 && result.data.MR_RECOMMEND_EXPLAIN === undefined) {
+    // 原始值非空但被 `.catch` 落为 undefined ⇒ 非法枚举值（如 'LLM'）。按未设置处理、不崩 server。
+    console.error(
+      `[mcp-env] MR_RECOMMEND_EXPLAIN=「${rawExplain}」不是合法值（template|llm），已按未设置处理（解释层默认走模板）。`,
+    );
   }
   return { ok: true, env: result.data };
 }

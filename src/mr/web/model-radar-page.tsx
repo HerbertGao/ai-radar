@@ -30,10 +30,15 @@ import type { Child } from 'hono/jsx';
 import { getModelRadarSnapshot, type CachedSnapshot } from '../snapshot/cache.js';
 import { modelRadarQueryParamsSchema, queryModelRadarSnapshot } from '../snapshot/query.js';
 import { recommend, type RecommendInput } from '../recommend/recommend.js';
-import { usageProfileSchema } from '../recommend/schema.js';
+import { usageProfileSchema, type Explainer } from '../recommend/schema.js';
+import { safeLog } from '../recommend/evidence.js';
+import { buildExplainer } from '../recommend/explain-llm.js';
 import { AlternativeCards, AnswerCard, ExplanationNote, SetupForm, type SetupQuery } from './answer.js';
 import { EvidenceDrawer, PageShell, type WebQuery } from './components.js';
 import { facetOptions, resolveTokensPerRound, type FreshnessSort } from './render.js';
+import { env } from '../../config/env.js';
+import { db } from '../../db/index.js';
+import { embedTexts } from '../../dedup/embedding.js';
 
 // default-src 'none' 收口未声明取数指令（object/connect/img…全拦）；显式 style-src 容内联 <style>；
 // font-src 'self' 放行同源自托管 webfont（未列 font-src 时字体由 default-src 'none' 兜底拦截），且不放行任何
@@ -51,6 +56,25 @@ const API_QUERY_KEYS = ['model', 'tool', 'protocol', 'currency', 'maxMonthlyPric
 /** 快照取用函数（默认走组 D 缓存；测试注入合成快照，不触 DB）。 */
 export type SnapshotProvider = () => Promise<CachedSnapshot>;
 const defaultProvider: SnapshotProvider = () => getModelRadarSnapshot();
+
+/**
+ * 解释层工厂（5e / task 4.1）：`MR_RECOMMEND_EXPLAIN==='llm'` ⇒ 用主 env 凭据 + 标准 embed + 主 db + stdout
+ * logger 构造 v2 LLM 证据叙述 explainer（注入 `recommend()` 第三参）；否则（默认 `template`）返回 `undefined`
+ * ⇒ `recommend()` 走默认模板层。**构造抛错不在此吞**——由 handler 的 fail-open try/catch 兜住（构造抛错 ⇒ 回落
+ * 模板 + 记错、绝不使公开页失败）。测试注入本工厂驱动 llm 路径（mock generateObjectFn/证据）或模拟构造抛错。
+ * Web 进程持全量 env，故直接读主 env（不同于 MCP 的 `mcpEnvSchema`/`getContext()` env-clean 款式）。
+ */
+export type ExplainerFactory = () => Explainer | undefined;
+
+const defaultExplainerFactory: ExplainerFactory = () => {
+  if (env.MR_RECOMMEND_EXPLAIN !== 'llm') return undefined;
+  return buildExplainer({
+    credentials: { apiKey: env.LLM_API_KEY, baseUrl: env.LLM_BASE_URL, model: env.LLM_MODEL },
+    dbh: db,
+    embed: (texts) => embedTexts(texts),
+    log: (message, detail) => console.log(`[model-radar-explain] ${message}`, detail ?? ''),
+  });
+};
 
 /** 从 query map 抽本页识别的 web 参数（透传给链接/chip/下拉预选）。 */
 function readWebQuery(raw: Record<string, string | undefined>): WebQuery {
@@ -95,8 +119,12 @@ async function renderDocument(title: string, body: Child): Promise<string> {
 /**
  * 构造挂载了 Model Radar 比价 Web 页的 Hono app。
  * @param getSnapshot 快照提供者（默认组 D 缓存；测试注入合成快照）。
+ * @param explainerFactory 解释层工厂（默认读主 env：llm 模式构造 v2 explainer、否则 undefined；测试注入驱动 llm 路径/构造抛错）。
  */
-export function createModelRadarWebApp(getSnapshot: SnapshotProvider = defaultProvider): Hono {
+export function createModelRadarWebApp(
+  getSnapshot: SnapshotProvider = defaultProvider,
+  explainerFactory: ExplainerFactory = defaultExplainerFactory,
+): Hono {
   const app = new Hono();
 
   // 自托管 Latin webfont（首个静态资源路由）。root 钉死到 `src/mr/web/assets`（唯一放行目录，MUST NOT
@@ -177,8 +205,20 @@ export function createModelRadarWebApp(getSnapshot: SnapshotProvider = defaultPr
     }
 
     const snapshot = cached.snapshot;
+    // 解释层装配（层选择不进 recommend() 本体，5e / task 4.1）：llm 模式经工厂构造 v2 explainer 注入第三参；
+    // **构造包 fail-open**——工厂（构造/装配 LLM 层）抛错 ⇒ 不传第三参走默认模板层 + 记错，绝不使公开页失败。
+    let explainer: Explainer | undefined;
+    try {
+      explainer = explainerFactory();
+    } catch (err) {
+      // best-effort stderr（safeLog 吞 sink 抛错，如 EPIPE）：不得破坏 fail-open 回落。
+      safeLog((m, d) => console.error(m, d), '[model-radar-web] 解释层构造失败，回落模板解释层（不影响公开页）', err);
+      explainer = undefined;
+    }
     // 呈现层零判定：答案/备选/说明全由引擎输出映射，按 verdict 过滤（非重排/重判/重算 primary）。
-    const result = await recommend(snapshot, input);
+    const result = explainer
+      ? await recommend(snapshot, input, explainer)
+      : await recommend(snapshot, input);
     const primary = result.candidates.find((c2) => c2.verdict === 'primary');
     const alternatives = result.candidates.filter((c2) => c2.verdict === 'alternative');
 

@@ -628,6 +628,12 @@ const envSchema = z.object({
   // 闭合"泄漏令牌长期可用"窗口。**必须是正整数**——下游 approve 用它拼 make_interval（校验过的整数、
   // 非字面拼接），非法值（NaN/负/0/小数）启动即报错。默认 72（3 天，够人工批一次）。
   MR_PRICE_REVIEW_TTL_HOURS: z.coerce.number().int().positive().default(72),
+
+  // ─── Model Radar 5e（add-model-radar-recommender-rag-explanation）推荐器解释层选择 ───
+  // 解释层：'template'（v1 纯模板、零成本、恒可回落）| 'llm'（v2 可选 LLM 证据叙述段，恒可回落模板）。
+  // 默认 'template' ⇒ 部署即惰性（生产开启是独立运营动作）；权威结论与数字恒出程序侧（模板段），
+  // llm 仅补非权威背景叙述。仿本仓开关惯例（WEEKLY_REPORT_ENABLED / ALERT_SCAN_ENABLED）。
+  MR_RECOMMEND_EXPLAIN: z.enum(['template', 'llm']).default('template'),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
