@@ -4,7 +4,7 @@
 >
 > 一个可长期运行的系统：聚合国内外 AI 新闻 / 产品 / 开源项目 / 论文 / 工具更新 → 跨来源去重 → 价值判断 → 中文摘要 → 飞书 / Telegram 推送 → 知识库沉淀 → MCP 查询与工具选型问答。
 >
-> **当前最高优先：Model Radar（P5）** —— AI 编程订阅 / Coding Plan / Token 包的**比价 + 选型**（编程垂类），作为同仓 bounded domain 并入（详见 [`ROADMAP.md`](./ROADMAP.md)「P5 Model Radar 步骤拆解」）。
+> **P5 Model Radar 已全部上线** —— AI 编程订阅 / Coding Plan / Token 包的**比价 + 选型**（比价页 + 选型推荐器，含可选的 LLM 证据解释）。下一步 = **P6**，把这套「先按规则选、再让 LLM 讲明白」泛化到「做某事该用哪个 AI 工具」。详见 [`ROADMAP.md`](./ROADMAP.md)。
 
 完整需求与设计文档见 [`QA.md`](./QA.md)（权威来源，任何冲突以它为准）。
 
@@ -82,7 +82,7 @@ flowchart TD
     DISP --> FS[飞书]:::prog
     DISP --> RES["成功置 success<br/>失败置 failed（可重试）"]:::db
 
-    KBING["KB Ingestion<br/>只入精选"]:::prog --> KB[("知识库<br/>Dify / RAGFlow / pgvector")]:::db
+    KBING["KB Ingestion<br/>只入精选"]:::prog --> KB[("知识库<br/>本地 pgvector（kb_documents + 语义检索核心）")]:::db
 
     classDef prog fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
     classDef agent fill:#fef9c3,stroke:#ca8a04,color:#713f12;
@@ -94,16 +94,17 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    USER([用户 · Claude/Cursor/ChatGPT]):::prog --> MCP[MCP Server]:::prog
+    USER([用户 · Claude/Cursor/ChatGPT]):::prog --> MCP[MCP Server · 9 工具]:::prog
     MCP --> Q1[get_today_ai_digest]:::prog
-    MCP --> Q2[search_ai_events / products]:::prog
-    MCP --> Q3[recommend_ai_tools_for_task]:::prog
+    MCP --> Q2[search_ai_events / products / kb]:::prog
+    MCP --> Q3[recommend_coding_subscription]:::prog
     Q1 --> DB[(PostgreSQL)]:::db
     Q2 --> DB
-    Q3 --> RECO["推荐引擎<br/>规则召回 → RAG 证据 → LLM 解释"]:::agent
+    Q2 --> KB
+    Q3 --> RECO["Model Radar 推荐器<br/>规则选出候选 → 程序算结论和价格<br/>→（可选）LLM 只补背景说明"]:::agent
     RECO --> DB
-    RECO --> KB[(知识库)]:::db
-    RECO --> OUT["首选 / 备选 / 不推荐 / 落地步骤"]:::prog
+    RECO --> KB[(知识库 pgvector)]:::db
+    RECO --> OUT["首选 / 备选 / 不推荐 + 月成本 + 来源"]:::prog
 
     classDef prog fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
     classDef agent fill:#fef9c3,stroke:#ca8a04,color:#713f12;
@@ -140,7 +141,7 @@ flowchart LR
 - `command: "tsx"` 须能被客户端 PATH 找到（或写成 `npx` + `args: ["tsx", "src/mcp/server.ts"]`，或填 `tsx` 的绝对路径）。
 - `cwd` 必须是仓库根的**绝对路径**：server 用 `import 'dotenv/config'` 之外不自动找 `.env`，且模块解析依赖 cwd。
 - `env.DATABASE_URL` **必填**：缺失/畸形时 server 在 connect 之前写 stderr 报错并 `exit(1)`（启动崩，不会静默）。
-- 纯查询链零全局-env 依赖：**只配 `DATABASE_URL` 即可启动并使用全部 5 个查询工具 + 2 个标记工具**；不需要 telegram/feishu/redis/llm/product_hunt 任何 token。
+- 纯查询链零全局-env 依赖：**只配 `DATABASE_URL` 即可启动并使用全部只读查询 + 2 个标记工具**；不需要 telegram/feishu/redis/product_hunt 任何 token。例外：`search_kb`（KB 语义检索）与 `recommend_coding_subscription` 的 `llm` 解释模式额外需 embedding/LLM 凭据（`LLM_API_KEY`/`LLM_BASE_URL`/`EMBEDDING_MODEL`[/`LLM_MODEL`]）——缺则该工具优雅降级（`search_kb` 返错误提示、推荐器回落模板解释），不影响其余工具与 server 启动。
 
 **要用 `push_event_now`（会真发推送）——须配齐与 worker 同的全部 required env**：
 
@@ -171,7 +172,7 @@ flowchart LR
 
 > 飞书可选：未配 `FEISHU_WEBHOOK_URL` + `FEISHU_SIGN_SECRET` 时 `push_event_now` 默认只推 telegram；配齐则默认 telegram + feishu（也可用 `channel` 参数指定单通道）。
 
-### 7 个工具一览（何时用 + 关键约束）
+### 9 个工具一览（何时用 + 关键约束）
 
 | 工具 | 何时用 | 关键约束 |
 |---|---|---|
@@ -182,6 +183,8 @@ flowchart LR
 | `mark_event_not_relevant` | 人工把某事件**踢出后续推送候选** | 置 `should_push=false`（事件表无 metadata 列，`reason` 仅记日志/返回、不入库）；事件不存在 → 返回错误；幂等。 |
 | `mark_product_interesting` | 人工给某产品打**「有趣」标记** | 在 `ai_products.metadata` 原子 merge 写 `interesting`（含时间/备注），不新增列、不触 LLM；产品不存在 → 返回错误；幂等。 |
 | `push_event_now` | 人工**立即把某事件推送**出去（不等日报） | **会真实发送外部消息**——复用既有 `dispatchDigest` 幂等状态机（该通道已成功推过则跳过）、单段要闻 digest；需配齐全部推送相关 env（缺则该通道返回错误）；多通道时各自独立，一个失败不拖累其它。 |
+| `search_kb` | 在**精选知识库**里按语义搜（只沉淀高价值的实测/经验/深度内容） | 本地 pgvector 语义检索，不依赖 Dify/RAGFlow；需 embedding 凭据，缺了只这个工具返回提示、不影响其它。只读。 |
+| `recommend_coding_subscription` | 问「重度用 Claude Code、想接 GLM-4.6，哪个订阅最便宜可用」这类**编程订阅选型** | 程序按规则筛出候选、算出结论和月成本，答「首选/备选/不推荐」并附每条价格的来源与核对时间。价格、额度、兼容都是库里的精确事实，**不让 LLM 拍脑袋**；打开 `MR_RECOMMEND_EXPLAIN=llm` 后 LLM 只额外补一段背景叙述、碰不到结论和数字。只读。 |
 
 ## 技术栈
 
@@ -197,8 +200,8 @@ flowchart LR
 | 编排 / 调度 / 队列 | **BullMQ**(Redis) | 自带重试与幂等任务;**不用 LangGraph** |
 | Telegram | **grammY** | 现代、强类型 |
 | 飞书 | 原生 fetch + 签名 Webhook | — |
-| 知识库 | Dify / RAGFlow（HTTP API） | 当可替换黑盒消费 |
-| 查询入口 | **MCP Server**(@modelcontextprotocol/sdk) | 官方 TS-first |
+| 知识库 | **本地 PostgreSQL + pgvector** | 自建语义检索，不用 Dify/RAGFlow 黑盒 |
+| 查询入口 | **MCP Server**(@modelcontextprotocol/sdk) | 官方 TS-first；9 个查询/推荐/标记工具 |
 | 本地 ML 逃生舱 | Python sidecar(按需) | 仅当未来需本地 embedding/rerank 模型时,经 HTTP 旁挂 |
 
 ## 技术栈决策：为什么用 TypeScript 而非 QA.md 的 Python
@@ -237,13 +240,11 @@ flowchart LR
 | **P2** | 扩源 + 双通道 + 产品发现 | 多源、飞书也通、每日 AI 产品发现、实时告警、周报 |
 | **P3** | 语义去重 + 知识库 | 跨源/跨语言同事件合并、精选可检索 |
 | **P4** | MCP 查询入口 | 在 Claude/Cursor 里查情报、人工干预（与 P3 并行） |
-| **P5** ⭐ | **Model Radar（编程订阅比价 + 选型，现最高优先）** | 编程订阅 / Coding Plan / Token 包比价页 + 「接 Claude Code 用哪个国产模型最划算」选型；10s 内答「谁含 GLM-5.2 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」 |
-| **P6** | 泛化选型顾问（原 P5） | "做某事用哪个 AI 工具" 的首选/备选/不推荐/落地步骤 |
+| **P5** ✅ | **Model Radar（编程订阅比价 + 选型）** | 编程订阅 / Coding Plan / Token 包比价页 + 「接 Claude Code 用哪个国产模型最划算」选型；10s 内答「谁含 GLM-4.6 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」；5a–5e + 答案优先 Web + 5e v2 RAG 证据解释层全部落地归档 |
+| **P6** | 泛化选型顾问（下一里程碑） | "做某事用哪个 AI 工具" 的首选/备选/不推荐/落地步骤（Model Radar 超集） |
 | P7 | Web 控制台（可选，延后） | 人工干预面板 |
 
-> 关键路径约 13–17 周；首个可用版本约第 4 周末。MVP 任务拆解与测试用例见 `QA.md` §17 / §18。
->
-> **进度（截至 2026-06-21）**：P0–P4 ✅ 全部落地，外加 roadmap 外的「AI 博主经验挖掘」链（`ai_experiences` 表 + 经验链 + ≥70 价值闸入知识库）。**下一步 P5 = Model Radar（编程订阅比价 + 选型，已提优先级）**，先做 5a（数据模型 + provenance）；原通用「工具选型顾问」降为 P6 泛化目标。P3 语义阈值的真实数据复校为持续运营动作（接线就位、取默认值，详见 `ROADMAP.md`「P3 退出标准达成」）。
+> **进度（2026-07-17）**：P0–P5 已全部上线——每日情报流水线（采集/去重/评分/中文摘要/双通道推送）+ 知识库 + MCP 查询入口 + Model Radar 比价与选型（含可选 LLM 证据解释）+ 额外的「AI 博主经验挖掘」链。下一步是 P6（把选型顾问从编程订阅泛化到更广的工具选型）或持续运营。分期细节见 `ROADMAP.md`。
 
 ## 建议目录结构
 
@@ -270,30 +271,36 @@ ai-radar/
 
 ## 环境变量
 
-参考 `QA.md` §19，落地时提供 `.env.example`：
+完整清单与每项注释见 [`.env.example`](./.env.example)。最常用的几项：
 
 ```env
-DATABASE_URL=postgresql://user:password@localhost:5432/ai_radar
-REDIS_URL=redis://localhost:6379/0
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
-DEEPSEEK_API_KEY=
+DATABASE_URL=postgres://ai_radar:ai_radar@localhost:5432/ai_radar
+REDIS_URL=redis://localhost:6379
+# LLM 走 OpenAI 兼容端点（默认 OpenRouter），一套凭据统一用于评分/摘要/embedding/推荐解释
+LLM_API_KEY=sk-or-...
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=openai/gpt-4o-mini
+EMBEDDING_MODEL=text-embedding-3-small
+# 推送通道
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 FEISHU_WEBHOOK_URL=
-FEISHU_SECRET=
-DIFY_API_BASE=
-DIFY_API_KEY=
-DIFY_DATASET_ID=
-ENABLE_PGVECTOR=true
-DEFAULT_TIMEZONE=Asia/Shanghai
+FEISHU_SIGN_SECRET=
+PUSH_TIMEZONE=Asia/Shanghai
+# 采集源（url|vendor，逗号分隔）
+RSS_FEEDS=
+BLOGGER_FEEDS=
+# Model Radar 选型解释层：template（默认，纯程序）| llm（叠加 LLM 证据叙述）
+MR_RECOMMEND_EXPLAIN=template
 ```
+
+> 知识库是本地 pgvector（不再需要 `DIFY_*`）；LLM 统一走 `LLM_*` 一套凭据（不再分 OpenAI/Anthropic/DeepSeek）。
 
 ## 开发约定
 
 本项目采用 **OpenSpec（spec-driven）** 工作流。项目上下文与不变量沉淀在 [`openspec/config.yaml`](./openspec/config.yaml)，需求权威文档为 [`QA.md`](./QA.md)。AI 协作约定见 [`CLAUDE.md`](./CLAUDE.md)。
 
-> **进度（截至 2026-06-21）**：P0–P4 + 「AI 博主经验挖掘」链均已落地（多源采集 → 跨源/跨语言语义去重 → 价值判断 → 中文摘要 → 飞书/Telegram 双通道推送，含产品发现 / 实时告警 / 周报 / 本地表知识库 / MCP 查询入口）；下一步 **P5 = Model Radar（编程订阅比价 + 选型，已提优先级）**，通用泛化顾问降为 P6。下面两节（P0 从零到验证序列、**P1 流水线运行说明**）是最初的端到端跑通指引，后续各期能力在其上叠加，运行入口不变。
+> P0–P5 已全部上线（进度见上）。下面两节（P0 从零到验证序列、**P1 流水线运行说明**）是最初的端到端跑通指引，后续各期能力在其上叠加、运行入口不变。
 
 ## 本地起步 / 快速开始
 
