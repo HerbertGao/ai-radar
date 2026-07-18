@@ -30,12 +30,14 @@ import type { Child } from 'hono/jsx';
 import { getModelRadarSnapshot, type CachedSnapshot } from '../snapshot/cache.js';
 import { modelRadarQueryParamsSchema, queryModelRadarSnapshot } from '../snapshot/query.js';
 import { recommend, type RecommendInput } from '../recommend/recommend.js';
-import { usageProfileSchema, type Explainer } from '../recommend/schema.js';
+import { usageProfileSchema, type Explainer, type RecommendationResult } from '../recommend/schema.js';
 import { safeLog } from '../recommend/evidence.js';
-import { buildExplainer } from '../recommend/explain-llm.js';
+import { buildExplainer, type RenderedBy } from '../recommend/explain-llm.js';
 import { AlternativeCards, AnswerCard, ExplanationNote, SetupForm, type SetupQuery } from './answer.js';
 import { EvidenceDrawer, PageShell, type WebQuery } from './components.js';
 import { facetOptions, resolveTokensPerRound, type FreshnessSort } from './render.js';
+import { computeSetupHash, getCachedExplanation, setCachedExplanation, withSingleFlight } from './explain-cache.js';
+import { checkAndBumpDailyCap, type DailyCapResult } from '../../rag/daily-cap.js';
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { embedTexts } from '../../dedup/embedding.js';
@@ -63,16 +65,24 @@ const defaultProvider: SnapshotProvider = () => getModelRadarSnapshot();
  * ⇒ `recommend()` 走默认模板层。**构造抛错不在此吞**——由 handler 的 fail-open try/catch 兜住（构造抛错 ⇒ 回落
  * 模板 + 记错、绝不使公开页失败）。测试注入本工厂驱动 llm 路径（mock generateObjectFn/证据）或模拟构造抛错。
  * Web 进程持全量 env，故直接读主 env（不同于 MCP 的 `mcpEnvSchema`/`getContext()` env-clean 款式）。
+ *
+ * 组 D：工厂接受两个 opt-in hooks（`onRender` 写闸 / `beforeLlmCall` daily-cap permit-gate）并**透传给
+ * `buildExplainer`**——web 侧的 Redis 缓存/日上限逻辑经回调注入，`explain-llm.ts` 本体保持 env-clean（回调实现
+ * 体在本调用方）。缺省不传 hooks（如 template 模式或未装配）时 `...undefined` 展开为空、行为不变。
  */
-export type ExplainerFactory = () => Explainer | undefined;
+export type ExplainerFactory = (hooks?: {
+  onRender?: (rb: RenderedBy) => void;
+  beforeLlmCall?: () => Promise<boolean>;
+}) => Explainer | undefined;
 
-const defaultExplainerFactory: ExplainerFactory = () => {
+const defaultExplainerFactory: ExplainerFactory = (hooks) => {
   if (env.MR_RECOMMEND_EXPLAIN !== 'llm') return undefined;
   return buildExplainer({
     credentials: { apiKey: env.LLM_API_KEY, baseUrl: env.LLM_BASE_URL, model: env.LLM_MODEL },
     dbh: db,
     embed: (texts) => embedTexts(texts),
     log: (message, detail) => console.log(`[model-radar-explain] ${message}`, detail ?? ''),
+    ...hooks,
   });
 };
 
@@ -117,14 +127,33 @@ async function renderDocument(title: string, body: Child): Promise<string> {
 }
 
 /**
+ * llm 解释路径的成本边界依赖（缓存读/写 + daily-cap 检查），默认走真实模块（组 C `explain-cache` + 组 A
+ * `daily-cap`）；测试按本文件既有 `getSnapshot`/`explainerFactory` 注入款式注入内存桩/canned 结果/reject 桩，
+ * 使缓存命中/未命中、cap 触顶/两态 reason、单飞、顶层兜底 fail-open 全可确定性驱动而不触真 Redis。
+ * `checkCap` 返回完整 `DailyCapResult`（reason 两态日志的落点在调用点的 `beforeLlmCall` 回调体内、非此桩内）。
+ */
+export interface ModelRadarWebDeps {
+  getCached?: (version: string, setupHash: string) => Promise<string | null>;
+  setCached?: (version: string, setupHash: string, explanation: string) => Promise<void>;
+  checkCap?: () => Promise<DailyCapResult>;
+}
+
+/**
  * 构造挂载了 Model Radar 比价 Web 页的 Hono app。
  * @param getSnapshot 快照提供者（默认组 D 缓存；测试注入合成快照）。
  * @param explainerFactory 解释层工厂（默认读主 env：llm 模式构造 v2 explainer、否则 undefined；测试注入驱动 llm 路径/构造抛错）。
+ * @param deps llm 成本边界依赖（缓存读写 + daily-cap；默认真实模块，测试注入内存/reject 桩）。
  */
 export function createModelRadarWebApp(
   getSnapshot: SnapshotProvider = defaultProvider,
   explainerFactory: ExplainerFactory = defaultExplainerFactory,
+  deps: ModelRadarWebDeps = {},
 ): Hono {
+  // 默认绑真实模块（无第三参 deps ⇒ 走默认 Redis）；测试注入桩以确定性驱动缓存/cap/单飞/兜底路径。
+  const getCached = deps.getCached ?? getCachedExplanation;
+  const setCached = deps.setCached ?? setCachedExplanation;
+  const checkCap =
+    deps.checkCap ?? (() => checkAndBumpDailyCap({ namespace: 'mr', cap: env.MR_EXPLAIN_DAILY_LLM_CAP }));
   const app = new Hono();
 
   // 自托管 Latin webfont（首个静态资源路由）。root 钉死到 `src/mr/web/assets`（唯一放行目录，MUST NOT
@@ -205,20 +234,70 @@ export function createModelRadarWebApp(
     }
 
     const snapshot = cached.snapshot;
-    // 解释层装配（层选择不进 recommend() 本体，5e / task 4.1）：llm 模式经工厂构造 v2 explainer 注入第三参；
-    // **构造包 fail-open**——工厂（构造/装配 LLM 层）抛错 ⇒ 不传第三参走默认模板层 + 记错，绝不使公开页失败。
-    let explainer: Explainer | undefined;
+
+    // ── llm 解释路径成本边界（组 D，spec「公开 web 页 llm 解释的成本边界」）：整条解释缓存 + 进程内单飞 +
+    //    daily-cap permit-gate，整条链包在**顶层兜底 try/catch** 内——缓存读 / 单飞 / produce / 包裹 explainer 的
+    //    recommend() 任一 reject ⇒ 记错 + 回落默认模板、页恒 200（不冒泡成 500）。template 默认模式（工厂返
+    //    undefined）与 MCP 路径零变化（不触缓存/cap）。被缓存串 = explainer 返回的 narration（**不含 guidance
+    //    前缀**——guidance 由 recommend() 命中时现拼、逐字节重导）；仅 renderedBy==='llm' 成功产物写缓存。
+    let result: RecommendationResult;
     try {
-      explainer = explainerFactory();
+      let renderedBy: RenderedBy | undefined;
+      let narration: string | undefined;
+      const explainer = explainerFactory({
+        onRender: (rb) => {
+          renderedBy = rb;
+        },
+        // permit-gate（证据非空、真发起 LLM 之前 await 一次）：读 daily-cap 完整结果、按 reason 两态分别记日志后返
+        // .allowed。allowed=false（超限 quota-exceeded 或 Redis 故障 infra-error，皆 false）⇒ explainer 跳过 LLM
+        // 回落模板（fail-open，页恒可用）。空证据在 explainer 内早返、gate 之前 ⇒ 此回调不触发、不占配额。
+        beforeLlmCall: async () => {
+          const capRes = await checkCap();
+          if (!capRes.allowed) {
+            safeLog(
+              (m, d) => console.warn(m, d),
+              `[model-radar-explain] daily-cap 拒绝（reason=${capRes.reason ?? 'unknown'}）⇒ 回落模板`,
+              { reason: capRes.reason },
+            );
+          }
+          return capRes.allowed;
+        },
+      });
+      if (!explainer) {
+        // template 默认模式：无第三参 ⇒ 零缓存 / 零 cap / 零装配，与本变更前逐字节一致。
+        result = await recommend(snapshot, input);
+      } else {
+        // setupHash/version 仅 llm 分支的 getCached/setCached/单飞 key 用；下沉至此使 template 默认模式零多余 sha256。
+        const setupHash = computeSetupHash(input);
+        const version = cached.version;
+        const hit = await getCached(version, setupHash);
+        if (hit !== null) {
+          // 命中：注入 ()=>cached 作 explainer，recommend() 现拼 guidance；explainer 不跑 ⇒ 不装配、不调 LLM、
+          // beforeLlmCall 不触发（不计 cap）。
+          result = await recommend(snapshot, input, () => Promise.resolve(hit));
+        } else {
+          // 未命中：进程内单飞收敛并发首请求为至多 1 次装配+LLM；produce 内包裹 explainer 截获 narration，仅
+          // renderedBy==='llm' 成功产物写缓存（narration 不含 guidance）。
+          result = await withSingleFlight(`${version}:${setupHash}`, async () => {
+            const wrapped: Explainer = async (inp) => {
+              narration = await explainer(inp);
+              return narration;
+            };
+            const r = await recommend(snapshot, input, wrapped);
+            if (renderedBy === 'llm' && narration !== undefined) {
+              await setCached(version, setupHash, narration);
+            }
+            return r;
+          });
+        }
+      }
     } catch (err) {
-      // best-effort stderr（safeLog 吞 sink 抛错，如 EPIPE）：不得破坏 fail-open 回落。
-      safeLog((m, d) => console.error(m, d), '[model-radar-web] 解释层构造失败，回落模板解释层（不影响公开页）', err);
-      explainer = undefined;
+      // 顶层兜底 fail-open：缓存读 / 单飞 / produce / 包裹 explainer 的 recommend() 任一 reject ⇒ 记错 + 回落默认
+      // 模板、页恒 200（不 500）。best-effort stderr（safeLog 吞 sink 抛错如 EPIPE）。
+      safeLog((m, d) => console.error(m, d), '[model-radar-web] llm 解释路径异常，回落默认模板（页恒 200）', err);
+      result = await recommend(snapshot, input);
     }
-    // 呈现层零判定：答案/备选/说明全由引擎输出映射，按 verdict 过滤（非重排/重判/重算 primary）。
-    const result = explainer
-      ? await recommend(snapshot, input, explainer)
-      : await recommend(snapshot, input);
+    // ponytail: result 可能是单飞共享引用（并发 awaiter 共享 winner 的同一对象）；下游仅 find/filter/JSX 只读，勿 mutate result.candidates（会串扰其它 awaiter）。
     const primary = result.candidates.find((c2) => c2.verdict === 'primary');
     const alternatives = result.candidates.filter((c2) => c2.verdict === 'alternative');
 

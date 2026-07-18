@@ -75,6 +75,7 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
       '../../db/index.js',
       '../../mr/snapshot/cache.js', // recommend-coding.ts 须动态 import env-clean build.ts、不顶层 import cache/build。
       '../../mr/snapshot/build.js',
+      '../../mr/web/explain-cache.js', // add-model-radar-explain-public-cost-bound 组 B（task 2.3）：web-only 解释缓存（Redis）MUST NOT 漂进 MCP 链（recommend-coding.ts 等）——静态钉住 web 缓存不破 env-clean。
       '../../selection/top-n.js', // 仅可 import type；下面单独放行 type-only。
     ];
     for (const f of files) {
@@ -141,10 +142,13 @@ describe('env-clean 静态纪律（无需 DB，恒跑）', () => {
     // explain-llm.ts / evidence.ts 被 recommend-coding.ts 在 handler 内动态 import（llm 模式，缺 key 分支亦过此边界）；
     // 二者 MUST NOT 值 import config/env、agents/llm-client（触全局 parseEnv 崩纯查询进程），db/index 若出现须 import type。
     // 文件在 src/mr/recommend/ → 相对 specifier 前缀 `../../`。
+    // add-model-radar-explain-public-cost-bound 组 B（task 2.3）：opt-in 回调注入不得把 web-only 的 Redis
+    // daily-cap / 缓存拖进 explain-llm.ts——回调实现体在 web 调用方、`explain-llm.ts`/`evidence.ts` 仍
+    // MUST NOT 值 import config/env、agents/llm-client、`ioredis`（Redis 值 import 即破 MCP env-clean）。
     for (const explainFile of [explainLlm, evidence]) {
       const src = await readFile(explainFile, 'utf8');
       const stmts = src.match(/^import\b[\s\S]*?from\s+['"][^'"]+['"]/gm) ?? [];
-      for (const spec of ['../../config/env.js', '../../agents/llm-client.js']) {
+      for (const spec of ['../../config/env.js', '../../agents/llm-client.js', 'ioredis']) {
         expect(
           stmts.some((s) => s.includes(spec)),
           `${explainFile}: 顶层不得 import ${spec}（env-clean）`,

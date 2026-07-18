@@ -634,6 +634,14 @@ const envSchema = z.object({
   // 默认 'template' ⇒ 部署即惰性（生产开启是独立运营动作）；权威结论与数字恒出程序侧（模板段），
   // llm 仅补非权威背景叙述。仿本仓开关惯例（WEEKLY_REPORT_ENABLED / ALERT_SCAN_ENABLED）。
   MR_RECOMMEND_EXPLAIN: z.enum(['template', 'llm']).default('template'),
+
+  // ─── Model Radar 5e 成本边界（add-model-radar-explain-public-cost-bound，design D3）───
+  // 公开 web 页 `/model-radar` `llm` 解释路径的**独立日 LLM 调用上限**（daily-cap namespace='mr'、
+  // 键 mr:llmcalls:<date>，与 advisor 的 RAG_DAILY_LLM_CALL_CAP 预算互不影响，一面用尽不拖累另一面）。
+  // 计的是**逻辑作答（permit）**：每 permit 至多 2 次真 generateObject（callLlm ≤1 瞬态重试）⇒ 日真调
+  // 上界 ≈ 2× cap，operator MUST 按 2× 设值。超限/Redis 不可用 ⇒ fail-open 回落模板（公开展示页恒可用、
+  // 只退化解释，区别 advisor 的 fail-closed 拒服务）。默认 200（低于 advisor 500）；非法值启动即报错。
+  MR_EXPLAIN_DAILY_LLM_CAP: z.coerce.number().int().positive().default(200),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
