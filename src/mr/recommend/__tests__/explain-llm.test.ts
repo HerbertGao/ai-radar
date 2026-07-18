@@ -11,7 +11,7 @@ import { APICallError } from 'ai';
 import { mrPriceHistory } from '../../../db/schema.js';
 import { recommend, type RecommendInput } from '../recommend.js';
 import { renderTemplate } from '../explain.js';
-import { buildExplainer, type BuildExplainerOptions, type GenerateObjectFn } from '../explain-llm.js';
+import { buildExplainer, type BuildExplainerOptions, type GenerateObjectFn, type RenderedBy } from '../explain-llm.js';
 import type {
   ExplanationInput,
   MrCurrency,
@@ -85,7 +85,14 @@ interface RenderOut {
 /** 注入 evidence 直渲：返回 out / 模板段 / 日志 / gen 桩。 */
 async function render(
   narrative: string,
-  opts: { candidates?: RankedCandidate[]; evidence?: RecommendEvidence; log?: (m: string, d?: unknown) => void; gen?: GenerateObjectFn } = {},
+  opts: {
+    candidates?: RankedCandidate[];
+    evidence?: RecommendEvidence;
+    log?: (m: string, d?: unknown) => void;
+    gen?: GenerateObjectFn;
+    onRender?: (renderedBy: RenderedBy) => void;
+    beforeLlmCall?: () => Promise<boolean>;
+  } = {},
 ): Promise<RenderOut> {
   const candidates = opts.candidates ?? [mkCandidate()];
   const evidence = opts.evidence ?? mkEvidence({ priceChanges: [priceChange()] });
@@ -98,6 +105,8 @@ async function render(
     embed: (async () => [[0.1]]) as BuildExplainerOptions['embed'],
     log,
     generateObjectFn: gen,
+    ...(opts.onRender ? { onRender: opts.onRender } : {}),
+    ...(opts.beforeLlmCall ? { beforeLlmCall: opts.beforeLlmCall } : {}),
   };
   const explainer = buildExplainer(options);
   const input: ExplanationInput = { query: QUERY, candidates, evidence };
@@ -474,6 +483,66 @@ describe('3.5 观测：renderedBy 三值 + 命中统计', () => {
     expect(out).toBe(templateSeg);
     expect(renderLog(logs)!.renderedBy).toBe('template');
     expect((gen as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(0);
+  });
+});
+
+// ── 2.4 buildExplainer 注入回调（onRender + beforeLlmCall；缺省逐字节不变）─────────
+
+describe('2.4 buildExplainer 注入回调 onRender / beforeLlmCall', () => {
+  it('beforeLlmCall=()=>false ⇒ 跳过 LLM、renderedBy=llm-fallback-template(cap-declined)、onRender 收该值', async () => {
+    const rendered: RenderedBy[] = [];
+    const beforeLlmCall = vi.fn(async () => false);
+    const gen = mockLlm('最近有更新');
+    const { out, templateSeg, logs } = await render('最近有更新', {
+      gen,
+      beforeLlmCall,
+      onRender: (rb) => rendered.push(rb),
+    });
+    expect(out).toBe(templateSeg); // 跳过 LLM ⇒ 逐字节 = 模板段
+    expect((gen as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(0); // LLM 未被调
+    expect(beforeLlmCall).toHaveBeenCalledTimes(1); // gate 只调一次（不进重试循环）
+    expect(renderLog(logs)!.renderedBy).toBe('llm-fallback-template');
+    expect(renderLog(logs)!.discardReason).toBe('cap-declined');
+    expect(rendered).toEqual(['llm-fallback-template']);
+  });
+
+  it('beforeLlmCall=()=>true ⇒ 正常调 LLM、onRender 收 llm', async () => {
+    const rendered: RenderedBy[] = [];
+    const beforeLlmCall = vi.fn(async () => true);
+    const gen = mockLlm('最近有更新');
+    const { out, templateSeg } = await render('最近有更新', {
+      gen,
+      beforeLlmCall,
+      onRender: (rb) => rendered.push(rb),
+    });
+    expect(out).toBe(`${templateSeg}\n\n最近有更新`); // 正常 LLM 段
+    expect((gen as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1);
+    expect(beforeLlmCall).toHaveBeenCalledTimes(1);
+    expect(rendered).toEqual(['llm']);
+  });
+
+  it('证据三源全空 ⇒ beforeLlmCall 不被调（gate 前早返）、onRender 收 template、零 LLM', async () => {
+    const rendered: RenderedBy[] = [];
+    const beforeLlmCall = vi.fn(async () => true);
+    const gen = mockLlm('never');
+    const { out, templateSeg } = await render('never', {
+      evidence: mkEvidence(), // 三源全空
+      gen,
+      beforeLlmCall,
+      onRender: (rb) => rendered.push(rb),
+    });
+    expect(out).toBe(templateSeg);
+    expect(beforeLlmCall).not.toHaveBeenCalled(); // 空证据不占配额（三源全空早返在 gate 前）
+    expect((gen as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(0);
+    expect(rendered).toEqual(['template']);
+  });
+
+  it('缺省不注入回调 ⇒ 行为与 5e v2 逐字节不变（有回调=true 时同结果）', async () => {
+    // 缺省（MCP 路径）与显式 beforeLlmCall=()=>true 应产出逐字节相同的 explanation。
+    const bare = await render('最近有更新'); // 不注入任何回调
+    const gated = await render('最近有更新', { beforeLlmCall: async () => true });
+    expect(bare.out).toBe(`${bare.templateSeg}\n\n最近有更新`);
+    expect(gated.out).toBe(bare.out);
   });
 });
 

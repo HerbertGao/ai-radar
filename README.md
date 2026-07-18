@@ -292,6 +292,10 @@ RSS_FEEDS=
 BLOGGER_FEEDS=
 # Model Radar 选型解释层：template（默认，纯程序）| llm（叠加 LLM 证据叙述）
 MR_RECOMMEND_EXPLAIN=template
+# 公开页 /model-radar 开 llm 的成本边界：整条解释缓存（按快照版本+setup 哈希）+ 独立日 LLM 上限（键 mr:llmcalls:，
+# 与 advisor 预算隔离），超限/Redis 故障 fail-open 回落模板、页恒 200。计逻辑作答（permit），每 permit 至多 2 次真调
+# ⇒ 日真调 ≈ 2× cap，按 2× 设值。默认 200。
+MR_EXPLAIN_DAILY_LLM_CAP=200
 ```
 
 > 知识库是本地 pgvector（不再需要 `DIFY_*`）；LLM 统一走 `LLM_*` 一套凭据（不再分 OpenAI/Anthropic/DeepSeek）。

@@ -31,8 +31,9 @@ import {
 
 /** 桶2 gate category + 默认币种——复用枚举 SOT（不依赖 web 层、不新立裸字面量）。 */
 const RECOMMEND_CATEGORY = mrCategorySchema.enum.coding_plan;
-const DEFAULT_CURRENCY: MrCurrency = mrCurrencySchema.enum.CNY;
-const DEFAULT_USAGE: UsageProfile = 'medium';
+// export：供 web 侧 explain-cache.computeSetupHash 套同款缺省再哈希（避免 setupHash 与 recommend() 缺省漂移）。
+export const DEFAULT_CURRENCY: MrCurrency = mrCurrencySchema.enum.CNY;
+export const DEFAULT_USAGE: UsageProfile = 'medium';
 
 /** usageProfile → 两个正交旋钮（recommender 自持；demandedRounds 与 tokensPerRound 互不耦合）。 */
 const USAGE_KNOBS: Record<UsageProfile, { demandedRounds: number; tokensPerRound: number }> = {

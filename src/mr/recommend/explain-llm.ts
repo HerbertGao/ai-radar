@@ -32,8 +32,8 @@ const EXPLAIN_LLM_TIMEOUT_MS = 8000;
 /** 重试前的剩余预算下限：低于此不重试（design D4）。 */
 const EXPLAIN_RETRY_MIN_REMAINING_MS = 2000;
 
-/** 渲染层三值标记（spec「可观测」）。 */
-type RenderedBy = 'template' | 'llm' | 'llm-fallback-template';
+/** 渲染层三值标记（spec「可观测」）。type-only 导出供 web onRender 标注（编译期擦除、零 env-clean 代价）。 */
+export type RenderedBy = 'template' | 'llm' | 'llm-fallback-template';
 
 /** 守卫②结论词表（封闭常量、匹配无正则参与，spec 守卫②）。 */
 const CONCLUSION_ZH = ['首选', '备选', '不推荐', '推荐', '建议选'];
@@ -56,13 +56,23 @@ export interface GenerateObjectArgs {
 }
 export type GenerateObjectFn = (args: GenerateObjectArgs) => Promise<{ object: unknown }>;
 
-/** buildExplainer 入参（凭据 + 装配 deps + 可选 generateObject 注入缝）。 */
+/** buildExplainer 入参（凭据 + 装配 deps + 可选 generateObject 注入缝 + web-only 成本边界回调）。 */
 export interface BuildExplainerOptions {
   credentials: ExplainerCredentials;
   dbh: AssembleEvidenceDeps['dbh'];
   embed: AssembleEvidenceDeps['embed'];
   log: EvidenceLog;
   generateObjectFn?: GenerateObjectFn;
+  /**
+   * 渲染末尾回调（opt-in，web 注入；MCP 不注入）——只携 `renderedBy`、保持 `void`：供调用方判是否写缓存
+   * （仅 `renderedBy==='llm'` 写）。被缓存的叙述串由 web 包裹 explainer 截获、**不经此回调**（design D2）。
+   */
+  onRender?: (renderedBy: RenderedBy) => void;
+  /**
+   * permit-gate（opt-in，web 注入 daily-cap；MCP 不注入）——在**证据非空、真发起 `callLlm` 之前** await 一次，
+   * 返 `false` ⇒ 跳过 LLM、走回落模板。缺省 ⇒ 不 gate、照常调 LLM（design D2/D3）。
+   */
+  beforeLlmCall?: () => Promise<boolean>;
 }
 
 const narrativeSchema = z.object({ narrative: z.string() });
@@ -330,7 +340,7 @@ function isTransient(error: unknown): boolean {
 }
 
 export function buildExplainer(options: BuildExplainerOptions): (input: ExplanationInput) => Promise<string> {
-  const { credentials, dbh, embed, log } = options;
+  const { credentials, dbh, embed, log, onRender, beforeLlmCall } = options;
   // 工厂对注入凭据做防御断言（构造期抛错由调用方 fail-open 兜住，spec 两进程装配）。
   if (!credentials || !credentials.apiKey || !credentials.baseUrl || !credentials.model) {
     throw new Error('buildExplainer: credentials.apiKey/baseUrl/model 均必填');
@@ -382,6 +392,8 @@ export function buildExplainer(options: BuildExplainerOptions): (input: Explanat
           pendingReview: evidence!.pendingReview.length,
           ...(discardReason ? { discardReason } : {}),
         });
+        // 渲染出口末尾回调（opt-in，缺省 no-op）：只携 renderedBy，供 web 判缓存写（仅 'llm' 写）。
+        onRender?.(renderedBy);
       };
 
       // 三源全空 ⇒ 跳过 LLM（无料可写、省成本），标记 template。
@@ -409,6 +421,14 @@ export function buildExplainer(options: BuildExplainerOptions): (input: Explanat
         evidence,
       );
       const prompt = buildPrompt(candidateMaterials, kbMaterials, priceMaterials, pendingMaterials);
+
+      // permit-gate（opt-in，web 注入 daily-cap）：证据非空、真发起 callLlm **之前** await 一次——不进 callLlm
+      // 重试循环（每 permit ≤ 2 次真调）。返 false（超限/Redis 故障 fail-open）⇒ 跳过 LLM 回落模板；缺省
+      //（MCP 不注入）⇒ 短路跳过、照常调 LLM。三源全空已在上方早返、gate 前 ⇒ 空证据不占配额（design D3）。
+      if (beforeLlmCall && !(await beforeLlmCall())) {
+        logRender('llm-fallback-template', 'cap-declined');
+        return templateOut;
+      }
 
       let narrative: string;
       try {
@@ -461,6 +481,8 @@ export function buildExplainer(options: BuildExplainerOptions): (input: Explanat
         discardReason: 'render-error',
         error: String(error),
       });
+      // 此出口不经 logRender（evidence 可能 undefined）——单独补 onRender（缺省 no-op；'llm-fallback-template' ⇒ web 不写缓存）。
+      onRender?.('llm-fallback-template');
       return templateOut;
     }
   };
