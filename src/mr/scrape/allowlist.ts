@@ -25,7 +25,8 @@ export const MR_SOURCE_DOMAIN_ALLOWLIST: readonly string[] = [
   'google.com', // Gemini / Google AI pricing
   'x.ai', // xAI / Grok
   'deepseek.com',
-  'moonshot.cn', // Kimi（platform.moonshot.cn）
+  'moonshot.cn', // Kimi（platform.moonshot.cn 旧 API 域；api.moonshot.cn/anthropic 仍服务 Anthropic-compatible）
+  'kimi.com', // Kimi 新域（platform.kimi.com 文档/定价、www.kimi.com/membership/pricing 消费端会员 + Kimi Code Plans）
   'bigmodel.cn', // 智谱 GLM / Z.ai
   'alibabacloud.com', // 通义千问 / DashScope
   'minimaxi.com', // MiniMax（platform.minimaxi.com）

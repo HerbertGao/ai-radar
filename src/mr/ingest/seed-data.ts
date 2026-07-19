@@ -194,7 +194,10 @@ export const SEED_VENDORS: SeedVendor[] = [
     normalizedName: 'kimi',
     name: 'Kimi（Moonshot）',
     sources: [
-      { sourceUrl: 'https://platform.moonshot.cn/docs/pricing', fetchStrategy: 'http' },
+      // 2026-07 域名迁移：moonshot.cn → kimi.com；platform.kimi.com 是新 API 平台主域（结构化文档页 → http）。
+      // www.kimi.com/membership/pricing 是消费端会员 + Kimi Code Plans 页（JS 渲染 → browser）；kimi.com 已入 allowlist。
+      { sourceUrl: 'https://platform.kimi.com/docs/pricing', fetchStrategy: 'http' },
+      { sourceUrl: 'https://www.kimi.com/membership/pricing', fetchStrategy: 'browser' },
     ],
     plans: [
       {
@@ -203,14 +206,50 @@ export const SEED_VENDORS: SeedVendor[] = [
         availability: 'unknown',
         currentPrice: null,
         currency: null,
-        sourceUrl: 'https://platform.moonshot.cn/docs/pricing',
+        sourceUrl: 'https://platform.kimi.com/docs/pricing',
         sourceConfidence: 'needs_login_recheck',
         limits: [
           // Token 桶通用积分额度类型确定，具体数无把握 → null 占位。
           { limitType: 'credit', value: null, window: 'month' },
         ],
-        models: [{ family: 'kimi', version: 'k2' }],
-        clients: [{ clientType: 'protocol', clientId: 'openai-compatible' }],
+        // 2026-07 模型线刷新：K3（旗舰，1M ctx）、K2.7 Code（256k，coding）、K2.6、K2.5；
+        // Moonshot V1 官方公告 8/31 全平台下线（platform.kimi.com/docs/pricing/chat）。
+        models: [
+          { family: 'kimi', version: 'k3' },
+          { family: 'kimi', version: 'k2.7-code' },
+          { family: 'kimi', version: 'k2.6' },
+          { family: 'kimi', version: 'k2.5' },
+        ],
+        clients: [
+          { clientType: 'protocol', clientId: 'openai-compatible' },
+          // api.moonshot.cn/anthropic 提供 Anthropic-compatible（platform.kimi.com/docs/guide/claude-code-kimi）。
+          { clientType: 'protocol', clientId: 'anthropic-compatible' },
+        ],
+      },
+      {
+        // Kimi Code Plans（消费端会员，www.kimi.com/membership/pricing）。
+        // 文档明示多档位（音乐术语命名如 Moderato，K3 从 Moderato 起可用），具体档位价 JS 渲染 + 登录墙 → 需人工核实。
+        // 买 plan 同时享受其他 Kimi 会员权益（消费端 + Kimi Code 合并会员体系）。
+        name: 'Kimi Code Plan',
+        category: 'coding_plan',
+        availability: 'unknown',
+        currentPrice: null,
+        currency: null,
+        sourceUrl: 'https://www.kimi.com/membership/pricing',
+        sourceConfidence: 'needs_login_recheck',
+        limits: [
+          // Kimi Code 共享消费端会员额度池，具体数无把握 → null 占位。
+          { limitType: 'credit', value: null, window: 'month' },
+        ],
+        models: [
+          { family: 'kimi', version: 'k3' },
+          { family: 'kimi', version: 'k2.7-code' },
+        ],
+        clients: [
+          // 官方生态集成（platform.kimi.com/docs/guide/claude-code-kimi）：Claude Code 经 api.moonshot.cn/anthropic。
+          { clientType: 'tool', clientId: 'claude-code' },
+          { clientType: 'protocol', clientId: 'anthropic-compatible' },
+        ],
       },
     ],
   },
