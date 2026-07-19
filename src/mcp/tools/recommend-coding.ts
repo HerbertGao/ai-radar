@@ -149,7 +149,8 @@ export const recommendCodingTool: McpToolDescriptor = {
           explainer = explainLlm.buildExplainer({
             credentials: { apiKey: env.LLM_API_KEY!, baseUrl: env.LLM_BASE_URL!, model: env.LLM_MODEL! },
             dbh: db,
-            embed: (texts) => embedClean.embedTextsClean(texts, embedCredentials),
+            embed: (texts, signal) =>
+              embedClean.embedTextsClean(texts, embedCredentials, { ...(signal ? { signal } : {}) }),
             log: (message, detail) => console.error(`[recommend-coding-explain] ${message}`, detail ?? ''),
           });
         }

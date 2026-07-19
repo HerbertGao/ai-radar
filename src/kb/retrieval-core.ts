@@ -19,8 +19,11 @@ import type { db as defaultDb } from '../db/index.js';
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测（类型经 `import type` 引入、运行期无副作用）。 */
 type DbLike = typeof defaultDb;
 
-/** 注入的 env-clean embed：给定文本批 → 等长同序向量。MCP 侧注入真实 env-clean embed 变体、测试注入桩（不触网）。 */
-export type KbEmbed = (texts: string[]) => Promise<number[][]>;
+/**
+ * 注入的 env-clean embed：给定文本批 → 等长同序向量。MCP 侧注入真实 env-clean embed 变体、测试注入桩（不触网）。
+ * opt-in 第二参 `signal`（D3）：转发给底层 embedMany 的 abortSignal 做真取消；既有 `(texts) => …` lambda 少参可赋、兼容。
+ */
+export type KbEmbed = (texts: string[], signal?: AbortSignal) => Promise<number[][]>;
 
 /** top-k 归一化上限：防超大 topK 触发巨量 seq-scan 输出（D3）。 */
 const TOP_K_MAX = 50;
@@ -52,6 +55,13 @@ export interface SearchKbCoreParams {
   dbh: DbLike;
   /** 注入的 env-clean embed（真实变体 or 测试桩）。 */
   embed: KbEmbed;
+  /** opt-in 取消信号（D3）：转发给注入的 embed；DB 查询不认 signal（走 deadlineAtMs，见 D4）。缺省不传即现状。 */
+  signal?: AbortSignal;
+  /**
+   * opt-in 绝对 epoch 截止时刻（ms，D4）：非空时 KB 查询进单连事务、事务回调内（拿到连接后）算剩余预算
+   * 设服务端 `statement_timeout`（剩余 ≤0 则回调内不启动查询返 []）。缺省不传即现状（裸查询、无事务）。
+   */
+  deadlineAtMs?: number;
   /** 错误/观测日志 sink，默认 console.error。 */
   logError?: (message: string, detail: unknown) => void;
 }
@@ -94,7 +104,8 @@ export async function searchKbCore(params: SearchKbCoreParams): Promise<KbSearch
   }
 
   // 查询向量化（注入的 env-clean embed；守 D7 同模型 cosine 可比不变量由调用方选同一 EMBEDDING_MODEL 保证）。
-  const [queryVec] = await embed([query]);
+  // opt-in signal 转发给 embed 做真取消（D3）；缺省 undefined ⇒ 底层 abortSignal 不出现、逐字节等价现状。
+  const [queryVec] = await embed([query], params.signal);
   if (!queryVec || queryVec.length === 0) return [];
 
   const queryLiteral = toPgVectorLiteral(queryVec);
@@ -102,29 +113,47 @@ export async function searchKbCore(params: SearchKbCoreParams): Promise<KbSearch
   const distanceExpr = sql<number>`(${kbDocuments.embedding} <=> ${queryLiteral}::vector)`;
 
   // D8 谓词：事件域 + 有 embedding + tombstone 事件域只读反连接排除；取序 `<=> $q, id`（id 消并列任意序）。
-  const rows = await dbh
-    .select({
-      id: kbDocuments.id,
-      kbTitle: kbDocuments.kbTitle,
-      summaryZh: kbDocuments.summaryZh,
-      entities: kbDocuments.entities,
-      sourceUrls: kbDocuments.sourceUrls,
-      eventDate: kbDocuments.eventDate,
-      longTermValue: kbDocuments.longTermValue,
-      cosineSim: sql<number>`1 - ${distanceExpr}`,
-    })
-    .from(kbDocuments)
-    .where(
-      sql`${kbDocuments.targetType} = 'event'
-        AND ${kbDocuments.embedding} IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM ${aiNewsEvents} e
-          WHERE e.event_id = ${kbDocuments.targetId}
-            AND e.merged_into IS NOT NULL
-        )`,
-    )
-    .orderBy(distanceExpr, kbDocuments.id)
-    .limit(topK);
+  // 抽出查询构造：既供裸路径（executor=dbh），也供事务路径（executor=tx）——两路发出的 SQL 逐字节同一。
+  const runKbQuery = (executor: Pick<DbLike, 'select'>) =>
+    executor
+      .select({
+        id: kbDocuments.id,
+        kbTitle: kbDocuments.kbTitle,
+        summaryZh: kbDocuments.summaryZh,
+        entities: kbDocuments.entities,
+        sourceUrls: kbDocuments.sourceUrls,
+        eventDate: kbDocuments.eventDate,
+        longTermValue: kbDocuments.longTermValue,
+        cosineSim: sql<number>`1 - ${distanceExpr}`,
+      })
+      .from(kbDocuments)
+      .where(
+        sql`${kbDocuments.targetType} = 'event'
+          AND ${kbDocuments.embedding} IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM ${aiNewsEvents} e
+            WHERE e.event_id = ${kbDocuments.targetId}
+              AND e.merged_into IS NOT NULL
+          )`,
+      )
+      .orderBy(distanceExpr, kbDocuments.id)
+      .limit(topK);
+
+  // deadlineAtMs 非空：KB 查询进单连事务（Drizzle 异常自动 ROLLBACK、连接干净归还），事务回调内（拿到连接后）
+  // 算剩余预算 remainingMs 设服务端 statement_timeout（D4）——绝不在 transaction() 之前算：满池时连接获取等待
+  // 可能跨过 deadline，事务前算的正预算已过期。remainingMs≤0 ⇒ 回调内不启动业务查询返 []。
+  // 用 set_config(...,is_local=true)（值可作绑定参、事务本地）而非裸 `SET LOCAL …=$1`（PG SET 不吃绑定参会语法错）。
+  // deadlineAtMs 缺省 ⇒ 走裸查询路径 runKbQuery(dbh)，逐字节等价现状。
+  const { deadlineAtMs } = params;
+  const rows =
+    deadlineAtMs == null
+      ? await runKbQuery(dbh)
+      : await dbh.transaction(async (tx) => {
+          const remainingMs = deadlineAtMs - Date.now();
+          if (remainingMs <= 0) return [];
+          await tx.execute(sql`select set_config('statement_timeout', ${String(remainingMs)}, true)`);
+          return runKbQuery(tx);
+        });
 
   const results: KbSearchResult[] = rows.map((r) => ({
     id: String(r.id), // bigint → string（防 JSON.stringify 崩，仿 store.ts:193）。

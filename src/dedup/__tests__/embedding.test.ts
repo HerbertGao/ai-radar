@@ -242,6 +242,36 @@ describe('embedTexts（低层原语：重试 / 长度校验 / 注入桩）', () 
   });
 });
 
+describe('embedTexts（signal 透传 + abort 不重试，见 D2）', () => {
+  it('传 signal ⇒ 桩 args 含 abortSignal；abort 后抛且不重试（run 计数=1，maxAttempts=3）', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const embedManyFn = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    await expect(
+      mod.embedTexts(['a'], { embedManyFn, signal: ac.signal, maxAttempts: 3, logError: () => {} }),
+    ).rejects.toBeTruthy();
+    expect(embedManyFn).toHaveBeenCalledTimes(1); // abort 不进下一 attempt
+    expect(embedManyFn.mock.calls[0]![0].abortSignal).toBe(ac.signal);
+  });
+
+  it('缺省不传 signal ⇒ 桩 args 无 abortSignal 键（逐字节等价现状）', async () => {
+    const embedManyFn = vi.fn().mockResolvedValue({ embeddings: [[1, 2]] });
+    const out = await mod.embedTexts(['a'], { embedManyFn, logError: () => {} });
+    expect(out).toEqual([[1, 2]]);
+    expect(embedManyFn).toHaveBeenCalledTimes(1);
+    expect('abortSignal' in embedManyFn.mock.calls[0]![0]).toBe(false);
+  });
+
+  it('空数组仍直接返 []（即便传 signal 也不发起调用）', async () => {
+    const embedManyFn = vi.fn();
+    const out = await mod.embedTexts([], { embedManyFn, signal: new AbortController().signal });
+    expect(out).toEqual([]);
+    expect(embedManyFn).not.toHaveBeenCalled();
+  });
+});
+
 describe('runEmbeddingBootstrap（候选窗口 bootstrap：四不变量）', () => {
   it('① 已有 embedding 的事件不在候选 → 不嵌、不写（候选 SELECT 带 embedding IS NULL）', async () => {
     // fake db 的 rows 即候选 SELECT 结果（真实 DB 由 WHERE embedding IS NULL 过滤掉已嵌行）。

@@ -41,6 +41,8 @@ type DbLike = typeof defaultDb;
 export type EmbedManyFn = (args: {
   model: ReturnType<ReturnType<typeof createOpenAI>['embedding']>;
   values: string[];
+  /** opt-in 取消信号（SDK `embedMany` 原生支持）；缺省不传 ⇒ 不出现该键 ⇒ 逐字节等价现状。 */
+  abortSignal?: AbortSignal;
 }) => Promise<{ embeddings: number[][] }>;
 
 /**
@@ -80,6 +82,11 @@ export interface EmbedTextsOptions {
   maxAttempts?: number;
   /** 错误日志 sink，默认 console.error；便于测试断言（非静默）。 */
   logError?: (message: string, detail: unknown) => void;
+  /**
+   * opt-in 取消信号（见 D2）。传入则透传给 `embedMany` 的 `abortSignal`；abort 后不重试
+   * （主动取消非瞬态错）。缺省不传 ⇒ 不出现 `abortSignal` ⇒ 逐字节等价现状。
+   */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -106,6 +113,7 @@ export async function embedTexts(
   const logError =
     options.logError ??
     ((message, detail) => console.error(`[embedding] ${message}`, detail));
+  const signal = options.signal;
 
   const model = buildEmbeddingModel();
   const values = [...texts];
@@ -113,7 +121,7 @@ export async function embedTexts(
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const { embeddings } = await run({ model, values });
+      const { embeddings } = await run({ model, values, ...(signal ? { abortSignal: signal } : {}) });
       if (!Array.isArray(embeddings) || embeddings.length !== values.length) {
         // 长度不齐则无法可靠地按序回写 event——视为失败重试，绝不错位落库。
         lastError = new Error(
@@ -124,6 +132,9 @@ export async function embedTexts(
       }
       return embeddings;
     } catch (error) {
+      // abort 是主动取消、非瞬态错——仅当调用方传入 signal（本层才引入取消语义）时不进下一 attempt、直接抛（见 D2）；
+      // 无 signal 消费者不触此分支 ⇒ 与现状逐字节等价（保 D5「缺省逐字节不变」，不吞 SDK 内部 abort 的既有重试）。
+      if (signal && (signal.aborted || (error as { name?: string } | null)?.name === 'AbortError')) throw error;
       lastError = error;
       logError(`第 ${attempt}/${maxAttempts} 次：embedMany 调用失败`, error);
     }

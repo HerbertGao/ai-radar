@@ -616,8 +616,12 @@ function makeDbh(opts: { kbRowSets?: KbRow[][]; priceRows?: PriceRow[] }): Build
     limit: () => Promise.resolve(opts.kbRowSets?.[kbCall++] ?? []),
   };
   const priceBuilder = { where: () => Promise.resolve(opts.priceRows ?? []) };
+  // assembleEvidence 现恒经 dbh.transaction 跑 KB/价格查询（design D1/D4 统一 deadlineAt）——tx 桩提供 execute(no-op set_config)
+  // + 同一 select 路由；本文件不断言 rollback/set_config，故 tx 桩无需记状态。
+  const selectRouter = () => ({ from: (table: unknown) => (table === mrPriceHistory ? priceBuilder : kbBuilder) });
   return {
-    select: () => ({ from: (table: unknown) => (table === mrPriceHistory ? priceBuilder : kbBuilder) }),
+    select: selectRouter,
+    transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb({ execute: async () => {}, select: selectRouter }),
   } as unknown as BuildExplainerOptions['dbh'];
 }
 
