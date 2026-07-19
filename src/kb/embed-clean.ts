@@ -31,6 +31,11 @@ export interface EmbedCleanOptions {
   maxAttempts?: number;
   /** 错误日志 sink，默认 console.error。 */
   logError?: (message: string, detail: unknown) => void;
+  /**
+   * opt-in 取消信号（见 D2）。传入则透传给 `embedMany` 的 `abortSignal`；abort 后不重试。
+   * 缺省不传 ⇒ 不出现 `abortSignal` ⇒ 逐字节等价现状。`AbortSignal` 是全局，不破 env-clean。
+   */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -72,6 +77,7 @@ export async function embedTextsClean(
   const logError =
     options.logError ??
     ((message, detail) => console.error(`[embed-clean] ${message}`, detail));
+  const signal = options.signal;
 
   // 仅内存构造 provider + model（不触网）；凭据由入参注入、非读 config/env。
   const provider = createOpenAI({
@@ -85,7 +91,7 @@ export async function embedTextsClean(
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const { embeddings } = await run({ model, values });
+      const { embeddings } = await run({ model, values, ...(signal ? { abortSignal: signal } : {}) });
       if (!Array.isArray(embeddings) || embeddings.length !== values.length) {
         // 长度不齐则无法可靠按序回映——视为失败重试，绝不错位。
         lastError = new Error(
@@ -96,6 +102,9 @@ export async function embedTextsClean(
       }
       return embeddings;
     } catch (error) {
+      // abort 是主动取消、非瞬态错——仅当调用方传入 signal（本层才引入取消语义）时不进下一 attempt、直接抛（见 D2）；
+      // 无 signal 消费者不触此分支 ⇒ 与现状逐字节等价（保 D5「缺省逐字节不变」，不吞 SDK 内部 abort 的既有重试）。
+      if (signal && (signal.aborted || (error as { name?: string } | null)?.name === 'AbortError')) throw error;
       lastError = error;
       logError(`第 ${attempt}/${maxAttempts} 次：embedMany 调用失败`, error);
     }

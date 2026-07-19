@@ -23,12 +23,20 @@ vi.mock('../../../mr/snapshot/build.js');
 import { buildModelRadarSnapshot } from '../../../mr/snapshot/build.js';
 
 // 5e 解释层：mock explain-llm.js 的 buildExplainer——handler 在 llm 模式（四 key 齐）动态 import 它。默认返回 stub
-// explainer（直返固定叙述，证注入 recommend 第三参）；构造抛错测用 mockImplementationOnce 令其 throw。embed-clean.js
-// 不 mock（真 env-clean、缺 key 分支不触其调用）。template 模式的既有测试恒不进 llm 分支 → 本 mock 对其惰性。
+// explainer（直返固定叙述，证注入 recommend 第三参）；构造抛错测用 mockImplementationOnce 令其 throw。template 模式
+// 的既有测试恒不进 llm 分支 → 本 mock 对其惰性。
 vi.mock('../../../mr/recommend/explain-llm.js', () => ({
   buildExplainer: vi.fn(() => async () => 'MOCK_NARRATIVE'),
 }));
 import { buildExplainer } from '../../../mr/recommend/explain-llm.js';
+
+// 组 D（add-model-radar-assembly-deadline-cancel / task 4.2）：mock embed-clean.js 以监视 MCP 装配 embed lambda
+// 的 signal 转发（缺省 undefined ⇒ 无 abortSignal 逐字节不变；传入 ⇒ 转发第三参 { signal }）。真实 embed 从不被
+// 调用（buildExplainer 被 mock、注入的 lambda 仅被捕获显式驱动）；缺 key 分支即便动态 import 它也不触调用。
+vi.mock('../../../kb/embed-clean.js', () => ({
+  embedTextsClean: vi.fn(async () => [[1]]),
+}));
+import { embedTextsClean } from '../../../kb/embed-clean.js';
 
 const PROV = {
   sourceUrl: 'https://open.bigmodel.cn/pricing',
@@ -90,6 +98,7 @@ const db = {} as unknown as McpDb;
 
 const mockedBuild = vi.mocked(buildModelRadarSnapshot);
 const mockedBuildExplainer = vi.mocked(buildExplainer);
+const mockedEmbedClean = vi.mocked(embedTextsClean);
 
 /** llm 模式 + 四 key 齐（chat=LLM_MODEL、embed=EMBEDDING_MODEL）。 */
 const llmEnvFull: McpEnv = {
@@ -288,5 +297,34 @@ describe('4.2/4.4 解释层装配（env-clean、四 key 判定、fail-open、模
     expect(mockedBuildExplainer).not.toHaveBeenCalled();
     expect(errSpy).not.toHaveBeenCalled(); // 未配 llm 不刷 stderr
     errSpy.mockRestore();
+  });
+});
+
+describe('4.2 MCP 装配 embed lambda：signal 转发（缺省 undefined ⇒ 无 abortSignal 逐字节不变、传入 ⇒ 转发 { signal }）', () => {
+  it('捕获注入 buildExplainer 的 embed lambda：缺省 signal=undefined ⇒ embedTextsClean 收 { signal: undefined }；传入 signal ⇒ 转发', async () => {
+    setContext({ env: llmEnvFull, db });
+    mockedBuild.mockResolvedValue(exitSnapshot);
+
+    const res = (await recommendCodingTool.handler(
+      { model: 'glm:4.6', tool: 'claude-code' },
+      {},
+    )) as CallToolResult;
+    expect(res.isError).not.toBe(true);
+    expect(mockedBuildExplainer).toHaveBeenCalledTimes(1);
+
+    // 注入的 embed lambda（KbEmbed：(texts, signal?)）——buildExplainer 被 mock、该 lambda 在业务路径未被调用，
+    // 此处显式驱动只验 signal 透传形状（embed 凭据 model=EMBEDDING_MODEL='embed-m'，同 handler 分工）。
+    const embed = mockedBuildExplainer.mock.calls[0]![0].embed;
+    const creds = { apiKey: 'k', baseURL: 'https://ex.com/v1', model: 'embed-m' };
+
+    // 缺省路径：searchKbCore 不传 signal ⇒ lambda 收 undefined ⇒ 条件展开省去 signal 键 ⇒ embedTextsClean 收 {}
+    // （同原 `embedTextsClean(texts, creds)` 的默认 options={}）⇒ 底层 abortSignal 不出现 ⇒ 逐字节等价现状。
+    await embed(['t'], undefined);
+    expect(mockedEmbedClean).toHaveBeenCalledWith(['t'], creds, {});
+
+    // 真取消路径：传入 signal ⇒ 原样转发（装配超时 ac.abort() 经此中止 MCP embed）。
+    const ac = new AbortController();
+    await embed(['t2'], ac.signal);
+    expect(mockedEmbedClean).toHaveBeenLastCalledWith(['t2'], creds, { signal: ac.signal });
   });
 });

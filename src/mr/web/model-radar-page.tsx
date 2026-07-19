@@ -80,7 +80,7 @@ const defaultExplainerFactory: ExplainerFactory = (hooks) => {
   return buildExplainer({
     credentials: { apiKey: env.LLM_API_KEY, baseUrl: env.LLM_BASE_URL, model: env.LLM_MODEL },
     dbh: db,
-    embed: (texts) => embedTexts(texts),
+    embed: (texts, signal) => embedTexts(texts, { ...(signal ? { signal } : {}) }),
     log: (message, detail) => console.log(`[model-radar-explain] ${message}`, detail ?? ''),
     ...hooks,
   });
