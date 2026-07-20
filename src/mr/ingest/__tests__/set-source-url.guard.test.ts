@@ -23,8 +23,8 @@ function tsFiles(dir: string): string[] {
   return out;
 }
 
-// 只匹配 `... from '...set-source-url(.js)?'` 静态 import/export 语句，不匹配注释/字符串里的裸词。
-const IMPORT_RE = /\bfrom\s+['"][^'"]*set-source-url(?:\.js)?['"]/;
+// 匹配 `from '...'` 与 `import '...'`（侧效应）两种 set-source-url 静态 import；不匹配注释/字符串里的裸词。
+const IMPORT_RE = /(?:\bfrom\s+|\bimport\s*)['"][^'"]*set-source-url(?:\.js)?['"]/;
 
 describe('2.3 set-source-url 仅 approve.ts 可 import（grep 守卫）', () => {
   it('全仓生产代码中，import set-source-url 的文件 ⊆ {mr/curation/approve.ts}', () => {

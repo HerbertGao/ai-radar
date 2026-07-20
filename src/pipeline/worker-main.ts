@@ -212,6 +212,11 @@ async function main(): Promise<void> {
     await scheduleStaleness(queue);
     const worker = createStalenessWorker({ connection, alert: buildOpsAlertSink() });
     lanes.push({ name: 'mr-staleness', worker, queue, connection });
+  } else if (isMrUrlDriftEnabled()) {
+    // 显式化上文「耦合」残余：staleness 关但 url-drift 开 → 零采纳 engagement 监控静默失效（信号骑本 lane 的 sink）。
+    console.error(
+      '[worker] MR_STALENESS_ENABLED=false 但 MR_URL_DRIFT_ENABLED=true → URL-drift 零采纳 engagement 监控不可用（该信号骑 mr-staleness lane 的 ops-alert-sink，DD3）；要采纳率告警须一并开 MR_STALENESS_ENABLED。',
+    );
   }
 
   // ── 链 7：Model Radar 价格 curation proposer mr-price-curation（日级 cron，http-only 无 Playwright，主镜像可跑）。

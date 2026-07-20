@@ -22,7 +22,9 @@ const code = raw.replace(/\/\*[\s\S]*?\*\//g, '');
 
 /** 只匹配 `... from '...<name>(.js)?'` 静态 import/export，不匹配注释/字符串里的裸词。 */
 function importsModule(s: string, name: string): boolean {
-  return new RegExp(`\\bfrom\\s+['"][^'"]*${name}(?:\\.js)?['"]`).test(s);
+  // 匹配 `from '...'` 与 `import '...'`（侧效应）；name 经转义防元字符误匹配。
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:\\bfrom\\s+|\\bimport\\s*)['"][^'"]*${escaped}(?:\\.js)?['"]`).test(s);
 }
 
 describe('10.4 url-drift-agent.eval.ts 静态守卫', () => {

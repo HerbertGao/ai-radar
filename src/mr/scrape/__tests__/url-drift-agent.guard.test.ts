@@ -15,9 +15,11 @@ import { join } from 'node:path';
 
 const AGENT = join(process.cwd(), 'src/mr/scrape/url-drift-agent.ts');
 
-// 只匹配 `... from '...<name>(.js)?'` 静态 import/export 语句，不匹配注释/字符串里的裸词。
+// 匹配 `from '...'`（具名/namespace/re-export）与 `import '...'`（侧效应）两种静态 import；不匹配注释/字符串里的裸词。
+// name 经转义——含正则元字符时按字面匹配、不误当通配（否则 backstop 会静默漏检侧效应导入）。
 function importsModule(src: string, name: string): boolean {
-  return new RegExp(`\\bfrom\\s+['"][^'"]*${name}(?:\\.js)?['"]`).test(src);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:\\bfrom\\s+|\\bimport\\s*)['"][^'"]*${escaped}(?:\\.js)?['"]`).test(src);
 }
 
 describe('4.3 url-drift-agent 不抓候选 URL / 不 import setter（grep 守卫）', () => {

@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false # 本 job 只读跑 eval、从不 push；不留 GITHUB_TOKEN 于 git config。
 
       - name: Setup Node
         uses: actions/setup-node@v7
