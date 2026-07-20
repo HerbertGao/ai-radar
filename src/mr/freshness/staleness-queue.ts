@@ -11,6 +11,7 @@ import { Queue, Worker, type ConnectionOptions, type Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import { env } from '../../config/env.js';
 import { runStaleness, type RunStalenessResult } from './staleness.js';
+import type { AlertSink } from '../../pipeline/ops-alert-sink.js';
 
 /** 队列名（独立于日报/告警，design D14）。 */
 export const MR_STALENESS_QUEUE = 'mr-staleness';
@@ -76,6 +77,11 @@ export interface StalenessWorkerOptions {
   connection?: ConnectionOptions;
   /** 并发度（默认 1）。 */
   concurrency?: number;
+  /**
+   * 运维告警出口（DD3）——转发给 `runStaleness`（URL drift 零采纳 engagement 信号经此发 ops 告警）。
+   * 生产由 worker-main 装配点注入 `buildOpsAlertSink`（非 VITEST → 真能发）；未注入则核心回落 stderr。
+   */
+  alert?: AlertSink;
 }
 
 /**
@@ -93,7 +99,10 @@ export function createStalenessWorker(
       const now = job.data?.nowIso ? new Date(job.data.nowIso) : undefined;
       return runStaleness(
         undefined,
-        now ? { now } : {},
+        {
+          ...(now ? { now } : {}),
+          ...(options.alert ? { alert: options.alert } : {}),
+        },
         env.MR_STALENESS_THRESHOLD_DAYS,
       );
     },

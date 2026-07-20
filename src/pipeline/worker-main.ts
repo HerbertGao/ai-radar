@@ -85,6 +85,7 @@ import {
   isFeishuEnabled,
 } from '../config/env.js';
 import { createFeishuSender } from '../push/feishu.js';
+import { buildOpsAlertSink } from './ops-alert-sink.js';
 import { withRetry } from '../collectors/types.js';
 import { assertProductZhColumns } from './product-digest.js';
 
@@ -202,11 +203,14 @@ async function main(): Promise<void> {
 
   // ── 链 6：Model Radar 陈旧度排程 mr-staleness（独立连接 buildStalenessConnection）。
   //    默认禁用（MR_STALENESS_ENABLED='false'）；改 env 即启用（design D9/D14）。
+  //    **URL drift 零采纳 engagement 信号骑本 lane**（DD3）：注入生产 ops-alert-sink——worker 非 VITEST
+  //    → 首次真告警才懒装配真实通道、genuinely 发得出（与离线 eval 的 vitest 守卫死路相反，design D7）。
+  //    **耦合**：engagement 监控受 MR_STALENESS_ENABLED 门控——只开 MR_URL_DRIFT_ENABLED 不开它则无此监控。
   if (isMrStalenessEnabled()) {
     const connection = buildStalenessConnection();
     const queue = createStalenessQueue(connection);
     await scheduleStaleness(queue);
-    const worker = createStalenessWorker({ connection });
+    const worker = createStalenessWorker({ connection, alert: buildOpsAlertSink() });
     lanes.push({ name: 'mr-staleness', worker, queue, connection });
   }
 

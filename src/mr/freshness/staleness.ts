@@ -17,7 +17,7 @@
  * 多 plan/source 打标 per-target 独立（setReviewFlag 单语句 CAS 自治、幂等收敛单行）；同一 run 内同 plan 经
  * 多个陈旧 child 命中只首次打标（本地去重，省重复 CAS）。
  */
-import { eq, lt, or, isNull } from 'drizzle-orm';
+import { eq, lt, or, isNull, sql } from 'drizzle-orm';
 import { db as defaultDb } from '../../db/index.js';
 import {
   mrPlanClients,
@@ -28,6 +28,8 @@ import {
   mrSource,
 } from '../../db/schema.js';
 import { setReviewFlag } from '../write/flag.js';
+import { env } from '../../config/env.js';
+import { consoleAlertSink, type AlertSink } from '../../pipeline/ops-alert-sink.js';
 
 /** db 句柄类型（drizzle 实例或事务），用于依赖注入/集成测（对齐 write/flag.ts）。 */
 type DbLike = typeof defaultDb;
@@ -49,6 +51,12 @@ export interface RunStalenessOptions {
   now?: Date;
   /** 运行期日志 sink（默认 console.error）。 */
   log?: (message: string, detail?: unknown) => void;
+  /**
+   * 运维告警出口（DD3）——URL drift 零采纳 engagement 信号经此发 ops 告警。未注入回落
+   * `consoleAlertSink`（不静默、只进 stderr）；生产由 worker 装配点注入 `buildOpsAlertSink`
+   *（非 VITEST → 真能发）。测试注入 mock（守 test-no-prod-sends 不变量）。仿 `alert-scan.ts:401`。
+   */
+  alert?: AlertSink;
 }
 
 /** 各事实表对应的 plan 级 reason 前缀（注明哪类行陈旧，落地 design D9 reason 注明）。 */
@@ -76,6 +84,8 @@ export async function runStaleness(
   const thresholdDays = options.thresholdDays ?? envThresholdDays ?? 30;
   const now = options.now ?? new Date();
   const log = options.log ?? defaultLog;
+  // 源级健康告警出口（DD3）：未注入回落 stderr 的 consoleAlertSink（不静默）；生产由 worker 装配点注入。
+  const alert = options.alert ?? consoleAlertSink;
   const threshold = new Date(now.getTime() - thresholdDays * 86_400_000);
 
   // 陈旧判定：last_checked IS NULL（最该复核）OR < threshold（design D9 NULL 语义）。
@@ -154,5 +164,52 @@ export async function runStaleness(
     }
   }
 
+  // engagement 信号（DD3，best-effort、非 precision）：URL drift 连续 N 轮零采纳 → 经注入 alert 发 ops 告警。
+  // 挂 mr-staleness lane、受 MR_STALENESS_ENABLED 门控——只开 MR_URL_DRIFT_ENABLED 不开它则无此监控。
+  await checkUrlDriftZeroAdoption(dbh, alert, log);
+
   return { sourceFlagged, planFlagged, errors };
+}
+
+/**
+ * engagement 信号（DD3，design D7 信号 1，**best-effort、非 precision/正确性度量**）——读
+ * `mr_url_drift_metric` 最近 `env.MR_URL_DRIFT_ADOPTION_ROUNDS`（默认 3）个「已决且有产出」轮次
+ *（`total_candidates > 0 AND adopted IS NOT NULL`、按 `ran_at` 序）；若这样的轮次达 N 个且**全部**
+ * `adopted = 0` → 经注入的 `alert` 发 ops 告警（dedupKey `zero-adoption:url-drift`）。
+ *
+ * **分母只计已决且有产出的轮**（`adopted IS NULL` 未决轮 / `total_candidates = 0` 空产出轮由 WHERE
+ * 排除、不进窗口，防健康静默误报）。显式标注为 engagement/actionability 信号（还有没有产出、人还理不
+ * 理），**非** precision/正确性度量；**不写 `mr_review_flag`**。
+ *
+ * best-effort：查询或告警失败只记日志（如注入的 db 桩无 `execute`、mr_url_drift_metric 未迁移、通道故障）
+ * ——engagement 是 additive、非阻塞信号，绝不打断陈旧度打标主流程（信号 addition 是 additive/best-effort）。
+ */
+async function checkUrlDriftZeroAdoption(
+  dbh: DbLike,
+  alert: AlertSink,
+  log: (message: string, detail?: unknown) => void,
+): Promise<void> {
+  const rounds = env.MR_URL_DRIFT_ADOPTION_ROUNDS;
+  try {
+    const res = await dbh.execute<{ total_candidates: number; adopted: number }>(sql`
+      SELECT total_candidates, adopted
+      FROM mr_url_drift_metric
+      WHERE total_candidates > 0 AND adopted IS NOT NULL
+      ORDER BY ran_at DESC
+      LIMIT ${rounds}
+    `);
+    const rows = res.rows;
+    // 已决且有产出的轮次不足 N → 不告警（未决/空产出轮已被 WHERE 排除、不进窗口）。
+    if (rows.length < rounds) return;
+    // 连续 N 轮全 adopted=0 才告警（任一轮有采纳 → 人仍在处理 → 静默）。
+    if (!rows.every((r) => Number(r.adopted) === 0)) return;
+    const totalCandidates = rows.reduce((sum, r) => sum + Number(r.total_candidates), 0);
+    await alert(
+      `URL drift agent 连续 ${rounds} 轮零采纳：这些轮共发候选 ${totalCandidates} 个、采纳 0 个` +
+        `（engagement 信号、非 precision——agent 仍在产出但人不再批，请查看）`,
+      { dedupKey: 'zero-adoption:url-drift', rounds, totalCandidates, adopted: 0 },
+    );
+  } catch (err) {
+    log('URL drift 零采纳 engagement 检查失败（best-effort、跳过、不影响打标）', err);
+  }
 }
