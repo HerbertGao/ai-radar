@@ -27,6 +27,9 @@ import type { MrCurrency } from './extract.js';
 export const CALLBACK_PREFIX = 'mrpr';
 export const CALLBACK_APPROVE_OP = 'approve';
 
+/** URL drift callback_data 前缀（telegram-callback 侧按 `mrud:<token>:approve` 解析、与 `mrpr` 并列，design D3）。 */
+export const URL_DRIFT_CALLBACK_PREFIX = 'mrud';
+
 /** 币种符号（展示用，非事实——落库仍用行上冻结值）。 */
 const CURRENCY_SYMBOL: Record<MrCurrency, string> = {
   CNY: '¥',
@@ -91,6 +94,56 @@ export function buildPriceReviewTelegramCard(
           {
             text: '✅ 一键批准',
             callback_data: `${CALLBACK_PREFIX}:${input.token}:${CALLBACK_APPROVE_OP}`,
+          },
+        ],
+      ],
+    },
+  };
+}
+
+/** URL drift 卡片展示所需信息（**不含 token**——token 只进 callback_data；`candidateUrl` 是 value 亦不进 callback_data）。 */
+export interface UrlDriftReviewCardInput {
+  /** 开卡时冻结的现有源 URL（基线）。URL 字段——渲染用 `escapeMarkdownV2Url`。 */
+  oldUrl: string;
+  /** agent 建议的候选新 URL（同 vendor 已 allowlist 域内）。URL 字段——渲染用 `escapeMarkdownV2Url`。 */
+  candidateUrl: string;
+  /** agent 置信度枚举。文本字段——渲染用 `escapeMarkdownV2`。 */
+  confidence: 'low' | 'medium' | 'high';
+  /** agent 给出的 drift 推断理由（**LLM 产出、不可信文本**）。文本字段——MUST 经 `escapeMarkdownV2`，防伪链接/破坏渲染。 */
+  reason: string;
+}
+
+/**
+ * Telegram 一键批准卡片（URL drift）。与 `buildPriceReviewTelegramCard` 对称：
+ * `callback_data = "mrud:<token>:approve"`——token 是能力、只进 callback_data，`candidateUrl` 是 value 绝不进
+ * callback_data（applyUrlDriftReview 服务端按 token 读冻结行）。
+ *
+ * **转义纪律（对称 card.ts:82）**：URL 字段（`oldUrl`/`candidateUrl`/源链接）用 `escapeMarkdownV2Url`（保 URL 语义字符），
+ * 文本字段（`confidence`/`reason`/标签）用 `escapeMarkdownV2`（转义全部 MarkdownV2 特殊字符）——LLM 产出的 `reason`
+ * 不可信、可能含 `[click](evil)` 伪链接或破坏渲染的特殊字符，**必须**经 `escapeMarkdownV2`。
+ */
+export function buildUrlDriftTelegramCard(
+  input: UrlDriftReviewCardInput & { token: string },
+): TelegramReviewCard {
+  const lines = [
+    `*${escapeMarkdownV2('Model Radar 源 URL 待复核')}*`,
+    // old_url → candidate_url：URL 两端各经 escapeMarkdownV2Url，箭头是无特殊字符的纯文本分隔。
+    `${escapeMarkdownV2('URL 变更：')}${escapeMarkdownV2Url(input.oldUrl)} → ${escapeMarkdownV2Url(input.candidateUrl)}`,
+    `${escapeMarkdownV2('置信度：')}${escapeMarkdownV2(input.confidence)}`,
+    // reason 不可信：经文本转义器，任何 MarkdownV2 特殊字符 / 伪链接被中和。
+    `${escapeMarkdownV2('理由：')}${escapeMarkdownV2(input.reason)}`,
+    `[${escapeMarkdownV2('查看候选页')}](${escapeMarkdownV2Url(input.candidateUrl)})`,
+    escapeMarkdownV2('点下方按钮一键批准（仅授权人可批，改的是源 URL、不改价格事实）。'),
+  ];
+  return {
+    text: lines.join('\n'),
+    parseMode: 'MarkdownV2',
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          {
+            text: '✅ 一键批准',
+            callback_data: `${URL_DRIFT_CALLBACK_PREFIX}:${input.token}:${CALLBACK_APPROVE_OP}`,
           },
         ],
       ],
