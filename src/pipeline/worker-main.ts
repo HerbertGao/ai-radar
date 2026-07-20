@@ -63,6 +63,12 @@ import {
   createMrPriceCurationWorker,
   buildCurationConnection,
 } from '../mr/curation/curation-queue.js';
+import {
+  createUrlDriftQueue,
+  scheduleUrlDrift,
+  createUrlDriftWorker,
+  buildUrlDriftConnection,
+} from '../mr/curation/url-drift-queue.js';
 import type { CurationNotify } from '../mr/curation/propose.js';
 import { Bot } from 'grammy';
 import {
@@ -74,6 +80,8 @@ import {
   isMrStalenessEnabled,
   isMrPriceCurationEnabled,
   isMrPriceCurationApprovalReady,
+  isMrUrlDriftEnabled,
+  isMrUrlDriftApprovalReady,
   isFeishuEnabled,
 } from '../config/env.js';
 import { createFeishuSender } from '../push/feishu.js';
@@ -215,6 +223,22 @@ async function main(): Promise<void> {
   } else if (isMrPriceCurationEnabled()) {
     console.error(
       '[worker] mr-price-curation 门控开但 TELEGRAM_APPROVER_IDS 为空 → 不注册 lane（不发无人能批的卡）。',
+    );
+  }
+
+  // ── 链 8：Model Radar browser 档 URL-drift agent mr-url-drift（周级 cron，browser 源 URL 迁移检测，主镜像可跑）。
+  //    **跨镜像 fail-closed**（design D4）：与 mr-price-curation 同区、复用 TELEGRAM_APPROVER_IDS + TELEGRAM_CHAT_ID——
+  //    推 Telegram 卡、批准侧同一 web 镜像 bot，单查 MR_URL_DRIFT_ENABLED 不足以防"发卡无人能批"。
+  //    worker 只发卡（buildCurationNotify 的 api.sendMessage），**绝不 bot.start()**；接收长轮询归 web 镜像。
+  if (isMrUrlDriftApprovalReady()) {
+    const connection = buildUrlDriftConnection();
+    const queue = createUrlDriftQueue(connection);
+    await scheduleUrlDrift(queue);
+    const worker = createUrlDriftWorker({ notify: buildCurationNotify(), connection });
+    lanes.push({ name: 'mr-url-drift', worker, queue, connection });
+  } else if (isMrUrlDriftEnabled()) {
+    console.error(
+      '[worker] mr-url-drift 门控开但 TELEGRAM_APPROVER_IDS 为空或 TELEGRAM_CHAT_ID 非数值 → 不注册 lane（不发无人能批的卡）。',
     );
   }
 

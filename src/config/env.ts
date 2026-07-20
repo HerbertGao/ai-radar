@@ -909,3 +909,24 @@ export function isMrPriceCurationApprovalReady(e: Env = env): boolean {
     Number.isFinite(Number(e.TELEGRAM_CHAT_ID))
   );
 }
+
+/**
+ * Model Radar browser 档 URL-drift agent lane 是否启用（默认禁用；仿 isMrPriceCurationEnabled）。
+ * 跨镜像 fail-closed 由 isMrUrlDriftApprovalReady 组合判定（design D4）。
+ */
+export function isMrUrlDriftEnabled(e: Env = env): boolean {
+  return e.MR_URL_DRIFT_ENABLED === 'true';
+}
+
+/**
+ * URL-drift lane 是否「就绪」：本侧开关开 **且** 批准白名单非空 **且** TELEGRAM_CHAT_ID 数值化
+ *（仿 isMrPriceCurationApprovalReady——mr-url-drift 同推 Telegram 卡、批准侧同一 web 镜像 bot，单查
+ * MR_URL_DRIFT_ENABLED 不足以防"发卡无人能批"，与 mr-price-curation 共用 approver/chat env，design D4）。
+ */
+export function isMrUrlDriftApprovalReady(e: Env = env): boolean {
+  return (
+    isMrUrlDriftEnabled(e) &&
+    e.TELEGRAM_APPROVER_IDS.length > 0 &&
+    Number.isFinite(Number(e.TELEGRAM_CHAT_ID))
+  );
+}

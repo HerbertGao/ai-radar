@@ -28,6 +28,15 @@ export function normalizeUrl(u: string): string {
 export const URL_DRIFT_MODEL = 'gpt-4o-mini-2024-07-18';
 
 /**
+ * confidence 序数映射（design D7 / task 7.2）——`low=0, medium=1, high=2`。propose 侧用
+ * `confidenceRank(confidence) < confidenceRank(MR_URL_DRIFT_CONFIDENCE_THRESHOLD)` 判候选是否达阈值。
+ * 纯函数、**不 import 任何模块**（保本文件 env-clean，design D9）。
+ */
+export function confidenceRank(c: 'low' | 'medium' | 'high'): 0 | 1 | 2 {
+  return c === 'low' ? 0 : c === 'medium' ? 1 : 2;
+}
+
+/**
  * candidate 臂——URL drift 检出、给出候选 URL。**不含** escalate_reason（严格互斥、见下方 `.strict()`）。
  * `candidate_url` https-only（design D-M7：ftp:// 等在 schema 层即拒、不留给 assertUrlAllowed 兜）+ ≤2048
  *（防过长 payload）；`.max(2048)` 须在 `.refine()` **之前**（ZodEffects 无 `.max`）。
