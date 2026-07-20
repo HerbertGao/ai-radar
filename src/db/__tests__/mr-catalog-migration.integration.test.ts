@@ -125,9 +125,11 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     'mr_review_flag',
     'mr_catalog_version',
     'mr_price_review',
+    'mr_url_drift_review',
+    'mr_url_drift_metric',
   ];
 
-  it('逐一点名全部 13 张 mr_* 表存在', async () => {
+  it('逐一点名全部 15 张 mr_* 表存在', async () => {
     const { rows } = await pool!.query<{ table_name: string }>(
       `SELECT table_name FROM information_schema.tables WHERE table_name = ANY($1)`,
       [ALL_TABLES],
@@ -136,10 +138,10 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
     for (const t of ALL_TABLES) {
       expect(present.has(t), `缺表 ${t}`).toBe(true);
     }
-    expect(present.size).toBe(13);
+    expect(present.size).toBe(15);
   });
 
-  it('全部命名唯一约束逐一就位且为精确集（恰 13 条、无多余、命名表级 *_key）', async () => {
+  it('全部命名唯一约束逐一就位且为精确集（恰 15 条、无多余、命名表级 *_key）', async () => {
     // 读所有 mr_* 表 UNIQUE 约束（含约束名 + 覆盖列集合，按列名排序聚合）。
     const { rows } = await pool!.query<{
       table_name: string;
@@ -175,11 +177,15 @@ describe.skipIf(!databaseUrl)('3.1 mr_* 落表与结构不变量（information_s
       mr_catalog_version: 'version',
       // mr_price_review：token UNIQUE 约束（偏唯一索引 plan_id WHERE pending 是 INDEX 非 CONSTRAINT，不入 table_constraints）。
       mr_price_review: 'token',
+      // mr_url_drift_review：token UNIQUE 约束（偏唯一索引 source_id WHERE pending 同为 INDEX 非 CONSTRAINT，不入 table_constraints）。
+      mr_url_drift_review: 'token',
+      // mr_url_drift_metric：run_id UNIQUE 约束（每 run 一行、metric upsert 幂等）。
+      mr_url_drift_metric: 'run_id',
     };
-    // 精确集：恰 13 条 mr_* UNIQUE 约束，多一条（第 14 条意外约束）即红。
+    // 精确集：恰 15 条 mr_* UNIQUE 约束，多一条（第 16 条意外约束）即红。
     expect(
       rows.length,
-      `mr_* UNIQUE 约束应恰 13 条；实际 ${rows.length}：${JSON.stringify(
+      `mr_* UNIQUE 约束应恰 15 条；实际 ${rows.length}：${JSON.stringify(
         rows.map((r) => `${r.table_name}.${r.constraint_name}(${r.columns})`),
       )}`,
     ).toBe(Object.keys(expected).length);

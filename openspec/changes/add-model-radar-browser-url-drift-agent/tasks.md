@@ -66,8 +66,8 @@
 
 ## 11. 验收
 
-- [ ] 11.1 全量 `npm run typecheck && npm run lint && npm run test` 通过（含既有 `mr_price_review` / `applyReview` / `telegram-callback` 回归——前缀分流后 `mrpr` 路径逐字节不变；5b 抓取链回归——`setSourceUrl` 不在 `src/mr/scrape/` 可 import 范围；既有 `mr_source.source_url` ingest 路径回归）
-- [ ] 11.2 `npm run spec:validate add-model-radar-browser-url-drift-agent` 通过（含 `--strict`）
+- [x] 11.1 全量 `npm run typecheck && npm run lint && npm run test` 通过（含既有 `mr_price_review` / `applyReview` / `telegram-callback` 回归——前缀分流后 `mrpr` 路径逐字节不变；5b 抓取链回归——`setSourceUrl` 不在 `src/mr/scrape/` 可 import 范围；既有 `mr_source.source_url` ingest 路径回归）
+- [x] 11.2 `npm run spec:validate add-model-radar-browser-url-drift-agent` 通过（含 `--strict`）
 - [ ] 11.3 归档纪律自检：MODIFIED 块的场景名集合是主规范该需求的超集（`三档抓取仅做变更检测...` 主规范 6 场景 + 本变更新增 1 场景 = 7 场景全列；`mr_price_review 待批记录...` 主规范 5 场景全列；`Telegram 一键批准...` 主规范 7 场景 + 本变更新增 1 场景 = 8 场景全列）；正文逐字保留前驱每一行实质 MUST（人工 diff 比对）
 
 ## 12. 文档
