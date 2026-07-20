@@ -110,8 +110,10 @@ describe('applyUrlDriftReview 成功路径', () => {
     expect(mocks.markUrlDriftApplyFailed).not.toHaveBeenCalled();
   });
 
-  it('generation mismatch（setSourceUrl 内部容忍、正常返回 void）→ 仍 applied', async () => {
-    // generation mismatch 是 setSourceUrl 内部对 resolveFlag 0 行的容忍——对外仍 void，applyUrlDriftReview 视为落库成功。
+  it('setSourceUrl 返 void → applyUrlDriftReview 视为 applied（外层契约）', async () => {
+    // 注：generation-mismatch 容忍（resolveFlag 0 行）发生在 setSourceUrl **内部**——本单测 mock 掉 setSourceUrl，
+    // 无法触及该逻辑（曾误标为「测 generation mismatch」，实与 happy path 同形）。真行为由
+    // set-source-url.integration.test.ts 覆盖（URL 落库、flag 保持 pending）。此处仅固定「void → applied」的外层契约。
     mocks.setSourceUrl.mockResolvedValue(undefined);
     const out = await applyUrlDriftReview('tok-live', 'approver-1', makeDb() as never);
     expect(out.kind).toBe('applied');

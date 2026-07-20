@@ -145,6 +145,30 @@ describe('handleApprovalCallback 授权 + 反馈', () => {
     expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无批准权限' });
   });
 
+  it('价格 lane 已停用（priceApprovalReady=false）→ 拒 mrpr 残留卡、不调 applyReview', async () => {
+    const applyReview = makeApplyReview();
+    const { ctx, answerCallbackQuery } = makeCtx(`mrpr:${TOKEN}:approve`, 111);
+
+    await handleApprovalCallback(ctx, { ...deps(applyReview), priceApprovalReady: false });
+
+    expect(applyReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '价格批准通道未启用' });
+  });
+
+  it('URL-drift lane 已停用（urlDriftApprovalReady=false）→ 拒 mrud 残留卡、不调 applyUrlDriftReview', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDrift = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery } = makeCtx(`mrud:${TOKEN}:approve`, 111);
+
+    await handleApprovalCallback(ctx, {
+      ...deps(applyReview, applyUrlDrift),
+      urlDriftApprovalReady: false,
+    });
+
+    expect(applyUrlDrift).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: 'URL 批准通道未启用' });
+  });
+
   it('缺 from → 拒、不调 applyReview', async () => {
     const applyReview = makeApplyReview();
     const { ctx } = makeCtx(`mrpr:${TOKEN}:approve`, undefined);

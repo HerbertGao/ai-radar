@@ -4,7 +4,8 @@
 # **skip-clean（DD1）**：LLM creds 从 repo/environment secrets 注入；若 secret 未配置（值为空）或指向占位
 # （ci-placeholder-key / example.invalid），eval `describe.skip` 干净 skip（reports skipped、**绝不** green-claim
 # floor 达标）。故本 workflow 无 secret 时安全无害——要真跑 eval，须在仓库 Settings → Secrets 配置 LLM_API_KEY
-#（可选 LLM_BASE_URL / LLM_MODEL）后手动 dispatch。
+#（可选 LLM_BASE_URL）后手动 dispatch。**模型不经 secret 注入**：eval 钉定 `URL_DRIFT_MODEL`（dated snapshot，
+# council #2）——可注入的 LLM_MODEL 会破坏「eval 是无静默漂移的稳定测量仪器」不变量，故不挂。
 #
 # 不挂 push/pull_request（避免 fork 无 secret 时空跑 / 烧 LLM 成本）；仅手动重验。deploy follow-up：确认
 # secret 名与部署一致后即可用 Actions 页「Run workflow」按钮跑真值。
@@ -33,5 +34,4 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: npm run test:eval

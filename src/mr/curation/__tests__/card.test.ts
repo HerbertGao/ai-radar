@@ -82,6 +82,23 @@ describe('buildUrlDriftTelegramCard', () => {
     expect(card.text).toContain('high');
   });
 
+  it('B1 回归守卫：old→candidate 变更行是纯文本、host 的 `.`/`-` 经 escapeMarkdownV2 转义（防 Telegram 400 整卡失败）', () => {
+    // oldUrl 只出现在**变更行纯文本**（不进内联链接目标、reason 也不含它）——故其转义形唯一可判：误用
+    // escapeMarkdownV2Url（只转 `)`/`\`）会留裸 `.` → MarkdownV2「'.' is reserved」→ sendMessage 400 → 每张卡都发不出。
+    const card = buildUrlDriftTelegramCard({
+      token: TOKEN,
+      oldUrl: 'https://old-host.example/p',
+      candidateUrl: 'https://new-host.example/q',
+      confidence: 'low',
+      reason: 'r',
+    });
+    expect(card.text).toContain('old\\-host\\.example'); // 变更行经文本转义器
+    expect(card.text).not.toContain('old-host.example'); // 无未转义裸 host（回归到 Url 转义器即出现）
+    // 候选 host 也单独钉：变更行须文本转义（链接目标另有一份不转义的 new-host.example）——否则只回退 candidate 侧的
+    // 变更行 escaper（保留 old 侧）不会被上面两条捕获。
+    expect(card.text).toContain('new\\-host\\.example');
+  });
+
   it('不可信 reason / candidate_url 含 MarkdownV2 破坏字符 → 安全转义、无未转义 breakout', () => {
     const card = buildUrlDriftTelegramCard({
       token: TOKEN,

@@ -131,6 +131,15 @@ describe('makeUrlDriftAgentOutputSchema — 严格判别联合 + refine', () => 
         reason: 'x',
       }).success,
     ).toBe(false);
+    // M3/C4a 回归：仅 fragment 差（`#frag` 不进 HTTP 请求、同一抓取资源）→ normalizeUrl 剥离后相同 → no-op 拒。
+    expect(
+      norm.safeParse({
+        kind: 'candidate',
+        candidate_url: 'https://kimi.com/p#replacement',
+        confidence: 'high',
+        reason: 'x',
+      }).success,
+    ).toBe(false);
   });
 
   it('⑦ ftp:// 候选 → schema 层拒（https-only）', () => {
@@ -218,9 +227,12 @@ describe('detectUrlDrift — 注入 mock model 端到端', () => {
 });
 
 describe('normalizeUrl / URL_DRIFT_MODEL', () => {
-  it('normalizeUrl = new URL(u).href（规范化 trailing/host-case/default-port）', () => {
+  it('normalizeUrl 规范化 host-case/default-port 并**剥离 fragment**（#frag 不进 HTTP、仅 fragment 差异是语义 no-op）', () => {
     expect(normalizeUrl('https://KIMI.com:443/p')).toBe('https://kimi.com/p');
     expect(normalizeUrl('https://kimi.com/p')).toBe('https://kimi.com/p');
+    // M3 回归守卫：fragment 必须剥离，否则 `oldurl#x` 逃过 no-op refine → 语义 no-op 却「批准成功」解了 flag。
+    expect(normalizeUrl('https://kimi.com/p#frag')).toBe('https://kimi.com/p');
+    expect(normalizeUrl('https://kimi.com/p#a')).toBe(normalizeUrl('https://kimi.com/p#b'));
   });
 
   it('URL_DRIFT_MODEL 钉定 dated snapshot（agent + eval 共用）', () => {

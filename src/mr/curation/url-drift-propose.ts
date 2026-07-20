@@ -32,6 +32,7 @@ import { listPendingFlags, type PendingFlag } from '../freshness/dispose.js';
 import {
   detectUrlDrift,
   confidenceRank,
+  normalizeUrl,
   URL_DRIFT_MODEL,
   type DetectUrlDriftInput,
   type UrlDriftAgentOutput,
@@ -40,7 +41,8 @@ import { vendorDomainSet } from '../scrape/vendor-domains.js';
 import { assertUrlAllowed } from '../scrape/ssrf-guard.js';
 import { MR_SOURCE_DOMAIN_ALLOWLIST } from '../scrape/allowlist.js';
 import { openUrlDriftReviewOrSupersede, markUrlDriftSuperseded } from './url-drift-store.js';
-import { buildUrlDriftTelegramCard } from './card.js';
+import { buildUrlDriftCardText, buildUrlDriftTelegramCard } from './card.js';
+import { MAX_MESSAGE_LENGTH } from '../../push/message.js';
 import type { CurationNotify } from './propose.js';
 
 type DbLike = typeof defaultDb;
@@ -202,8 +204,27 @@ async function proposeForSource(
     return 'skipped';
   }
 
-  // 达阈值：assertUrlAllowed 二次校验（SSRF/全局 allowlist，防 prompt injection）——越界即抛 SsrfBlockedError。
-  assertUrlAllowed(output.candidate_url, MR_SOURCE_DOMAIN_ALLOWLIST);
+  // 达阈值：先规范化候选（剥 fragment / 统一 host case + default port，见 normalizeUrl 注释）——store 去重键、
+  // mr_source 唯一约束、no-op 判定与最终落库值全用此 canonical 形，防大小写/端口/fragment 变体逃过去重与 23505。
+  const candidateUrl = normalizeUrl(output.candidate_url);
+
+  // 卡片装配长度守卫（见 buildUrlDriftCardText JSDoc：装配后文本长度、保守取原文）：超 MAX_MESSAGE_LENGTH → 跳过不发
+  //（否则钉定模型下同候选每轮复现成死循环）；真实定价 URL 远短于限、绝不误跳。token 不进正文、此处不需 token。
+  const cardText = buildUrlDriftCardText({
+    oldUrl: source.sourceUrl,
+    candidateUrl,
+    confidence: output.confidence,
+    reason: output.reason,
+  });
+  if (cardText.length > MAX_MESSAGE_LENGTH) {
+    console.error(
+      `[mr-url-drift] 卡片文本过长（${cardText.length} > ${MAX_MESSAGE_LENGTH}）、跳过 source=${source.id}`,
+    );
+    return 'skipped';
+  }
+
+  // assertUrlAllowed 二次校验（SSRF/全局 allowlist，防 prompt injection）——对 canonical 形（即落库值）断言；越界即抛 SsrfBlockedError。
+  assertUrlAllowed(candidateUrl, MR_SOURCE_DOMAIN_ALLOWLIST);
 
   // 开待批记录（记 run_id + 冻结 flag_opened_at 自该 source flag 的 opened_at）；同 pending 同候选 → noop。
   const opened = await openUrlDriftReviewOrSupersede(
@@ -211,7 +232,7 @@ async function proposeForSource(
       sourceId: source.id,
       runId,
       oldUrl: source.sourceUrl,
-      candidateUrl: output.candidate_url,
+      candidateUrl,
       confidence: output.confidence,
       reason: output.reason,
       flagOpenedAt: flag.openedAtText,
@@ -225,7 +246,7 @@ async function proposeForSource(
     await notify.telegram(
       buildUrlDriftTelegramCard({
         oldUrl: source.sourceUrl,
-        candidateUrl: output.candidate_url,
+        candidateUrl,
         confidence: output.confidence,
         reason: output.reason,
         token: opened.token,

@@ -252,7 +252,10 @@ export default tseslint.config(
           patterns: [
             {
               // m3 新增：出站抓取原语（safeFetch/fetchWithBrowser）——agent/propose 不物理访问候选 URL。
-              group: ['**/scrape/http-tier*', '**/scrape/browser-tier*'],
+              // ⚠ glob **不含** `scrape/` 段：url-drift-agent.ts 就在 src/mr/scrape/ 内、import 同级 `./http-tier.js`
+              // 的说明符里没有 `scrape/`，`**/scrape/http-tier*` 永不匹配 → 守卫静默失效。`**/http-tier*` 同时命中
+              // 同级 `./http-tier.js`（agent）与跨目录 `../scrape/http-tier.js`（propose）。仅这两文件受此块、必须零抓取。
+              group: ['**/http-tier*', '**/browser-tier*'],
               message:
                 'url-drift agent/propose 不抓候选 URL——禁 import http-tier/browser-tier。design D9/m3',
             },

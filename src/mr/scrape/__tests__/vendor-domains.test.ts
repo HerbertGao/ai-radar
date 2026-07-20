@@ -68,7 +68,11 @@ describe('vendorDomainSet 反查（design D5）', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = await vendorDomainSet(inject, fakeDb([], capture) as any);
     expect(result).toEqual([]); // vendorId 对函数不透明、不入 URL 解析逻辑
-    expect(capture.where).toBeDefined(); // 经 eq(mrSource.vendorId, vendorId) 构造的绑定条件对象、非裸串
+    // 安全主证是上面的 toEqual([])（vendorId 作不透明绑定参、未被当 SQL 执行）。补强防「回归到裸串拼接」：
+    // where 是 drizzle SQL builder 对象（queryChunks 数组）——eq() 默认参数化；裸串拼接则无此结构。
+    expect(capture.where).toBeDefined();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(Array.isArray((capture.where as any).queryChunks)).toBe(true);
   });
 });
 

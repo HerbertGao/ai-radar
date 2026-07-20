@@ -13,11 +13,19 @@ import { generateObject, type LanguageModel } from 'ai';
 import { z } from 'zod';
 
 /**
- * URL 规范化 helper（`new URL(u).href`）——schema refine 的 no-op 判定（`candidate_url !== old_url`）复用此
- * helper，trailing slash / host case / default port 差异经此统一视为相同，防字面相同语义不同的 URL 污染计数。
+ * URL 规范化 helper——host case / default port 由 `new URL().href` 统一；**并显式剥离 fragment**（`#frag` 不进
+ * HTTP 请求、仅 fragment 差异是语义 no-op，指向同一抓取资源）。no-op 判定（`candidate !== old`）、store 去重键、
+ * 唯一约束比对与最终落库值都走此规范化形，防字面相同语义不同的 URL 逃过 no-op/去重/`23505`、污染计数。
+ *
+ * **前提（path/服务端渲染页）**：剥离 fragment 假定 `#` 后是纯锚点、不改抓取到的资源。**hash 路由 SPA**（如
+ * `vendor.com/#!/pricing` vs `#!/enterprise`）里 fragment 是客户端路由、承载不同页——而 browser 档正是为 JS SPA 设。
+ * 当前语料（Z.ai `bigmodel.cn/...`、Kimi `www.kimi.com/membership/pricing`）皆 path 路由、不触发。若将来接入 hash
+ * 路由 SPA 源，须改为条件剥离（保 `#!`/`#/` 路由段）——见 design D-M7 残余。
  */
 export function normalizeUrl(u: string): string {
-  return new URL(u).href;
+  const url = new URL(u);
+  url.hash = '';
+  return url.href;
 }
 
 /**
@@ -129,7 +137,9 @@ function buildPrompt(input: DetectUrlDriftInput): string {
     `  <fetch_strategy>${source.fetchStrategy}</fetch_strategy>\n` +
     '</source>\n' +
     `<vendor_domain_set>${vendorDomainSet.join(', ')}</vendor_domain_set>\n` +
-    `<flag_reason>${reason}</flag_reason>`
+    // reason 不可信（design D6）：剥 `<`/`>` 防其内容伪造 `</flag_reason>` 闭合标签突破「不可信文本」信封夹带指令。
+    // 现值是开发者常量（fingerprint/staleness），此为纵深防御——若日后 reason 掺入页面文本即已挡住。
+    `<flag_reason>${reason.replace(/[<>]/g, '')}</flag_reason>`
   );
 }
 

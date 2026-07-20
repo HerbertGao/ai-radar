@@ -12,7 +12,7 @@
  * sender）装配由 worker-main 做；本文件只给 queue/worker 工厂 + job body。
  *
  * `job.id` = BullMQ job 稳定 id（跨 attempts 不变）作 `run_id` 传入 `runUrlDriftCuration`（metric 回填 join
- * key、幂等，design D7/Codex#5）。
+ * key、幂等，design D7）。
  */
 import { Queue, Worker, type ConnectionOptions, type Job } from 'bullmq';
 import { Redis } from 'ioredis';

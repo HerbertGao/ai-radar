@@ -17,7 +17,11 @@
  * review `id` / `plan_id`，日志 sink 只落 `err.message`（不落含 payload 的 error 对象，防 token 随 update 入日志）。
  */
 import { Bot } from 'grammy';
-import { env } from '../../config/env.js';
+import {
+  env,
+  isMrPriceCurationApprovalReady,
+  isMrUrlDriftApprovalReady,
+} from '../../config/env.js';
 import { withRetry } from '../../collectors/types.js';
 import {
   applyReview as defaultApplyReview,
@@ -98,6 +102,13 @@ export interface ApprovalHandlerDeps {
   approverIds: readonly number[];
   /** 目标 chat id（数值化 TELEGRAM_CHAT_ID）——回调须来自此 chat，能力绑定通道。 */
   chatId: number;
+  /**
+   * 各 lane 的批准就绪。共享 bot 由**任一** ready lane 启动（index.ts），但已停用 lane 的残留卡（TTL 内）不应仍可批准
+   * ——`false` 时拒该 prefix 的回调，令「停用即在消费侧亦惰性」的开关契约在跨 lane 共享 bot 下仍成立。缺省 `undefined`
+   * = permissive（单测不设即照旧）；生产由 startApprovalBot 注入真实就绪值。
+   */
+  priceApprovalReady?: boolean;
+  urlDriftApprovalReady?: boolean;
 }
 
 /** 出站重试参数（answerCallbackQuery / editMessageText）：小步退避，日志脱敏。 */
@@ -174,6 +185,11 @@ export async function handleApprovalCallback(
     //    money-path red line 两路一致（parse → authorize → channel-bind → apply）；result discriminated
     //    union 各异（价格 baseline-drift / URL cross-domain-drift），故分支内各调各的答文案函数。
     if (prefix === CALLBACK_PREFIX) {
+      if (deps.priceApprovalReady === false) {
+        console.error('[mr-curation] 拒绝已停用价格 lane 的残留卡批准');
+        await answer(ctx, '价格批准通道未启用');
+        return;
+      }
       const result = await deps.applyReview(token, String(fromId));
       await answer(ctx, answerText(result));
       if (result.kind === 'applied') {
@@ -186,6 +202,11 @@ export async function handleApprovalCallback(
       }
     } else {
       // prefix === URL_DRIFT_CALLBACK_PREFIX（上方 gate 已保证 prefix ∈ {mrpr, mrud}）。
+      if (deps.urlDriftApprovalReady === false) {
+        console.error('[mr-curation] 拒绝已停用 URL-drift lane 的残留卡批准');
+        await answer(ctx, 'URL 批准通道未启用');
+        return;
+      }
       const result = await deps.applyUrlDriftReview(token, String(fromId));
       await answer(ctx, answerUrlDriftText(result));
       if (result.kind === 'applied') {
@@ -257,6 +278,9 @@ export function startApprovalBot(
       options.deps?.applyUrlDriftReview ?? defaultApplyUrlDriftReview,
     approverIds: options.deps?.approverIds ?? env.TELEGRAM_APPROVER_IDS,
     chatId,
+    // 共享 bot 由任一 ready lane 启动；按 lane 就绪拒已停用 lane 的残留卡回调（停用即消费侧亦惰性）。
+    priceApprovalReady: options.deps?.priceApprovalReady ?? isMrPriceCurationApprovalReady(),
+    urlDriftApprovalReady: options.deps?.urlDriftApprovalReady ?? isMrUrlDriftApprovalReady(),
   };
 
   bot.on('callback_query:data', (ctx) =>
