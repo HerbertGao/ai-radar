@@ -833,6 +833,82 @@ export const mrPriceReview = pgTable(
 );
 
 /**
+ * browser 档 URL drift 待批记录（add-model-radar-browser-url-drift-agent，design D2）。
+ * 与 mrPriceReview 结构对称（token + status + extracted_at + partial unique + CAS 同范式），但字段语义
+ * 专属 URL drift 路径——承载「一条冻结的候选 URL + 一次性能力令牌」跨「agent 检测 → 人批准」的异步间隙。
+ *
+ * 关键不变量：
+ * - `(source_id) WHERE status='pending'` **偏唯一索引** = 每 source 至多一条待批（与 mr_price_review 的
+ *   `(plan_id) WHERE status='pending'` 同范式；普通 UNIQUE 会连历史行一起唯一化，须用 partial index）。
+ * - `old_url` / `candidate_url` / `confidence` / `reason` 开卡时**冻结在行上**；批准落库只用行上冻结值。
+ * - `run_id` = 本轮 drift lane 的 BullMQ job 稳定 id（跨 attempts 不变），作 `mr_url_drift_metric.run_id`
+ *   回填 join key；无 FK（同其余 mr_* 表口径）。
+ * - `flag_opened_at` **frozen**：开卡时从当前 source flag 的 `opened_at::text` 读入（full-precision
+ *   timestamptz 文本）；approve 侧 resolveFlag 用作 expectedOpenedAt generation token，防旧复核 resolve 掉
+ *   卡片签发后新打的 flag（design D-M4）。列型 text（存文本 token、非时刻比较）。
+ * - `token` = CSPRNG randomBytes(16) hex、UNIQUE、单用；走 Telegram callback_data（前缀 mrud）。
+ * - `extracted_at` **由 DB now() 写入**（TTL 比较也用 DB now()，单一时钟）。
+ * - `status ∈ {pending,approved,superseded,apply_failed}`——取值集合法性唯一防线 = mr-schema.zod
+ *   （全仓零 pg-enum / 零 CHECK，见 schema.ts:793 注释；apply_failure_kind 列不建，见 design D-B3）。
+ */
+export const mrUrlDriftReview = pgTable(
+  'mr_url_drift_review',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    sourceId: varchar('source_id', { length: 128 }).notNull(),
+    runId: varchar('run_id', { length: 128 }).notNull(),
+    oldUrl: text('old_url').notNull(),
+    candidateUrl: text('candidate_url').notNull(),
+    confidence: text('confidence').notNull(),
+    reason: text('reason').notNull(),
+    token: varchar('token', { length: 128 }).notNull(),
+    status: text('status').notNull().default('pending'),
+    flagOpenedAt: text('flag_opened_at').notNull(),
+    extractedAt: timestamp('extracted_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    decidedBy: text('decided_by'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique('mr_url_drift_review_token_key').on(table.token),
+    // 偏唯一索引：每 source 至多一条 pending；已决/superseded/apply_failed 历史行不参与唯一化。
+    uniqueIndex('mr_url_drift_review_source_id_pending_key')
+      .on(table.sourceId)
+      .where(sql`status = 'pending'`),
+  ],
+);
+
+/**
+ * URL drift lane 每轮采纳率 metric（add-model-radar-browser-url-drift-agent，design D7）。
+ * 每 run 一行（`run_id` UNIQUE、写用 upsert `ON CONFLICT(run_id) DO UPDATE` 幂等）——`run_id` = BullMQ
+ * job 稳定 id（跨 attempts 不变），防 crash-retry 重复插行 / 换 run_id 致审批永不回填。
+ *
+ * - `total_candidates` = `SELECT count(*) FROM mr_url_drift_review WHERE run_id = $run_id`（从持久候选行
+ *   重算、非 in-memory carded 计数器，DD2）。
+ * - `adopted` nullable：当轮暂为 null（写 0 则回填 `WHERE adopted IS NULL` 永不命中）；人审批后回填该 run
+ *   中 `status='approved'` 的候选数（design D7 (a)）。engagement 信号「连续 N 轮零采纳」的度量源。
+ */
+export const mrUrlDriftMetric = pgTable(
+  'mr_url_drift_metric',
+  {
+    id: varchar('id', { length: 128 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    runId: varchar('run_id', { length: 128 }).notNull(),
+    totalCandidates: integer('total_candidates').notNull(),
+    adopted: integer('adopted'),
+    ranAt: timestamp('ran_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique('mr_url_drift_metric_run_id_key').on(table.runId)],
+);
+
+/**
  * 目录版本表（design D11）。**5c 公开 version/ETag = 快照内容哈希**（见 add-model-radar-compare-api D8）——
  * 该表在 5c **不写不读不服务也不哈希**，是 5a 所建、留未来/内部用途（**非死表漏接线**，是有意决定）。
  * `version bigint NOT NULL UNIQUE` 无 default；`built_at` NOT NULL DEFAULT now()。
