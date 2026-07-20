@@ -642,6 +642,25 @@ const envSchema = z.object({
   // 上界 ≈ 2× cap，operator MUST 按 2× 设值。超限/Redis 不可用 ⇒ fail-open 回落模板（公开展示页恒可用、
   // 只退化解释，区别 advisor 的 fail-closed 拒服务）。默认 200（低于 advisor 500）；非法值启动即报错。
   MR_EXPLAIN_DAILY_LLM_CAP: z.coerce.number().int().positive().default(200),
+
+  // ─── Model Radar browser 档 URL-drift agent（add-model-radar-browser-url-drift-agent）───
+  // 总开关，默认 'false'（合并即门控关；仿 MR_SCRAPE_ENABLED / MR_PRICE_CURATION_ENABLED）。
+  // 关闭时 worker 不注册 mr-url-drift lane。
+  MR_URL_DRIFT_ENABLED: z.enum(['true', 'false']).default('false'),
+  // drift lane 周级 cron（周一 09:33，错峰 browser scrape 周一 09:17 之后；TZ 复用 MR_SCRAPE_CRON_TZ，
+  // 不新立独立 TZ env，m1）。
+  MR_URL_DRIFT_CRON: z.string().min(1).default('33 9 * * 1'),
+  // drift lane job 重试次数（独立于 MR_SCRAPE_JOB_ATTEMPTS：LLM 调用成本远高于抓取 HTTP、须独立调优）。
+  MR_URL_DRIFT_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  // 发卡置信度阈值：confidenceRank(confidence) < confidenceRank(此值) 的候选跳过、不发卡（enum low/medium/high）。
+  MR_URL_DRIFT_CONFIDENCE_THRESHOLD: z.enum(['low', 'medium', 'high']).default('medium'),
+  // 待批 URL-drift 记录有效期（小时）：批准 CAS 谓词含 make_interval(hours => <此值>)，闭合泄漏令牌窗口。
+  // 必须正整数（下游拼 make_interval 用校验过的整数、非字面拼接）。默认 72（仿 MR_PRICE_REVIEW_TTL_HOURS）。
+  MR_URL_DRIFT_TTL_HOURS: z.coerce.number().int().positive().default(72),
+  // engagement 信号「连续 N 轮 total_candidates>0 却 adopted=0」的 N（design D7 信号 1）。
+  MR_URL_DRIFT_ADOPTION_ROUNDS: z.coerce.number().int().min(1).default(3),
+  // 离线 eval precision 地板：test:eval 断言 precision >= 此值，跌破 → 红 CI job（生产侧不用 precision，design D7）。
+  MR_URL_DRIFT_PRECISION_FLOOR: z.coerce.number().min(0).max(1).default(0.8),
 })
   // 飞书配置完整性跨字段校验（feishu-push 5.1）：
   // - 两者均缺 → 飞书 disabled（向后兼容纯 Telegram 部署），放行；
@@ -886,6 +905,27 @@ export function isMrPriceCurationEnabled(e: Env = env): boolean {
 export function isMrPriceCurationApprovalReady(e: Env = env): boolean {
   return (
     isMrPriceCurationEnabled(e) &&
+    e.TELEGRAM_APPROVER_IDS.length > 0 &&
+    Number.isFinite(Number(e.TELEGRAM_CHAT_ID))
+  );
+}
+
+/**
+ * Model Radar browser 档 URL-drift agent lane 是否启用（默认禁用；仿 isMrPriceCurationEnabled）。
+ * 跨镜像 fail-closed 由 isMrUrlDriftApprovalReady 组合判定（design D4）。
+ */
+export function isMrUrlDriftEnabled(e: Env = env): boolean {
+  return e.MR_URL_DRIFT_ENABLED === 'true';
+}
+
+/**
+ * URL-drift lane 是否「就绪」：本侧开关开 **且** 批准白名单非空 **且** TELEGRAM_CHAT_ID 数值化
+ *（仿 isMrPriceCurationApprovalReady——mr-url-drift 同推 Telegram 卡、批准侧同一 web 镜像 bot，单查
+ * MR_URL_DRIFT_ENABLED 不足以防"发卡无人能批"，与 mr-price-curation 共用 approver/chat env，design D4）。
+ */
+export function isMrUrlDriftApprovalReady(e: Env = env): boolean {
+  return (
+    isMrUrlDriftEnabled(e) &&
     e.TELEGRAM_APPROVER_IDS.length > 0 &&
     Number.isFinite(Number(e.TELEGRAM_CHAT_ID))
   );

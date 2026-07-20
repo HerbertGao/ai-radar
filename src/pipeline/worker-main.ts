@@ -63,6 +63,12 @@ import {
   createMrPriceCurationWorker,
   buildCurationConnection,
 } from '../mr/curation/curation-queue.js';
+import {
+  createUrlDriftQueue,
+  scheduleUrlDrift,
+  createUrlDriftWorker,
+  buildUrlDriftConnection,
+} from '../mr/curation/url-drift-queue.js';
 import type { CurationNotify } from '../mr/curation/propose.js';
 import { Bot } from 'grammy';
 import {
@@ -74,9 +80,12 @@ import {
   isMrStalenessEnabled,
   isMrPriceCurationEnabled,
   isMrPriceCurationApprovalReady,
+  isMrUrlDriftEnabled,
+  isMrUrlDriftApprovalReady,
   isFeishuEnabled,
 } from '../config/env.js';
 import { createFeishuSender } from '../push/feishu.js';
+import { buildOpsAlertSink } from './ops-alert-sink.js';
 import { withRetry } from '../collectors/types.js';
 import { assertProductZhColumns } from './product-digest.js';
 
@@ -194,12 +203,20 @@ async function main(): Promise<void> {
 
   // ── 链 6：Model Radar 陈旧度排程 mr-staleness（独立连接 buildStalenessConnection）。
   //    默认禁用（MR_STALENESS_ENABLED='false'）；改 env 即启用（design D9/D14）。
+  //    **URL drift 零采纳 engagement 信号骑本 lane**（DD3）：注入生产 ops-alert-sink——worker 非 VITEST
+  //    → 首次真告警才懒装配真实通道、genuinely 发得出（与离线 eval 的 vitest 守卫死路相反，design D7）。
+  //    **耦合**：engagement 监控受 MR_STALENESS_ENABLED 门控——只开 MR_URL_DRIFT_ENABLED 不开它则无此监控。
   if (isMrStalenessEnabled()) {
     const connection = buildStalenessConnection();
     const queue = createStalenessQueue(connection);
     await scheduleStaleness(queue);
-    const worker = createStalenessWorker({ connection });
+    const worker = createStalenessWorker({ connection, alert: buildOpsAlertSink() });
     lanes.push({ name: 'mr-staleness', worker, queue, connection });
+  } else if (isMrUrlDriftEnabled()) {
+    // 显式化上文「耦合」残余：staleness 关但 url-drift 开 → 零采纳 engagement 监控静默失效（信号骑本 lane 的 sink）。
+    console.error(
+      '[worker] MR_STALENESS_ENABLED=false 但 MR_URL_DRIFT_ENABLED=true → URL-drift 零采纳 engagement 监控不可用（该信号骑 mr-staleness lane 的 ops-alert-sink，DD3）；要采纳率告警须一并开 MR_STALENESS_ENABLED。',
+    );
   }
 
   // ── 链 7：Model Radar 价格 curation proposer mr-price-curation（日级 cron，http-only 无 Playwright，主镜像可跑）。
@@ -215,6 +232,22 @@ async function main(): Promise<void> {
   } else if (isMrPriceCurationEnabled()) {
     console.error(
       '[worker] mr-price-curation 门控开但 TELEGRAM_APPROVER_IDS 为空 → 不注册 lane（不发无人能批的卡）。',
+    );
+  }
+
+  // ── 链 8：Model Radar browser 档 URL-drift agent mr-url-drift（周级 cron，browser 源 URL 迁移检测，主镜像可跑）。
+  //    **跨镜像 fail-closed**（design D4）：与 mr-price-curation 同区、复用 TELEGRAM_APPROVER_IDS + TELEGRAM_CHAT_ID——
+  //    推 Telegram 卡、批准侧同一 web 镜像 bot，单查 MR_URL_DRIFT_ENABLED 不足以防"发卡无人能批"。
+  //    worker 只发卡（buildCurationNotify 的 api.sendMessage），**绝不 bot.start()**；接收长轮询归 web 镜像。
+  if (isMrUrlDriftApprovalReady()) {
+    const connection = buildUrlDriftConnection();
+    const queue = createUrlDriftQueue(connection);
+    await scheduleUrlDrift(queue);
+    const worker = createUrlDriftWorker({ notify: buildCurationNotify(), connection });
+    lanes.push({ name: 'mr-url-drift', worker, queue, connection });
+  } else if (isMrUrlDriftEnabled()) {
+    console.error(
+      '[worker] mr-url-drift 门控开但 TELEGRAM_APPROVER_IDS 为空或 TELEGRAM_CHAT_ID 非数值 → 不注册 lane（不发无人能批的卡）。',
     );
   }
 

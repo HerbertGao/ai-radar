@@ -1,0 +1,39 @@
+# URL drift agent 离线 eval（信号 2，design D7 / DD1）——**手动 workflow_dispatch** 触发，用真实 LLM
+# creds 跑 `npm run test:eval` 断言 `precision >= MR_URL_DRIFT_PRECISION_FLOOR`；跌破 → 断言失败 → 本 job 变红。
+#
+# **skip-clean（DD1）**：LLM creds 从 repo/environment secrets 注入；若 secret 未配置（值为空）或指向占位
+# （ci-placeholder-key / example.invalid），eval `describe.skip` 干净 skip（reports skipped、**绝不** green-claim
+# floor 达标）。故本 workflow 无 secret 时安全无害——要真跑 eval，须在仓库 Settings → Secrets 配置 LLM_API_KEY
+#（可选 LLM_BASE_URL）后手动 dispatch。**模型不经 secret 注入**：eval 钉定 `URL_DRIFT_MODEL`（dated snapshot，
+# council #2）——可注入的 LLM_MODEL 会破坏「eval 是无静默漂移的稳定测量仪器」不变量，故不挂。
+#
+# 不挂 push/pull_request（避免 fork 无 secret 时空跑 / 烧 LLM 成本）；仅手动重验。deploy follow-up：确认
+# secret 名与部署一致后即可用 Actions 页「Run workflow」按钮跑真值。
+name: url-drift-eval
+
+on:
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false # 本 job 只读跑 eval、从不 push；不留 GITHUB_TOKEN 于 git config。
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run offline eval (skip-clean when creds absent/placeholder)
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+        run: npm run test:eval

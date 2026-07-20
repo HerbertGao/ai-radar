@@ -15,6 +15,8 @@ import {
   env,
   isMrPriceCurationEnabled,
   isMrPriceCurationApprovalReady,
+  isMrUrlDriftEnabled,
+  isMrUrlDriftApprovalReady,
 } from './config/env.js';
 import {
   startApprovalBot,
@@ -30,16 +32,17 @@ const server = serve({ fetch: app.fetch, port }, (info) => {
 // Model Radar 快照后台刷新（5d）：subscriber 收跨进程失效 + 周期 rebuild 驱动 stale 翻转/漏消息自愈。
 const snapshotBg = startSnapshotBackgroundRefresh();
 
-// Model Radar 价格 curation 批准接收 bot（design D4）：**仅 web 镜像**跑 grammY 长轮询——web 是常驻 bot host，
-// 且 Telegram 单 getUpdates 消费者、web 单副本约束（多副本/多消费者会 409 flap）。worker 镜像只 api.sendMessage
-// 发卡、绝不 bot.start()。跨镜像 fail-closed：门控关或 TELEGRAM_APPROVER_IDS 为空 → 不 start bot。
+// Model Radar 批准接收 bot（design D4）：**单个共享** grammY 长轮询消费者，同时路由价格（mrpr）与 URL-drift（mrud）
+// 两条批准回调。**仅 web 镜像**跑——web 是常驻 bot host，且 Telegram 单 getUpdates 消费者、web 单副本约束（多副本/
+// 多消费者会 409 flap）。worker 镜像只 api.sendMessage 发卡、绝不 bot.start()。**任一** lane approval-ready 即须
+// start（否则该 lane 发得出卡却无回调消费者 → 点批准无反应）；两 lane 都没 ready 才 fail-closed 不 start。
 // // ponytail: 长轮询单副本，web 横扩再切 webhook（+ secret_token 常量时间校验）。
 let approvalBot: ApprovalBotHandle | undefined;
-if (isMrPriceCurationApprovalReady()) {
+if (isMrPriceCurationApprovalReady() || isMrUrlDriftApprovalReady()) {
   approvalBot = startApprovalBot();
 } else {
   console.error(
-    `[web] Model Radar 价格批准 bot 未启动（enabled=${isMrPriceCurationEnabled()} approvers=${env.TELEGRAM_APPROVER_IDS.length}）。`,
+    `[web] Model Radar 批准 bot 未启动（price: enabled=${isMrPriceCurationEnabled()} ready=${isMrPriceCurationApprovalReady()} / url-drift: enabled=${isMrUrlDriftEnabled()} ready=${isMrUrlDriftApprovalReady()} approvers=${env.TELEGRAM_APPROVER_IDS.length}）。`,
   );
 }
 

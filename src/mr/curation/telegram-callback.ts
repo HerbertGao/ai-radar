@@ -17,29 +17,48 @@
  * review `id` / `plan_id`，日志 sink 只落 `err.message`（不落含 payload 的 error 对象，防 token 随 update 入日志）。
  */
 import { Bot } from 'grammy';
-import { env } from '../../config/env.js';
+import {
+  env,
+  isMrPriceCurationApprovalReady,
+  isMrUrlDriftApprovalReady,
+} from '../../config/env.js';
 import { withRetry } from '../../collectors/types.js';
-import { applyReview as defaultApplyReview, type ApplyReviewResult } from './approve.js';
-import { CALLBACK_APPROVE_OP, CALLBACK_PREFIX } from './card.js';
+import {
+  applyReview as defaultApplyReview,
+  applyUrlDriftReview as defaultApplyUrlDriftReview,
+  answerUrlDriftText,
+  type ApplyReviewResult,
+} from './approve.js';
+import {
+  CALLBACK_APPROVE_OP,
+  CALLBACK_PREFIX,
+  URL_DRIFT_CALLBACK_PREFIX,
+} from './card.js';
 
 /** token = `randomBytes(16).toString('hex')` = 恰 32 位小写十六进制（定长 + 字符集闸）。 */
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 
 /**
- * 解析 + 校验 `callback_data`（design D3）：仅接受 `mrpr:<token>:approve`，token 须过定长/字符集。
- * 拒未知 op、拒多余分段、拒非法 token。返回 token（合法）或 `null`（拒绝，调用方不打 DB）。
+ * 解析 + 校验 `callback_data`（design D3）：接受 `<prefix>:<token>:approve`（`prefix` 由调用方指定，
+ * 支持 `mrpr`（价格）/ `mrud`（URL drift）两前缀），token 须过定长/字符集。
+ * 拒 prefix 不符、拒未知 op、拒多余分段、拒非法 token。返回 token（合法）或 `null`（拒绝，调用方不打 DB）。
  *
  * 篡改金额无从注入：结构上只有 3 段、op 白名单、token 为 32-hex——任何塞进金额的变体（多段 / token 位放数字）
- * 都被拒，money 值只可能来自服务端冻结行。
+ * 都被拒，money 值/URL 只可能来自服务端冻结行。
  */
-export function parseApprovalCallback(data: string): string | null {
+export function parseCallbackByPrefix(data: string, prefix: string): string | null {
   const parts = data.split(':');
   if (parts.length !== 3) return null;
-  const [prefix, token, op] = parts;
-  if (prefix !== CALLBACK_PREFIX) return null;
+  const [p, token, op] = parts;
+  if (p !== prefix) return null;
   if (op !== CALLBACK_APPROVE_OP) return null; // 拒未知 op（本期只 approve，忽略 reject）。
   if (!token || !TOKEN_RE.test(token)) return null;
   return token;
+}
+
+/** 价格路径 thin wrapper（向后兼容——既有导出符号不删）。委托 `parseCallbackByPrefix(data, 'mrpr')`。 */
+export function parseApprovalCallback(data: string): string | null {
+  return parseCallbackByPrefix(data, CALLBACK_PREFIX);
 }
 
 /** kind → 用户可见反馈文案（applied 另去按钮）。 */
@@ -78,9 +97,18 @@ export interface ApprovalCtx {
 /** handler 依赖（注入便于单测）。 */
 export interface ApprovalHandlerDeps {
   applyReview: typeof defaultApplyReview;
+  /** URL drift 落库（`mrud` 路径）——与 `applyReview` 对称，注入便于单测（design D3）。 */
+  applyUrlDriftReview: typeof defaultApplyUrlDriftReview;
   approverIds: readonly number[];
   /** 目标 chat id（数值化 TELEGRAM_CHAT_ID）——回调须来自此 chat，能力绑定通道。 */
   chatId: number;
+  /**
+   * 各 lane 的批准就绪。共享 bot 由**任一** ready lane 启动（index.ts），但已停用 lane 的残留卡（TTL 内）不应仍可批准
+   * ——`false` 时拒该 prefix 的回调，令「停用即在消费侧亦惰性」的开关契约在跨 lane 共享 bot 下仍成立。缺省 `undefined`
+   * = permissive（单测不设即照旧）；生产由 startApprovalBot 注入真实就绪值。
+   */
+  priceApprovalReady?: boolean;
+  urlDriftApprovalReady?: boolean;
 }
 
 /** 出站重试参数（answerCallbackQuery / editMessageText）：小步退避，日志脱敏。 */
@@ -97,6 +125,18 @@ async function answer(ctx: ApprovalCtx, text: string): Promise<void> {
   });
 }
 
+/** applied 后去按钮（不传 reply_markup → 移除 inline keyboard）。best-effort：失败不回退已成功的批准（两路共用）。 */
+async function removeKeyboard(ctx: ApprovalCtx, text: string): Promise<void> {
+  try {
+    await withRetry(() => ctx.editMessageText(text), {
+      ...OUTBOUND_RETRY,
+      label: 'mr-curation-editMessage',
+    });
+  } catch (err) {
+    logRedacted('[mr-curation] editMessageText 去按钮失败（批准仍成功）', err);
+  }
+}
+
 /**
  * 处理一次 `callback_query:data`（design D5，顺序不可乱：解析校验 → 鉴权 → DB）。
  * 本函数**不抛**（内部兜底记日志 + 尽力反馈）——由 `bot.on('callback_query:data')` 直接挂。
@@ -109,9 +149,14 @@ export async function handleApprovalCallback(
     const data = ctx.callbackQuery?.data;
     if (!data) return; // 非数据回调（非本 bot 关切）——不处理。
 
-    // ① 解析 + 校验 token/op（任何 DB 往返之前）。拒 → 反馈通用文案、绝不打 DB。
-    const token = parseApprovalCallback(data);
-    if (!token) {
+    // ① 解析 + 校验 prefix/token/op（任何 DB 往返之前）。先按 `:` 第一段分流 prefix（design D3），
+    //    再校验 token/op；未知 prefix（非 mrpr/mrud）或非法 token → 反馈通用文案、绝不打 DB。
+    const prefix = data.split(':')[0] ?? ''; // data 非空 → 首段必存在；?? '' 只为 noUncheckedIndexedAccess 收窄
+    const token = parseCallbackByPrefix(data, prefix);
+    if (
+      !token ||
+      (prefix !== CALLBACK_PREFIX && prefix !== URL_DRIFT_CALLBACK_PREFIX)
+    ) {
       await answer(ctx, '无法识别的操作');
       return;
     }
@@ -136,25 +181,44 @@ export async function handleApprovalCallback(
       return;
     }
 
-    // ③ 通过 → 落库（money 值/币种/provenance 由 applyReview 服务端按 token 读冻结行；入站只给 token+id）。
-    const result = await deps.applyReview(token, String(fromId));
-    await answer(ctx, answerText(result));
-
-    if (result.kind === 'applied') {
-      // editMessageText 去按钮（不传 reply_markup → 移除 inline keyboard）。best-effort：失败不回退已成功的批准。
-      try {
-        await withRetry(
-          () => ctx.editMessageText('✅ 已应用（Model Radar 价格已更新，落库用冻结值）'),
-          { ...OUTBOUND_RETRY, label: 'mr-curation-editMessage' },
-        );
-      } catch (err) {
-        logRedacted('[mr-curation] editMessageText 去按钮失败（批准仍成功）', err);
+    // ③ 通过 → 落库（值/provenance 由服务端按 token 读冻结行；入站只给 token+id）。按 prefix 分流——
+    //    money-path red line 两路一致（parse → authorize → channel-bind → apply）；result discriminated
+    //    union 各异（价格 baseline-drift / URL cross-domain-drift），故分支内各调各的答文案函数。
+    if (prefix === CALLBACK_PREFIX) {
+      if (deps.priceApprovalReady === false) {
+        console.error('[mr-curation] 拒绝已停用价格 lane 的残留卡批准');
+        await answer(ctx, '价格批准通道未启用');
+        return;
       }
-      console.error(
-        `[mr-curation] 批准已应用 review=${result.reviewId} plan=${result.planId}`,
-      );
-    } else if (result.kind !== 'noop') {
-      console.error(`[mr-curation] 批准未落库 review=${result.reviewId} kind=${result.kind}`);
+      const result = await deps.applyReview(token, String(fromId));
+      await answer(ctx, answerText(result));
+      if (result.kind === 'applied') {
+        await removeKeyboard(ctx, '✅ 已应用（Model Radar 价格已更新，落库用冻结值）');
+        console.error(
+          `[mr-curation] 批准已应用 review=${result.reviewId} plan=${result.planId}`,
+        );
+      } else if (result.kind !== 'noop') {
+        console.error(`[mr-curation] 批准未落库 review=${result.reviewId} kind=${result.kind}`);
+      }
+    } else {
+      // prefix === URL_DRIFT_CALLBACK_PREFIX（上方 gate 已保证 prefix ∈ {mrpr, mrud}）。
+      if (deps.urlDriftApprovalReady === false) {
+        console.error('[mr-curation] 拒绝已停用 URL-drift lane 的残留卡批准');
+        await answer(ctx, 'URL 批准通道未启用');
+        return;
+      }
+      const result = await deps.applyUrlDriftReview(token, String(fromId));
+      await answer(ctx, answerUrlDriftText(result));
+      if (result.kind === 'applied') {
+        await removeKeyboard(ctx, '✅ 已应用（Model Radar 源 URL 已更新）');
+        console.error(
+          `[mr-curation] URL 批准已应用 review=${result.reviewId} source=${result.sourceId}`,
+        );
+      } else if (result.kind !== 'noop') {
+        console.error(
+          `[mr-curation] URL 批准未落库 review=${result.reviewId} kind=${result.kind}`,
+        );
+      }
     }
   } catch (err) {
     // applyReview 基础设施抛错（认领前）等：记脱敏日志 + 尽力反馈，绝不把含 token 的 update 冒泡给 bot.catch。
@@ -210,8 +274,13 @@ export function startApprovalBot(
   }
   const deps: ApprovalHandlerDeps = {
     applyReview: options.deps?.applyReview ?? defaultApplyReview,
+    applyUrlDriftReview:
+      options.deps?.applyUrlDriftReview ?? defaultApplyUrlDriftReview,
     approverIds: options.deps?.approverIds ?? env.TELEGRAM_APPROVER_IDS,
     chatId,
+    // 共享 bot 由任一 ready lane 启动；按 lane 就绪拒已停用 lane 的残留卡回调（停用即消费侧亦惰性）。
+    priceApprovalReady: options.deps?.priceApprovalReady ?? isMrPriceCurationApprovalReady(),
+    urlDriftApprovalReady: options.deps?.urlDriftApprovalReady ?? isMrUrlDriftApprovalReady(),
   };
 
   bot.on('callback_query:data', (ctx) =>

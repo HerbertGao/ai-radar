@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:eval": "vitest run --config vitest.eval.config.ts",
     "migrate": "drizzle-kit migrate",
     "worker": "tsx src/pipeline/worker-main.ts",
     "mr:browser-worker": "tsx src/mr/scrape/browser-worker-main.ts",

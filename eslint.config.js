@@ -51,6 +51,13 @@ export default tseslint.config(
                 '抓取链 / 保鲜回路禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange/setPlanAvailability/upsertPlanPeriodPrice）——只能改不了事实，仅可 import src/mr/write/（flag/fingerprint/last_checked）。design D7/D6。',
             },
             {
+              // set-source-url 是 authorized setter（改 mr_source.source_url）——scrape 路径的既有 patterns
+              // 不命中它（非 upsert*/record-price-change*、相对 import 无 mr/ 段），须显式补全（design D9）。
+              group: ['**/ingest/set-source-url*'],
+              message:
+                '抓取链禁 import set-source-url authorized setter——仅 approve.ts 可 import。design D9',
+            },
+            {
               // 点名覆盖 recordPriceChange（D7：它改 mr_plans.current_price 是事实写，绝不可被抓取链可达）。
               group: ['**/record-price-change*'],
               importNames: ['recordPriceChange', '_recordPriceChangeTx'],
@@ -144,6 +151,13 @@ export default tseslint.config(
                 '抓取链禁止 import src/mr/ingest/ 事实 writer（upsert*/recordPriceChange/setPlanAvailability/upsertPlanPeriodPrice）——只能改不了事实，仅可 import src/mr/write/。design D7/D6。',
             },
             {
+              // set-source-url authorized setter——本块 last-wins 覆盖上块，故此禁令 MUST 在两块都重述
+              //（否则 last-wins 吞掉守卫、对 url-drift-agent.ts 静默失效）。design D9。
+              group: ['**/ingest/set-source-url*'],
+              message:
+                '抓取链禁 import set-source-url authorized setter——仅 approve.ts 可 import。design D9',
+            },
+            {
               group: ['**/record-price-change*'],
               importNames: ['recordPriceChange', '_recordPriceChangeTx'],
               message:
@@ -216,6 +230,46 @@ export default tseslint.config(
               importNames: ['upsertPlan', 'setPlanAvailability', 'upsertPlanPeriodPrice'],
               message:
                 'upsertPlan/setPlanAvailability/upsertPlanPeriodPrice 是授权写入口——curation/** 中仅 approve.ts 豁免，其余禁 import。design D1。',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // Model Radar（add-model-radar-browser-url-drift-agent，design D9/m3）url-drift agent/propose no-fetch 守卫：
+    // 「agent/propose 不抓候选 URL、只解释」从约定升为 lint——禁 import 出站抓取原语 http-tier/browser-tier
+    // （safeFetch/fetchWithBrowser wrappers）。
+    // ⚠️ **per-file 块 + flat-config 同名规则 last-wins（不 merge options）**——本块对这两文件覆盖 scrape/curation
+    // 通用块的 `no-restricted-imports`，故**自包含重述**全部 fact-writer/setter/ingest 禁令（否则 last-wins 吞掉
+    // 通用块的 ingest/set-source-url/write 守卫、对 url-drift-agent.ts 静默失效）。
+    // url-drift-propose.ts 属后续 wave、当前不存在——eslint 不匹配不存在的文件、预置无害。
+    files: ['src/mr/scrape/url-drift-agent.ts', 'src/mr/curation/url-drift-propose.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              // m3 新增：出站抓取原语（safeFetch/fetchWithBrowser）——agent/propose 不物理访问候选 URL。
+              // ⚠ glob **不含** `scrape/` 段：url-drift-agent.ts 就在 src/mr/scrape/ 内、import 同级 `./http-tier.js`
+              // 的说明符里没有 `scrape/`，`**/scrape/http-tier*` 永不匹配 → 守卫静默失效。`**/http-tier*` 同时命中
+              // 同级 `./http-tier.js`（agent）与跨目录 `../scrape/http-tier.js`（propose）。仅这两文件受此块、必须零抓取。
+              group: ['**/http-tier*', '**/browser-tier*'],
+              message:
+                'url-drift agent/propose 不抓候选 URL——禁 import http-tier/browser-tier。design D9/m3',
+            },
+            {
+              // 重述 set-source-url authorized setter 禁令（本块 last-wins 覆盖通用块，须自包含）。
+              group: ['**/ingest/set-source-url*'],
+              message:
+                '抓取链禁 import set-source-url authorized setter——仅 approve.ts 可 import。design D9',
+            },
+            {
+              // 重述 fact-writer 禁令（write/ingest 全体）——落库唯一走 approve.ts 人批准路径。
+              group: ['**/ingest/*', '**/mr/ingest/*', '**/write/*', '**/mr/write/*'],
+              message:
+                'url-drift agent/propose 禁 import src/mr/ingest/ + src/mr/write/ 事实 writer——落库唯一走 approve.ts 人批准路径。design D9。',
             },
           ],
         },

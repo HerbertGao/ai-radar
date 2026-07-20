@@ -18,9 +18,9 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
-const { parseApprovalCallback, handleApprovalCallback } = await import(
-  '../telegram-callback.js'
-);
+const { parseApprovalCallback, parseCallbackByPrefix, handleApprovalCallback } =
+  await import('../telegram-callback.js');
+const { answerUrlDriftText } = await import('../approve.js');
 type ApprovalCtx = Parameters<typeof handleApprovalCallback>[0];
 type Deps = Parameters<typeof handleApprovalCallback>[1];
 
@@ -66,10 +66,31 @@ function makeApplyReview(
   return vi.fn(async (_token: string, _decidedBy: string) => result);
 }
 
-/** 装配 deps（applyReview 桩类型宽松，此处收窄到 handler 期望的签名）。 */
-function deps(applyReview: ReturnType<typeof makeApplyReview>): Deps {
+/** applyUrlDriftReview 桩：默认 applied（URL drift result union，字段 sourceId/oldUrl/newUrl）。 */
+function makeApplyUrlDrift(
+  result: unknown = {
+    kind: 'applied',
+    reviewId: 'r-u1',
+    sourceId: 'src-1',
+    oldUrl: 'https://old.example.com/p',
+    newUrl: 'https://new.example.com/p',
+  },
+) {
+  return vi.fn(async (_token: string, _decidedBy: string) => result);
+}
+
+/**
+ * 装配 deps（apply* 桩类型宽松，此处收窄到 handler 期望的签名）。
+ * `applyUrlDriftReview` 为必填 dep，mrpr 路径测试传默认桩（不会被调用）。
+ */
+function deps(
+  applyReview: ReturnType<typeof makeApplyReview>,
+  applyUrlDriftReview: ReturnType<typeof makeApplyUrlDrift> = makeApplyUrlDrift(),
+): Deps {
   return {
     applyReview: applyReview as unknown as Deps['applyReview'],
+    applyUrlDriftReview:
+      applyUrlDriftReview as unknown as Deps['applyUrlDriftReview'],
     approverIds: APPROVERS,
     chatId: CHAT_ID,
   };
@@ -122,6 +143,30 @@ describe('handleApprovalCallback 授权 + 反馈', () => {
 
     expect(applyReview).not.toHaveBeenCalled();
     expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无批准权限' });
+  });
+
+  it('价格 lane 已停用（priceApprovalReady=false）→ 拒 mrpr 残留卡、不调 applyReview', async () => {
+    const applyReview = makeApplyReview();
+    const { ctx, answerCallbackQuery } = makeCtx(`mrpr:${TOKEN}:approve`, 111);
+
+    await handleApprovalCallback(ctx, { ...deps(applyReview), priceApprovalReady: false });
+
+    expect(applyReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '价格批准通道未启用' });
+  });
+
+  it('URL-drift lane 已停用（urlDriftApprovalReady=false）→ 拒 mrud 残留卡、不调 applyUrlDriftReview', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDrift = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery } = makeCtx(`mrud:${TOKEN}:approve`, 111);
+
+    await handleApprovalCallback(ctx, {
+      ...deps(applyReview, applyUrlDrift),
+      urlDriftApprovalReady: false,
+    });
+
+    expect(applyUrlDrift).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: 'URL 批准通道未启用' });
   });
 
   it('缺 from → 拒、不调 applyReview', async () => {
@@ -238,5 +283,138 @@ describe('7.5 money 值只从服务端行读（callback_data 篡改无效）', (
     expect(applyReview).not.toHaveBeenCalled();
     expect(c1.answerCallbackQuery).toHaveBeenCalledWith({ text: '无法识别的操作' });
     expect(c2.answerCallbackQuery).toHaveBeenCalledWith({ text: '无法识别的操作' });
+  });
+});
+
+describe('parseCallbackByPrefix（mrpr / mrud 两前缀）', () => {
+  it('mrud:<token>:approve + prefix=mrud → 返回 token', () => {
+    expect(parseCallbackByPrefix(`mrud:${TOKEN}:approve`, 'mrud')).toBe(TOKEN);
+  });
+  it('mrpr:<token>:approve + prefix=mrpr → 返回 token（与 parseApprovalCallback 一致）', () => {
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve`, 'mrpr')).toBe(TOKEN);
+    expect(parseApprovalCallback(`mrpr:${TOKEN}:approve`)).toBe(TOKEN);
+  });
+  it('prefix 与 data 首段不符 → null', () => {
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve`, 'mrud')).toBeNull();
+    expect(parseCallbackByPrefix(`mrud:${TOKEN}:approve`, 'mrpr')).toBeNull();
+  });
+  it('mrud 未知 op / 非法 token / 多余分段 → null', () => {
+    expect(parseCallbackByPrefix(`mrud:${TOKEN}:reject`, 'mrud')).toBeNull();
+    expect(parseCallbackByPrefix('mrud:SHORT:approve', 'mrud')).toBeNull();
+    expect(parseCallbackByPrefix(`mrud:${TOKEN}:approve:9999`, 'mrud')).toBeNull();
+  });
+});
+
+describe('handleApprovalCallback 前缀分流（mrud → applyUrlDriftReview）', () => {
+  it('mrpr 路径仍走 applyReview、不碰 applyUrlDriftReview（回归）', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery, editMessageText } = makeCtx(
+      `mrpr:${TOKEN}:approve`,
+      111,
+    );
+
+    await handleApprovalCallback(ctx, deps(applyReview, applyUrlDriftReview));
+
+    expect(applyReview).toHaveBeenCalledWith(TOKEN, '111');
+    expect(applyUrlDriftReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '✅ 已应用' });
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+  });
+
+  it('mrud 路径走 applyUrlDriftReview(token, id) → ✅ URL 已更新 + 去按钮、不碰 applyReview', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery, editMessageText } = makeCtx(
+      `mrud:${TOKEN}:approve`,
+      222,
+    );
+
+    await handleApprovalCallback(ctx, deps(applyReview, applyUrlDriftReview));
+
+    expect(applyUrlDriftReview).toHaveBeenCalledTimes(1);
+    expect(applyUrlDriftReview).toHaveBeenCalledWith(TOKEN, '222');
+    expect(applyReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '✅ URL 已更新' });
+    expect(editMessageText).toHaveBeenCalledTimes(1); // applied 去按钮
+  });
+
+  it('mrud kind 映射：noop/cross-domain-drift/failed → 各自反馈、非 applied 不去按钮', async () => {
+    const cases: Array<[unknown, string]> = [
+      [{ kind: 'noop' }, '已处理/已过期，请等新卡'],
+      [{ kind: 'cross-domain-drift', reviewId: 'r-u2' }, '候选越界，已升级 PR 流程'],
+      [{ kind: 'failed', reviewId: 'r-u3', reason: 'stale-url' }, '应用失败，将重新浮现'],
+    ];
+    for (const [result, text] of cases) {
+      const applyUrlDriftReview = makeApplyUrlDrift(result);
+      const { ctx, answerCallbackQuery, editMessageText } = makeCtx(
+        `mrud:${TOKEN}:approve`,
+        111,
+      );
+      await handleApprovalCallback(
+        ctx,
+        deps(makeApplyReview(), applyUrlDriftReview),
+      );
+      expect(answerCallbackQuery).toHaveBeenCalledWith({ text });
+      expect(editMessageText).not.toHaveBeenCalled();
+    }
+  });
+
+  it('mrud 非白名单 from.id → 拒、不调 applyUrlDriftReview（鉴权在 DB 往返前）', async () => {
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery } = makeCtx(`mrud:${TOKEN}:approve`, 999);
+
+    await handleApprovalCallback(ctx, deps(makeApplyReview(), applyUrlDriftReview));
+
+    expect(applyUrlDriftReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无批准权限' });
+  });
+
+  it('mrud 非目标 chat → 拒、不调 applyUrlDriftReview（通道绑定）', async () => {
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery } = makeCtx(
+      `mrud:${TOKEN}:approve`,
+      111,
+      999999,
+    );
+
+    await handleApprovalCallback(ctx, deps(makeApplyReview(), applyUrlDriftReview));
+
+    expect(applyUrlDriftReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无权限' });
+  });
+
+  it('mrud 非法 token → 拒、不调任一 apply（解析在鉴权/DB 之前）', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    const { ctx, answerCallbackQuery } = makeCtx('mrud:SHORT:approve', 111);
+
+    await handleApprovalCallback(ctx, deps(applyReview, applyUrlDriftReview));
+
+    expect(applyReview).not.toHaveBeenCalled();
+    expect(applyUrlDriftReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无法识别的操作' });
+  });
+
+  it('未知前缀（非 mrpr/mrud）→ 拒、不调任一 apply（前缀 gate 在鉴权/DB 之前）', async () => {
+    const applyReview = makeApplyReview();
+    const applyUrlDriftReview = makeApplyUrlDrift();
+    // 结构合法（3 段 + approve + 32-hex token）但前缀未知——须被前缀 gate 拒。
+    const { ctx, answerCallbackQuery } = makeCtx(`mrxx:${TOKEN}:approve`, 111);
+
+    await handleApprovalCallback(ctx, deps(applyReview, applyUrlDriftReview));
+
+    expect(applyReview).not.toHaveBeenCalled();
+    expect(applyUrlDriftReview).not.toHaveBeenCalled();
+    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无法识别的操作' });
+  });
+});
+
+describe('answerUrlDriftText（4-case exhaustive）', () => {
+  it('4 种 kind → 对应文案', () => {
+    expect(answerUrlDriftText({ kind: 'applied', reviewId: 'r', sourceId: 's', oldUrl: 'a', newUrl: 'b' })).toBe('✅ URL 已更新');
+    expect(answerUrlDriftText({ kind: 'noop' })).toBe('已处理/已过期，请等新卡');
+    expect(answerUrlDriftText({ kind: 'cross-domain-drift', reviewId: 'r' })).toBe('候选越界，已升级 PR 流程');
+    expect(answerUrlDriftText({ kind: 'failed', reviewId: 'r', reason: 'x' })).toBe('应用失败，将重新浮现');
   });
 });

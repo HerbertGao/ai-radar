@@ -110,6 +110,51 @@ export const mrPriceReviewWriteSchema = z.object({
 });
 
 /**
+ * URL drift 待批记录状态（add-model-radar-browser-url-drift-agent，design D2）。
+ * 与 mrPriceReviewStatusSchema 同四值——URL drift 路径同样**不含 rejected**（忽略即不动、由
+ * supersede/staleness 收敛）。取值集合法性唯一防线 = 本 Zod（全仓零 pg-enum / 零 CHECK）。
+ */
+export const mrUrlDriftReviewStatusSchema = z.enum([
+  'pending',
+  'approved',
+  'superseded',
+  'apply_failed',
+]);
+
+/** URL drift 候选置信度（design D8，序数 low<medium<high）。 */
+export const mrUrlDriftConfidenceSchema = z.enum(['low', 'medium', 'high']);
+
+/**
+ * `mr_url_drift_review` 写行校验闸 —— openUrlDriftReviewOrSupersede 发 SQL 前必过（与
+ * mrPriceReviewWriteSchema 对称）。校验 status/confidence 两有限值集列 + token 定长 hex + 关键非空串。
+ * token = randomBytes(16) hex（32 位十六进制小写）；source_id/run_id/old_url/candidate_url/flag_opened_at
+ * 非空字符串（run_id 作 metric 回填 join key、flag_opened_at 为 frozen generation token，见 design D2/D-M4）。
+ * **无 apply_failure_kind enum、无跨字段 superRefine**——列已删（design D-B3），值域合法性由本闸单防线守。
+ */
+export const mrUrlDriftReviewWriteSchema = z.object({
+  status: mrUrlDriftReviewStatusSchema,
+  confidence: mrUrlDriftConfidenceSchema,
+  token: z.string().regex(/^[0-9a-f]{32}$/),
+  source_id: z.string().min(1),
+  run_id: z.string().min(1),
+  old_url: z.string().min(1),
+  candidate_url: z.string().min(1),
+  flag_opened_at: z.string().min(1),
+});
+
+/**
+ * `mr_url_drift_metric` 写行校验闸（design D7）—— 每 run 一行、upsert 幂等。
+ * `total_candidates` 从持久候选行 `count(*)` 重算（非负整数）；`adopted` 当轮 null、人审批后回填
+ * （nullable 非负整数——写 0 则回填 `WHERE adopted IS NULL` 永不命中）；`ran_at` 时间戳。
+ */
+export const mrUrlDriftMetricWriteSchema = z.object({
+  run_id: z.string().min(1),
+  total_candidates: z.number().int().nonnegative(),
+  adopted: z.number().int().nonnegative().nullable(),
+  ran_at: z.date(),
+});
+
+/**
  * 价格金额校验（5c review）——贴合 numeric(12,2) 列：接受 `number | numeric-string`，但须
  * **有限（非 NaN/Infinity）、≥ 0、量级 < 1e10、小数位 ≤ 2**。无此闸时官方 provenance 的 `-1`/NaN/
  * 超 scale 价能落库并在比价 query 成 cheapest。仅校验、不 transform（保持调用方原值写 SQL）。

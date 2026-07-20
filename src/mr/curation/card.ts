@@ -27,6 +27,9 @@ import type { MrCurrency } from './extract.js';
 export const CALLBACK_PREFIX = 'mrpr';
 export const CALLBACK_APPROVE_OP = 'approve';
 
+/** URL drift callback_data 前缀（telegram-callback 侧按 `mrud:<token>:approve` 解析、与 `mrpr` 并列，design D3）。 */
+export const URL_DRIFT_CALLBACK_PREFIX = 'mrud';
+
 /** 币种符号（展示用，非事实——落库仍用行上冻结值）。 */
 const CURRENCY_SYMBOL: Record<MrCurrency, string> = {
   CNY: '¥',
@@ -91,6 +94,65 @@ export function buildPriceReviewTelegramCard(
           {
             text: '✅ 一键批准',
             callback_data: `${CALLBACK_PREFIX}:${input.token}:${CALLBACK_APPROVE_OP}`,
+          },
+        ],
+      ],
+    },
+  };
+}
+
+/** URL drift 卡片展示所需信息（**不含 token**——token 只进 callback_data；`candidateUrl` 是 value 亦不进 callback_data）。 */
+export interface UrlDriftReviewCardInput {
+  /** 开卡时冻结的现有源 URL（基线）。转义见函数 JSDoc「转义纪律」。 */
+  oldUrl: string;
+  /** agent 建议的候选新 URL（同 vendor 已 allowlist 域内）。转义见函数 JSDoc「转义纪律」。 */
+  candidateUrl: string;
+  /** agent 置信度枚举。文本字段——渲染用 `escapeMarkdownV2`。 */
+  confidence: 'low' | 'medium' | 'high';
+  /** agent 给出的 drift 推断理由（**LLM 产出、不可信文本**）。文本字段——MUST 经 `escapeMarkdownV2`，防伪链接/破坏渲染。 */
+  reason: string;
+}
+
+/**
+ * URL drift 卡片**正文**（不含 token/按钮）。propose 侧长度守卫复用此——对比**装配后文本**长度与 Telegram
+ * `MAX_MESSAGE_LENGTH`（转义/百分号编码会扩长，URL 长度代理不可靠、故文本装配须单一权威源）。守卫**保守**取原文
+ * 长度（含转义反斜杠 + 链接目标 URL）：Telegram「4096 after entities parsing」计数口径有歧义，而原文长 ≥ 显示长，
+ * 故原文 ≤ 4000 在任一口径下都可发；代价是极端转义密集 URL 会被过度拒——但那是钉定模型 + 无外部文本注入下不可达的输入。
+ *
+ * **转义纪律**：转义器按**上下文**选，不按字段类型——`escapeMarkdownV2Url`（只转 `)`/`\`）**仅**用于内联链接
+ * `[文本](url)` 的**目标**位；出现在**纯文本正文**里的 URL（本卡的 old→new 变更行）必须用 `escapeMarkdownV2`（转义
+ * 全部保留字含 `.`/`-`/`=`），否则 host 的 `.` 未转义 → Telegram 400 整卡失败。文本字段（`confidence`/`reason`/标签）
+ * 一律 `escapeMarkdownV2`——LLM 产出的 `reason` 不可信、可能含 `[click](evil)` 伪链接或破坏渲染的特殊字符。
+ */
+export function buildUrlDriftCardText(input: UrlDriftReviewCardInput): string {
+  return [
+    `*${escapeMarkdownV2('Model Radar 源 URL 待复核')}*`,
+    // 变更行走 escapeMarkdownV2（纯文本、非链接目标），见上方转义纪律。
+    `${escapeMarkdownV2('URL 变更：')}${escapeMarkdownV2(input.oldUrl)} → ${escapeMarkdownV2(input.candidateUrl)}`,
+    `${escapeMarkdownV2('置信度：')}${escapeMarkdownV2(input.confidence)}`,
+    `${escapeMarkdownV2('理由：')}${escapeMarkdownV2(input.reason)}`,
+    `[${escapeMarkdownV2('查看候选页')}](${escapeMarkdownV2Url(input.candidateUrl)})`,
+    escapeMarkdownV2('点下方按钮一键批准（仅授权人可批，改的是源 URL、不改价格事实）。'),
+  ].join('\n');
+}
+
+/**
+ * Telegram 一键批准卡片（URL drift）。正文见 `buildUrlDriftCardText`；此处挂能力 token 与按钮：
+ * `callback_data = "mrud:<token>:approve"`——token 只进 callback_data，`candidateUrl` 是 value 绝不进
+ * callback_data（applyUrlDriftReview 服务端按 token 读冻结行）。
+ */
+export function buildUrlDriftTelegramCard(
+  input: UrlDriftReviewCardInput & { token: string },
+): TelegramReviewCard {
+  return {
+    text: buildUrlDriftCardText(input),
+    parseMode: 'MarkdownV2',
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          {
+            text: '✅ 一键批准',
+            callback_data: `${URL_DRIFT_CALLBACK_PREFIX}:${input.token}:${CALLBACK_APPROVE_OP}`,
           },
         ],
       ],

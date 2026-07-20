@@ -32,6 +32,13 @@ import {
   markSuperseded,
 } from './price-review-store.js';
 import { sameMoney } from './money.js';
+import { setSourceUrl, StaleUrlError } from '../ingest/set-source-url.js';
+import { SsrfBlockedError } from '../scrape/ssrf-guard.js';
+import { vendorDomainSet, vendorOf } from '../scrape/vendor-domains.js';
+import {
+  claimUrlDriftReview,
+  markUrlDriftApplyFailed,
+} from './url-drift-store.js';
 
 /** db 句柄类型（drizzle 实例，须支持 transaction）。 */
 type DbLike = typeof defaultDb;
@@ -47,6 +54,21 @@ export type ApplyReviewResult =
   /** 写入未生效或抛错 → 未落库、独立事务已置 apply_failed。 */
   | { kind: 'failed'; reviewId: string; reason: string };
 
+/**
+ * URL drift 批准结果（discriminated；callback handler 据此映射反馈文案）。
+ * kind 集与 `ApplyReviewResult` 不同——**无 `baseline-drift`、有 `cross-domain-drift`**（URL drift 路径无基线漂移概念）；
+ * 落库目标是 `mr_source.source_url` 故字段名 `sourceId`/`oldUrl`/`newUrl`；非-applied 分支除 `noop` 外均带 `reviewId`。
+ */
+export type ApplyUrlDriftReviewResult =
+  /** 真改一次 `mr_source.source_url`（+ mr_plans 对齐 + flag resolve）；提交后已尽力触发快照失效。 */
+  | { kind: 'applied'; reviewId: string; sourceId: string; oldUrl: string; newUrl: string }
+  /** CAS 0 行（已决/重放/过期）→ 幂等 no-op、未落库。 */
+  | { kind: 'noop' }
+  /** 候选越界（approve step ② vendor-scope 失败 或 SSRF host-not-allowlisted）→ 未落库、独立事务已置 apply_failed。 */
+  | { kind: 'cross-domain-drift'; reviewId: string }
+  /** setSourceUrl 抛错（stale-url / url-conflict / 其余 SSRF reason / 任何 post-claim 失败）→ 未落库、独立事务已置 apply_failed。 */
+  | { kind: 'failed'; reviewId: string; reason: string };
+
 /** 基线漂移哨兵（携带认领 id，供回滚后独立事务按 id 置 superseded）。 */
 class BaselineDriftError extends Error {
   constructor(readonly reviewId: string) {
@@ -60,6 +82,14 @@ class ApplyFailedError extends Error {
   constructor(readonly reviewId: string, reason: string) {
     super(reason);
     this.name = 'ApplyFailedError';
+  }
+}
+
+/** 跨域漂移哨兵（携带认领 id，供回滚后独立事务按 id 置 apply_failed；design D-M5）。 */
+class CrossDomainDriftError extends Error {
+  constructor(readonly reviewId: string) {
+    super('cross-domain drift');
+    this.name = 'CrossDomainDriftError';
   }
 }
 
@@ -198,5 +228,155 @@ export async function applyReview(
       return { kind: 'failed', reviewId: claimedId, reason };
     }
     throw err; // 认领未发生（基础设施错），无 review 行可标，上抛交调用方处理。
+  }
+}
+
+/**
+ * pg `unique_violation`（SQLSTATE `23505`）检测——drizzle 把 pg 错误包成外层 `Error`、外层 `.code` 空，
+ * 真 code 住 `.cause` 链（仿 `recommend/evidence.ts` 同款教训）。approve catch ④ 用它把
+ * `mr_source` UNIQUE(vendor_id, source_url) 冲突分类为 `url-conflict`；深度封顶防环。
+ */
+function isUniqueViolation(error: unknown): boolean {
+  for (
+    let e: unknown = error, depth = 0;
+    e != null && depth <= 3;
+    e = (e as { cause?: unknown }).cause, depth++
+  ) {
+    if ((e as { code?: unknown }).code === '23505') return true;
+  }
+  return false;
+}
+
+/**
+ * URL drift 批准落库（design D2「事务范式」+ D-M5，group 9）——仿 `applyReview` 结构。见文件头红线。
+ * 候选 URL / oldUrl / flag generation token 只从 `claimUrlDriftReview` 返回的冻结行读，绝不从入站取。
+ *
+ * 主事务：① CAS 认领（0 行 → noop）→ ② vendor-scope 再校验（候选 host 须在该 vendor 域集内、否则
+ * `CrossDomainDriftError`）→ ③ `setSourceUrl`（同事务、成功 void、失败一律抛）。提交后 best-effort
+ * `publishSnapshotInvalidation`（失败不使已成功的批准转失败）。任何失败 → 主事务回滚 → 独立事务
+ * `markUrlDriftApplyFailed`（无 kind 参）+ 5-branch 分流选反馈 kind（design D2 catch 分流）。
+ *
+ * @param token 一次性令牌（调用方须已校验定长/字符集 + 鉴权）。
+ * @param decidedBy 批准人标识（写 decided_by 审计）。
+ * @param dbh db 句柄（默认全局 db；独立收敛事务用**顶层 db** 而非主 tx 句柄）。
+ */
+export async function applyUrlDriftReview(
+  token: string,
+  decidedBy: string,
+  dbh: DbLike = defaultDb,
+): Promise<ApplyUrlDriftReviewResult> {
+  let claimedId: string | undefined;
+  let applied: { sourceId: string; oldUrl: string; newUrl: string } | undefined;
+
+  /** 置 apply_failed（独立事务传顶层 dbh）；0 行 = 行已非 pending → warn 日志、不抛不阻塞（仿既有 0-row 范式）。 */
+  const markFailed = async (reviewId: string): Promise<void> => {
+    const n = await markUrlDriftApplyFailed(reviewId, decidedBy, dbh);
+    if (n === 0) {
+      console.warn(
+        `[mr-curation] applyUrlDriftReview 置 apply_failed 命中 0 行、行已非 pending、跳过 review=${reviewId}`,
+      );
+    }
+  };
+
+  try {
+    const kind = await dbh.transaction(async (tx) => {
+      // ① CAS 认领（传已开 tx，使认领与落库同事务：失败回滚连认领一并回滚，行留 pending）。
+      const claimed = await claimUrlDriftReview(token, decidedBy, tx);
+      if (!claimed) return 'noop' as const; // 0 行（已决/重放/过期）→ 幂等 no-op。
+      claimedId = claimed.id;
+
+      // ② vendor-scope 再校验（design D-M5，防御纵深第二道）：候选 host 须在该 vendor 域集内。
+      //    vid 缺（source 不存在）→ 空集 → 必然 miss → CrossDomainDriftError（fail-closed）。
+      const vid = await vendorOf(claimed.sourceId, tx);
+      const set = vid ? await vendorDomainSet(vid, tx) : [];
+      const h = new URL(claimed.candidateUrl).hostname;
+      if (!set.some((d) => h === d || h.endsWith('.' + d))) {
+        throw new CrossDomainDriftError(claimed.id);
+      }
+
+      // ③ 同事务落库（内部 old-URL CAS + mr_plans 对齐 + generation-aware resolveFlag）。
+      //    成功 void；失败一律抛（StaleUrlError / SsrfBlockedError / URL 唯一冲突 DB 错）→ 外层 catch 分流。
+      await setSourceUrl(
+        claimed.sourceId,
+        claimed.candidateUrl,
+        claimed.oldUrl,
+        decidedBy,
+        tx,
+        claimed.flagOpenedAt,
+      );
+      applied = {
+        sourceId: claimed.sourceId,
+        oldUrl: claimed.oldUrl,
+        newUrl: claimed.candidateUrl,
+      };
+      return 'applied' as const;
+    });
+
+    if (kind === 'noop') return { kind: 'noop' };
+
+    // 主事务已提交：best-effort 触发快照失效（不得使已成功的批准转失败；publish 内部已 never-throw，仍兜底 catch）。
+    try {
+      await publishSnapshotInvalidation();
+    } catch (err) {
+      console.error(
+        `[mr-curation] applyUrlDriftReview 快照失效失败（best-effort，批准仍成功）review=${claimedId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return {
+      kind: 'applied',
+      reviewId: claimedId!,
+      sourceId: applied!.sourceId,
+      oldUrl: applied!.oldUrl,
+      newUrl: applied!.newUrl,
+    };
+  } catch (err) {
+    // 主事务已回滚（CAS 认领一并回滚 → 行回 pending）。独立事务用**顶层 db** 收敛状态、全部 markUrlDriftApplyFailed（无 kind 参）。
+    // ① CrossDomainDriftError（approve step ② vendor-scope 失败）→ cross-domain-drift。
+    if (err instanceof CrossDomainDriftError) {
+      await markFailed(err.reviewId);
+      return { kind: 'cross-domain-drift', reviewId: err.reviewId };
+    }
+    if (claimedId === undefined) throw err; // 认领未发生（基础设施错），无 review 行可标，上抛。
+    const reviewId = claimedId;
+    // ① SsrfBlockedError 且 host-not-allowlisted → cross-domain（design D-M2：只有此 reason）；② 其余 reason 原样 ssrf 反馈。
+    if (err instanceof SsrfBlockedError) {
+      await markFailed(reviewId);
+      if (err.reason === 'host-not-allowlisted') {
+        return { kind: 'cross-domain-drift', reviewId };
+      }
+      return { kind: 'failed', reviewId, reason: err.reason };
+    }
+    // ③ StaleUrlError（old-URL CAS 0 行、源 URL 被并发信号替换）。
+    if (err instanceof StaleUrlError) {
+      await markFailed(reviewId);
+      return { kind: 'failed', reviewId, reason: 'stale-url' };
+    }
+    // ④ mr_source UNIQUE(vendor_id, source_url) 冲突（候选已等于同 vendor 另一 source 的 URL）。
+    if (isUniqueViolation(err)) {
+      await markFailed(reviewId);
+      return { kind: 'failed', reviewId, reason: 'url-conflict' };
+    }
+    // ⑤ 其它 post-claim throw（design D-M6：failed 恒带 reason）。
+    await markFailed(reviewId);
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[mr-curation] applyUrlDriftReview 落库异常 review=${reviewId}: ${reason}`);
+    return { kind: 'failed', reviewId, reason: reason || 'other' };
+  }
+}
+
+/**
+ * URL drift 批准结果 → Telegram 反馈文案（task 9.2；callback wave 接线 editMessageText/answerCallbackQuery）。
+ * 4-case exhaustive switch（result 类型与 `answerText` 不同、TS 拒混用，故单独函数）。
+ */
+export function answerUrlDriftText(result: ApplyUrlDriftReviewResult): string {
+  switch (result.kind) {
+    case 'applied':
+      return '✅ URL 已更新';
+    case 'noop':
+      return '已处理/已过期，请等新卡';
+    case 'cross-domain-drift':
+      return '候选越界，已升级 PR 流程';
+    case 'failed':
+      return '应用失败，将重新浮现';
   }
 }

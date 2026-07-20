@@ -13,6 +13,8 @@ import {
   mrCurrencySchema,
   mrPlanPriceSchema,
   mrPriceAmountSchema,
+  mrUrlDriftMetricWriteSchema,
+  mrUrlDriftReviewWriteSchema,
 } from '../../../db/mr-schema.zod.js';
 import {
   mrModelWriteSchema,
@@ -362,5 +364,120 @@ describe('1.1 design D3：mr_models.family 小写归一', () => {
     expect(
       mrModelWriteSchema.parse({ family: '  Kimi ', version: 'K2.7' }).family,
     ).toBe('kimi');
+  });
+});
+
+describe('add-model-radar-browser-url-drift-agent 1.4：URL drift 写 schema（纯 Zod、无 DB）', () => {
+  const validReview = {
+    status: 'pending',
+    confidence: 'medium',
+    token: 'a'.repeat(32),
+    source_id: 'src-1',
+    run_id: 'run-1',
+    old_url: 'https://kimi.com/membership/pricing',
+    candidate_url: 'https://kimi.com/membership',
+    flag_opened_at: '2026-07-20T09:33:00.000Z',
+  } as const;
+
+  it('接受合法枚举：status 四值 + confidence 三档 + 32 位小写 hex token', () => {
+    expect(() => mrUrlDriftReviewWriteSchema.parse(validReview)).not.toThrow();
+    for (const status of ['pending', 'approved', 'superseded', 'apply_failed'] as const) {
+      expect(mrUrlDriftReviewWriteSchema.parse({ ...validReview, status }).status).toBe(status);
+    }
+    for (const confidence of ['low', 'medium', 'high'] as const) {
+      expect(
+        mrUrlDriftReviewWriteSchema.parse({ ...validReview, confidence }).confidence,
+      ).toBe(confidence);
+    }
+  });
+
+  it('拒非法 status（含既有价格路径也拒的 rejected）', () => {
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, status: 'rejected' }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, status: 'done' }),
+    ).toThrow();
+  });
+
+  it('拒非法 confidence', () => {
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, confidence: 'urgent' }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, confidence: 'MEDIUM' }),
+    ).toThrow();
+  });
+
+  it('拒非 32 位小写 hex token（长度 / 大写 / 非 hex 字符）', () => {
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, token: 'a'.repeat(31) }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, token: 'a'.repeat(33) }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, token: 'A'.repeat(32) }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftReviewWriteSchema.parse({ ...validReview, token: 'g'.repeat(32) }),
+    ).toThrow();
+  });
+
+  it('拒空的 source_id / run_id / old_url / candidate_url / flag_opened_at', () => {
+    for (const key of [
+      'source_id',
+      'run_id',
+      'old_url',
+      'candidate_url',
+      'flag_opened_at',
+    ] as const) {
+      expect(() =>
+        mrUrlDriftReviewWriteSchema.parse({ ...validReview, [key]: '' }),
+      ).toThrow();
+    }
+  });
+
+  it('metric 写 schema：接受合法行（adopted null / 已回填）、拒负数 / 非整 / 空 run_id', () => {
+    expect(() =>
+      mrUrlDriftMetricWriteSchema.parse({
+        run_id: 'run-1',
+        total_candidates: 0,
+        adopted: null,
+        ran_at: new Date(),
+      }),
+    ).not.toThrow();
+    expect(() =>
+      mrUrlDriftMetricWriteSchema.parse({
+        run_id: 'run-1',
+        total_candidates: 3,
+        adopted: 2,
+        ran_at: new Date(),
+      }),
+    ).not.toThrow();
+    expect(() =>
+      mrUrlDriftMetricWriteSchema.parse({
+        run_id: 'run-1',
+        total_candidates: -1,
+        adopted: null,
+        ran_at: new Date(),
+      }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftMetricWriteSchema.parse({
+        run_id: 'run-1',
+        total_candidates: 1.5,
+        adopted: null,
+        ran_at: new Date(),
+      }),
+    ).toThrow();
+    expect(() =>
+      mrUrlDriftMetricWriteSchema.parse({
+        run_id: '',
+        total_candidates: 1,
+        adopted: null,
+        ran_at: new Date(),
+      }),
+    ).toThrow();
   });
 });
