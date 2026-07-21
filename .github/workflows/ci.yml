@@ -85,5 +85,4 @@ jobs:
           SEMANTIC_DEDUP_HIGH: "0.88"
           SEMANTIC_DEDUP_LLM: "0.82"
           SEMANTIC_WINDOW_DAYS: "14"
-          SEMANTIC_DEDUP_ENABLED: "on"
         run: npm run test

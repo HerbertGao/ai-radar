@@ -83,8 +83,8 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── 应用：常驻 worker（profile=app）。默认 3 条调度链生效（日报/产品发现/实时告警）；
-  #    周报为第 4 条、默认禁用（WEEKLY_REPORT_ENABLED=false）。
+  # ── 应用：常驻 worker（profile=app）。实际注册哪几条调度链由各自的 *_ENABLED 门控决定，
+  #    以启动日志「已启动 N 条调度链（…）」为准（此处不列举，避免随门控增删漂移）。
   worker:
     <<: *app
     profiles: ["app"]
