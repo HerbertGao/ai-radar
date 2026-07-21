@@ -8,30 +8,40 @@
  * **限频住在 DB 里，不在进程里**：告警经 `push_records` 的
  * `UNIQUE(target_type, target_id, channel, push_date)` 落地——`target_type='ops-alert'`、
  * `target_id=<dedupKey>`。限频的真实语义是「**今天该 dedupKey 该通道已有一条 `status='success'` 行**」
- * ——与 `hasAlertedToday()` 查的完全是同一个东西，两个口径合一。故认领用
+ * 。**逐通道**看，`hasAlertedToday()` 查的是同一个判据；但它不过滤 `channel`，是 dedupKey 维度的
+ * 聚合视图——多通道下二者不等价（一个通道 success、另一个 failed 时它已返回 true）。故认领用
  * `ON CONFLICT DO UPDATE ... WHERE status <> 'success'`：
  * - 已有 `success` 行 → setWhere 不满足 → 0 行 → 跳过（这才是真限频）；
  * - 有 `pending`（进程崩在发送前的残行）/ `failed`（上次发送失败）→ **重新认领 → 重试**；
  * - 无行 → INSERT → 发送。
  *
+ * **`success` 是吸收态**：终态写回（`setStatus`）同样附 `status <> 'success'`，已成功的行不再被任何
+ * 终态写回改动。它收敛的是**行**、不是**发送**——每一个在首个 `success` 落库前完成认领的 attempt
+ * 都各发一条。归因、边界与量级的权威表述在主规范
+ * `platform-foundation`「运维告警落真实通道并由 DB 唯一约束限频」，此处不复制。
+ *
  * 若改用 `ON CONFLICT DO NOTHING`，**任何 status** 的残行都会挡住当天全部重试——一条崩溃遗留的
  * pending 就足以让该告警当天彻底哑火（消息从未发出），而 `hasAlertedToday()` 仍报 false：限频口径
  * 与可观测口径分裂，连「今天没告成」都看不出来。
  *
- * **当前接线**：只有日报链注入真 sink——`run-daily-workflow.ts` 5 处 `alert()` +
- * `product-digest.ts` 3 处。故重复告警的真实来源是 **BullMQ 对同一 daily job 的重试**（同日重跑撞
- * 唯一键即跳过），这是本 sink 的实际收益。
- * **待接**：高频链（`alert-scan.ts`）目前零 `alert()` 调用、无 AlertSink 注入口；单源采集失败的
- * 源级健康告警也尚无告警点（`classifySystemFailure` 只在「整体采集为 0」或「全部不可处理」时才响，
- * 单源 throw 而其余源正常时不告警）。两者接入前，不要在本文件预支它们的行为。
+ * **当前接线**：三处都已注入真 sink——日报链（`run-daily-workflow.ts` 的薄 `run(ctx)` 包装，
+ * 该文件 7 处 `alert()` + `product-digest.ts` 3 处）、告警链（`alert-scan.ts:662` 注入，
+ * 该文件 1 处调用 `:434`）、staleness 车道（`worker-main.ts:196` 注入，`mr/freshness/staleness.ts`
+ * 1 处）。生产调用点共 12 处，全部 `await`、全部直接坐在业务 run 的 await 路径上。
+ * 故重复告警的主要来源**不再是** BullMQ 对同一 daily job 的重试，而是：告警链每天 72–96 轮的高频
+ * 重扫，以及告警链与日报链**共用同一 `dedupKey`（`source-health:<source>`）**的跨链重复——两者都
+ * 由这里的唯一键收口。
  *
  * **发送失败写 `failed`、不删行**（CLAUDE.md 推送不变量：先 `pending`、成功 `success`、失败 `failed`）。
  * `failed` 行满足 `status <> 'success'` → 下次同 dedupKey 可被重新认领重试；且 DB 里查得到「告警发送
  * 失败」这一事实（DELETE 会把它抹掉）。
  *
- * **DB 挂了时不哑火**：认领本身抛错 → 降级为**不去重直接发**，并在消息里标注「限频不可用（DB 异常）」。
- * `product-digest` 那条「待中文化产品查询失败（如 DB 断连）」的告警恰恰在 DB 断连时触发——若认领失败
- * 即放弃发送，最需要告警的那类故障上通道全哑。宁可重复一条，不可哑火。
+ * **DB 挂了时不哑火**：认领本身**抛错或无响应**（后者靠客户端超时判定，机制见 `DB_OP_TIMEOUT_MS`
+ * 的注释）→ 降级为**不去重直接发**，
+ * 并在消息里标注「限频不可用（DB 异常）」。`product-digest` 那条「待中文化产品查询失败（如 DB 断连）」
+ * 的告警恰恰在 DB 断连时触发——若认领失败即放弃发送，最需要告警的那类故障上通道全哑。
+ * 宁可重复一条，不可哑火。**代价按 `(dedupKey, channel, push_date)` 三维记全**：慢库持续期内是
+ * 「每轮、每通道各重发一条」（不是「多一条」），且跨链去重同时失效。
  */
 import { and, eq, sql } from 'drizzle-orm';
 
@@ -60,7 +70,10 @@ import { CHANNEL, TARGET_TYPE, type Channel } from '../push/targets.js';
  * ——运维在通道里收到的不能是一句没有上下文的裸话。
  */
 export interface AlertDetail {
-  /** 当日限频键（每 dedupKey 每通道每天至多一条成功告警）。形如 `degrade-abort:value-judge`。 */
+  /**
+   * 当日限频键（每 dedupKey 每通道每天至多一条 **`success` 行**）。形如 `degrade-abort:value-judge`。
+   * 注意口径是「行」不是「告警」——两个 attempt 重叠时仍会各发一条，见文件头的吸收态段。
+   */
   dedupKey: string;
   [key: string]: unknown;
 }
@@ -90,18 +103,64 @@ const RATE_LIMIT_UNAVAILABLE = '限频不可用（DB 异常）：本条未经 pu
  * ponytail: 只做「不再等」的超时，不取消底层请求（grammY 无 signal 缝）；到点即让本通道计为失败、
  * 写 `failed` 行、下次可重试。
  */
-const SEND_TIMEOUT_MS = 10_000;
+export const SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * 单次 DB 调用的客户端超时（认领 / 终态写回各一次）。
+ *
+ * **必须是客户端超时**：服务端 `statement_timeout` 管不到**连接池获取等待**，而共享池未设
+ * `connectionTimeoutMillis` ⇒ 池耗尽时 `pool.connect()` 无限排队且**不抛错** ⇒ 只捕获异常的降级分支
+ * 抓不到一个不发生的异常，告警既不发出、也不留痕。「DB 挂了时不哑火」因此只对「抛错」成立、
+ * 对「无响应」不成立。
+ *
+ * ponytail: 同样只做「不再等」、不取消底层写入——被放弃的那次写**仍可能迟到落地**，最终行状态取决于
+ * 时序（规范的三轴时序矩阵）。真取消需要单连事务内 `set_config('statement_timeout', …, true)`，
+ * 但那套写法同样管不到连接池获取等待——即本处要挡的头号形态，故不采用。
+ *
+ * 计时器在 `Promise.race` 构造时就挂上，此刻还没 `execute()`、更没拿到连接 ⇒ 这 5s 覆盖
+ * 「排队 + 握手 + 执行」全程，因此它同时是一个**池竞争阈值**（共享池上还跑着 pgvector KNN 与日报
+ * 批量写），不只是「DB 病了」的判据。
+ *
+ * 值写死、不加 env 旋钮：这是内部故障判据；且**单通道串行 I/O timeout 配置预算**
+ * （`DB_OP_TIMEOUT_MS × 2 + SEND_TIMEOUT_MS ≤ 20s`，由一条常量断言钉住）的算术依赖它是这个确切值。
+ * **它是配置预算、不是墙钟上界**——为什么，见主规范 `platform-foundation`
+ * 「运维告警落真实通道并由 DB 唯一约束限频」，此处不复制论证。
+ */
+export const DB_OP_TIMEOUT_MS = 5_000;
 
 export interface OpsAlertSinkOptions {
   /** 已配置的通道 → sender。空对象 ⇒ 回落 `consoleAlertSink`。 */
   senders: Partial<Record<Channel, MessageSender>>;
-  /** 可注入 db 或事务句柄（默认全局 db）。 */
+  /**
+   * 可注入 db 句柄（默认全局 db），供测试打桩。
+   *
+   * **不得传事务句柄**：事务句柄是单个 client、语句串行排队 ⇒
+   * ① **超时判据失真**（有界性本身不受影响——计时器照样到点 reject）：后一个通道那 5s 里大半在等前
+   *    一个通道的语句，于是「DB 慢」的判据变成「自制排队」的判据，白白 fail-open 重发；
+   * ② **告警反过来能搞死业务事务**：被弃的语句仍挂在事务主人的 client 队列上，它一旦自己报错
+   *    （如语句被取消、连接层错误），主人的事务会被整个打成 aborted；
+   * ③ 事务主人 `ROLLBACK` 会把整条告警的 `push_records` 事实一并抹掉——「今天已告过」丢失、下轮重发，
+   *    而 `alert()` 早已返回、看起来一切正常。
+   * 告警的落库事实必须独立于业务事务的提交/回滚，且只该旁观、不该反噬。
+   */
   dbh?: typeof defaultDb;
   /** 可注入「现在」（默认 `new Date()`）——各链必须用同一口径算 push_date。 */
   now?: () => Date;
 }
 
-/** 到点即 reject 的超时包装（不取消底层请求；见 SEND_TIMEOUT_MS）。 */
+/**
+ * 到点即 reject 的超时包装（不取消底层操作；见 SEND_TIMEOUT_MS / DB_OP_TIMEOUT_MS）。
+ *
+ * **动词由调用方给**：`label` 自带动作词（`… 认领` / `… 终态写回` / `… 发送`），本函数只拼
+ * `${label}超时（${ms}ms）`。若把「发送」写死在模板里，DB 调用挂住时会打出
+ * `[ops-alert][claim] 发送超时`——一个字节都没发出去却指向发送子系统，把排障引向错的地方。
+ * （认领 / 终态写回的超时串只进 stderr：落库的 `error_message` 只从发送失败的 err 取。）
+ *
+ * ⚠️ 传 drizzle builder 时**只许有这一个消费者**：`QueryPromise.then()` 每次调用都重跑 `execute()`、
+ * 无 memo。给被弃的那一侧补 `.catch()` 会让同一条 SQL 跑两次——**告警路径上 DB 往返翻倍，而这正是
+ * 池耗尽时最不该加压的地方**（真 PG 实测：两次认领要么各返 0 行、要么返同一 id，`sender.send` 仍只
+ * 调一次，所以代价不是「双发」而是这个）；且桩 dbh 测不出来。
+ */
 async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -109,7 +168,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
       p,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`${label} 发送超时（${ms}ms）`)),
+          () => reject(new Error(`${label}超时（${ms}ms）`)),
           ms,
         );
       }),
@@ -249,81 +308,114 @@ export function createOpsAlertSink(options: OpsAlertSinkOptions): AlertSink {
   if (channels.length === 0) return consoleAlertSink;
 
   return async (message, detail) => {
-    const pushDate = getPushDate(now());
-    const baseLines = [message, ...detailLines(detail)];
+    // best-effort 覆盖【整个】函数体：下面两行（push_date 计算 / detail 摘要）在逐通道的三层 catch
+    // 之外，畸形入参（toJSON 抛错、ownKeys 抛错的 Proxy、抛错的 now()）就能让 alert() 真的 reject
+    // ——而多数调用点没有本地 catch，其中几处紧接 throw（熔断中止 / 租约已失），另几处所在的函数
+    // 自陈「整步永不向上抛」。兜底日志必须打出**原始 message**：只打 err 会让这条告警的内容彻底消失。
+    // 逐通道隔离由 mapper 内**逐阶段的 catch**（认领 / 发送 / setStatus 各自兜住）保证，不是由
+    // allSettled 保证——今天 mapper 不可能 reject，故 allSettled 属纵深防御，只有将来有人在 mapper
+    // 里引入未被 catch 的路径时才起作用。**如实登记**：把它改成 Promise.all 撞不到任何检查；被钉住的
+    // 是隔离这个行为本身（用例「单通道失败不中断其余通道」），不是这个 API 的选择。
+    try {
+      const pushDate = getPushDate(now());
+      const baseLines = [message, ...detailLines(detail)];
 
-    await Promise.allSettled(
-      channels.map(async (channel) => {
-        const sender = senders[channel];
-        if (!sender) return;
+      await Promise.allSettled(
+        channels.map(async (channel) => {
+          const sender = senders[channel];
+          if (!sender) return;
 
-        // 1. 认领当日名额：只有【未成功】的行可被重新认领（崩溃残 pending / 上次 failed）。
-        //    已有 success 行 → 0 行 → 跳过。这就是限频，且与 hasAlertedToday() 同口径。
-        let claimedId: bigint | null = null;
-        let rateLimitDown = false;
-        try {
-          const claimed = await dbh
-            .insert(pushRecords)
-            .values({
-              targetType: TARGET_TYPE['ops-alert'],
-              targetId: detail.dedupKey,
-              channel,
-              pushDate,
-              status: 'pending',
-            })
-            .onConflictDoUpdate({
-              target: [
-                pushRecords.targetType,
-                pushRecords.targetId,
-                pushRecords.channel,
-                pushRecords.pushDate,
-              ],
-              set: { status: 'pending', errorMessage: null, updatedAt: sql`now()` },
-              setWhere: sql`${pushRecords.status} <> 'success'`,
-            })
-            .returning({ id: pushRecords.id });
+          // 1. 认领当日名额：只有【未成功】的行可被重新认领（崩溃残 pending / 上次 failed）。
+          //    已有 success 行 → 0 行 → 跳过。这就是限频，且与 hasAlertedToday() 同口径。
+          //    带客户端超时（见 DB_OP_TIMEOUT_MS）：超时 reject 落进下面同一个 catch，与「认领抛错」
+          //    同路——降级为不去重直接发。fail-open 的成因是「**本 attempt 未观察到认领结果**」，
+          //    不是「DB 里没有 success 行」：被弃的认领可能确实写了行，本 attempt 依然看不见。
+          let claimedId: bigint | null = null;
+          let rateLimitDown = false;
+          try {
+            // ⚠️ 这个 builder 只交给 withTimeout 一个消费者（drizzle 的 then() 无 memo，见 withTimeout）。
+            const claimed = await withTimeout(
+              dbh
+                .insert(pushRecords)
+                .values({
+                  targetType: TARGET_TYPE['ops-alert'],
+                  targetId: detail.dedupKey,
+                  channel,
+                  pushDate,
+                  status: 'pending',
+                })
+                .onConflictDoUpdate({
+                  target: [
+                    pushRecords.targetType,
+                    pushRecords.targetId,
+                    pushRecords.channel,
+                    pushRecords.pushDate,
+                  ],
+                  set: { status: 'pending', errorMessage: null, updatedAt: sql`now()` },
+                  setWhere: sql`${pushRecords.status} <> 'success'`,
+                })
+                .returning({ id: pushRecords.id }),
+              DB_OP_TIMEOUT_MS,
+              '[ops-alert][claim] 认领',
+            );
 
-          if (claimed.length === 0) return; // 今天已成功告过 → 真跳过。
-          claimedId = claimed[0]!.id;
-        } catch (claimErr) {
-          // 告警通路不能依赖它要告警的那个子系统：DB 挂了正是最该响的时候。降级为不去重直接发。
-          rateLimitDown = true;
-          console.error(
-            `[ops-alert] 认领当日名额失败（降级为不去重直接发）：channel=${channel} dedupKey=${detail.dedupKey}`,
-            claimErr,
-          );
-        }
+            if (claimed.length === 0) return; // 今天已成功告过 → 真跳过。
+            claimedId = claimed[0]!.id;
+          } catch (claimErr) {
+            // 告警通路不能依赖它要告警的那个子系统：DB 挂了正是最该响的时候。降级为不去重直接发。
+            rateLimitDown = true;
+            console.error(
+              `[ops-alert] 认领当日名额失败（降级为不去重直接发）：channel=${channel} dedupKey=${detail.dedupKey}`,
+              claimErr,
+            );
+          }
 
-        // 2. 按通道渲染 + 发送（带超时，防单通道挂起拖死熔断中止）。
-        const lines = rateLimitDown ? [...baseLines, RATE_LIMIT_UNAVAILABLE] : baseLines;
-        try {
-          await withTimeout(
-            Promise.resolve(sender.send(renderAlert(channel, lines), 'MarkdownV2')),
-            SEND_TIMEOUT_MS,
-            `[ops-alert][${channel}]`,
-          );
-        } catch (sendErr) {
-          console.error(
-            `[ops-alert] 发送失败（置 failed，下次同 dedupKey 可重新认领重试）：` +
-              `channel=${channel} dedupKey=${detail.dedupKey}`,
-            sendErr,
-          );
-          const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
-          await setStatus(dbh, claimedId, 'failed', msg);
-          return;
-        }
+          // 2. 按通道渲染 + 发送（带超时，防单通道挂起拖死熔断中止）。
+          //    ponytail: 渲染留在这个 try 里 ⇒ 它抛错会被记成「发送失败」，标签指向了一个字节都没发
+          //    出去的子系统。**登记为接受的残余，不修**：生产侧 renderAlert 抛不出来——detailLines
+          //    把 detail 全转成字符串、message 在类型上就是 string，唯一的抛点是未知 channel 的
+          //    穷尽性分支，而 channels 由
+          //    Object.keys(senders) 派生、装配只放 CHANNEL 常量，漏渲染分支还是编译错误。给它单独
+          //    catch 要多一条无覆盖的 DB 写和一条新的静默窄路，代价大于这条不可达路径的收益。
+          const lines = rateLimitDown ? [...baseLines, RATE_LIMIT_UNAVAILABLE] : baseLines;
+          try {
+            await withTimeout(
+              Promise.resolve(sender.send(renderAlert(channel, lines), 'MarkdownV2')),
+              SEND_TIMEOUT_MS,
+              `[ops-alert][${channel}] 发送`,
+            );
+          } catch (sendErr) {
+            console.error(
+              `[ops-alert] 发送失败（置 failed，下次同 dedupKey 可重新认领重试）：` +
+                `channel=${channel} dedupKey=${detail.dedupKey}`,
+              sendErr,
+            );
+            const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+            await setStatus(dbh, claimedId, 'failed', msg);
+            return;
+          }
 
-        // 3. 成功 → success + pushed_at（与 dispatcher 终态同口径；否则 ops-alert 行永远
-        //    status='success' AND pushed_at IS NULL）。
-        await setStatus(dbh, claimedId, 'success');
-      }),
-    );
+          // 3. 成功 → success + pushed_at（与 dispatcher 终态同口径；否则 ops-alert 行永远
+          //    status='success' AND pushed_at IS NULL）。
+          await setStatus(dbh, claimedId, 'success');
+        }),
+      );
+    } catch (err) {
+      // 回落 consoleAlertSink 的语义：原始告警文本 + 异常。
+      console.error(`[pipeline][ALERT] ${message}`, err);
+    }
   };
 }
 
 /**
  * 把认领到的那行置终态。`id` 为 null（认领时 DB 已挂）→ 无行可改，跳过。
  * best-effort：终态写库再抛错也只留 stderr——告警是可观测，绝不向业务路径抛。
+ *
+ * **`success` 是吸收态**：写入附 `status <> 'success'`，已成功的行不再被任何终态写回改动。
+ *
+ * 与认领超时**语义不同**：本处发生在发送**之后**（且 failed 那条路径意味着消息未必已发出），
+ * 既走不了认领的降级分支、也补不了「限频不可用」标注，只能有界返回 + 留痕。超时同样不取消底层写入
+ * ——被弃的写可能迟到落地，故不得断言「行必然滞留 pending」。
  */
 async function setStatus(
   dbh: typeof defaultDb,
@@ -333,23 +425,32 @@ async function setStatus(
 ): Promise<void> {
   if (id === null) return;
   try {
-    await dbh
-      .update(pushRecords)
-      .set(
-        status === 'success'
-          ? {
-              status: 'success',
-              pushedAt: new Date(),
-              errorMessage: null,
-              updatedAt: sql`now()`,
-            }
-          : {
-              status: 'failed',
-              errorMessage: (errorMessage ?? '').slice(0, 1000),
-              updatedAt: sql`now()`,
-            },
-      )
-      .where(eq(pushRecords.id, id));
+    // ⚠️ 这个 builder 只交给 withTimeout 一个消费者（drizzle 的 then() 无 memo，见 withTimeout）。
+    await withTimeout(
+      dbh
+        .update(pushRecords)
+        .set(
+          status === 'success'
+            ? {
+                status: 'success',
+                pushedAt: new Date(),
+                errorMessage: null,
+                updatedAt: sql`now()`,
+              }
+            : {
+                status: 'failed',
+                errorMessage: (errorMessage ?? '').slice(0, 1000),
+                updatedAt: sql`now()`,
+              },
+        )
+        // `success` 吸收态：已成功的行不再被任何终态写回改动。**这是既有缺陷、与超时无关**——
+        // 回滚超时不等于可以撤掉这个条件。不影响 failed 重试语义（failed 行仍满足 <> 'success'，
+        // 可被重新认领、error_message 清空）。归因、边界与已登记的反向降级见主规范
+        // `platform-foundation`「运维告警落真实通道并由 DB 唯一约束限频」。
+        .where(and(eq(pushRecords.id, id), sql`${pushRecords.status} <> 'success'`)),
+      DB_OP_TIMEOUT_MS,
+      '[ops-alert][setStatus] 终态写回',
+    );
   } catch (err) {
     console.error(`[ops-alert] 终态写库失败（消息已发/已失败，行状态可能滞留）：id=${id}`, err);
   }
