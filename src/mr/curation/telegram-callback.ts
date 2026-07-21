@@ -56,11 +56,6 @@ export function parseCallbackByPrefix(data: string, prefix: string): string | nu
   return token;
 }
 
-/** 价格路径 thin wrapper（向后兼容——既有导出符号不删）。委托 `parseCallbackByPrefix(data, 'mrpr')`。 */
-export function parseApprovalCallback(data: string): string | null {
-  return parseCallbackByPrefix(data, CALLBACK_PREFIX);
-}
-
 /** kind → 用户可见反馈文案（applied 另去按钮）。 */
 function answerText(result: ApplyReviewResult): string {
   switch (result.kind) {
@@ -254,11 +249,11 @@ export function startApprovalBot(
   options: StartApprovalBotOptions = {},
 ): ApprovalBotHandle {
   // 测试安全守卫：VITEST 下若未注入 bot（即将用真实 token 连生产 Telegram 长轮询）直接抛错。
-  // 测试请直接测 handleApprovalCallback / parseApprovalCallback，不建真 bot。
+  // 测试请直接测 handleApprovalCallback / parseCallbackByPrefix，不建真 bot。
   if (process.env.VITEST && !options.bot) {
     throw new Error(
       'startApprovalBot: 测试环境（VITEST）禁止构造真实批准 bot——会连生产 Telegram 长轮询。' +
-        '请直接测 handleApprovalCallback / parseApprovalCallback。',
+        '请直接测 handleApprovalCallback / parseCallbackByPrefix。',
     );
   }
   const bot = options.bot ?? new Bot(env.TELEGRAM_BOT_TOKEN);

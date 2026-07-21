@@ -18,7 +18,7 @@ process.env.LLM_MODEL ||= 'openai/gpt-4o-mini';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
 process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 
-const { parseApprovalCallback, parseCallbackByPrefix, handleApprovalCallback } =
+const { parseCallbackByPrefix, handleApprovalCallback } =
   await import('../telegram-callback.js');
 const { answerUrlDriftText } = await import('../approve.js');
 type ApprovalCtx = Parameters<typeof handleApprovalCallback>[0];
@@ -98,24 +98,24 @@ function deps(
 
 beforeEach(() => vi.clearAllMocks());
 
-describe('parseApprovalCallback', () => {
+describe('parseCallbackByPrefix（mrpr 前缀：受理 + op/token/分段各拒）', () => {
   it('合法 mrpr:<token>:approve → 返回 token', () => {
-    expect(parseApprovalCallback(`mrpr:${TOKEN}:approve`)).toBe(TOKEN);
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve`, 'mrpr')).toBe(TOKEN);
   });
   it('未知 op（reject / 其他）→ null', () => {
-    expect(parseApprovalCallback(`mrpr:${TOKEN}:reject`)).toBeNull();
-    expect(parseApprovalCallback(`mrpr:${TOKEN}:delete`)).toBeNull();
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:reject`, 'mrpr')).toBeNull();
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:delete`, 'mrpr')).toBeNull();
   });
   it('错前缀 → null', () => {
-    expect(parseApprovalCallback(`xxxx:${TOKEN}:approve`)).toBeNull();
+    expect(parseCallbackByPrefix(`xxxx:${TOKEN}:approve`, 'mrpr')).toBeNull();
   });
   it('非法 token 字符集/长度 → null', () => {
-    expect(parseApprovalCallback('mrpr:SHORT:approve')).toBeNull();
-    expect(parseApprovalCallback('mrpr:A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6:approve')).toBeNull(); // 大写
-    expect(parseApprovalCallback(`mrpr:${TOKEN}z:approve`)).toBeNull(); // 33 位
+    expect(parseCallbackByPrefix('mrpr:SHORT:approve', 'mrpr')).toBeNull();
+    expect(parseCallbackByPrefix('mrpr:A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6:approve', 'mrpr')).toBeNull(); // 大写
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}z:approve`, 'mrpr')).toBeNull(); // 33 位
   });
   it('多余分段（塞金额）→ null', () => {
-    expect(parseApprovalCallback(`mrpr:${TOKEN}:approve:9999`)).toBeNull();
+    expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve:9999`, 'mrpr')).toBeNull();
   });
 });
 
@@ -290,9 +290,8 @@ describe('parseCallbackByPrefix（mrpr / mrud 两前缀）', () => {
   it('mrud:<token>:approve + prefix=mrud → 返回 token', () => {
     expect(parseCallbackByPrefix(`mrud:${TOKEN}:approve`, 'mrud')).toBe(TOKEN);
   });
-  it('mrpr:<token>:approve + prefix=mrpr → 返回 token（与 parseApprovalCallback 一致）', () => {
+  it('mrpr:<token>:approve + prefix=mrpr → 返回 token', () => {
     expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve`, 'mrpr')).toBe(TOKEN);
-    expect(parseApprovalCallback(`mrpr:${TOKEN}:approve`)).toBe(TOKEN);
   });
   it('prefix 与 data 首段不符 → null', () => {
     expect(parseCallbackByPrefix(`mrpr:${TOKEN}:approve`, 'mrud')).toBeNull();
@@ -360,29 +359,8 @@ describe('handleApprovalCallback 前缀分流（mrud → applyUrlDriftReview）'
     }
   });
 
-  it('mrud 非白名单 from.id → 拒、不调 applyUrlDriftReview（鉴权在 DB 往返前）', async () => {
-    const applyUrlDriftReview = makeApplyUrlDrift();
-    const { ctx, answerCallbackQuery } = makeCtx(`mrud:${TOKEN}:approve`, 999);
-
-    await handleApprovalCallback(ctx, deps(makeApplyReview(), applyUrlDriftReview));
-
-    expect(applyUrlDriftReview).not.toHaveBeenCalled();
-    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无批准权限' });
-  });
-
-  it('mrud 非目标 chat → 拒、不调 applyUrlDriftReview（通道绑定）', async () => {
-    const applyUrlDriftReview = makeApplyUrlDrift();
-    const { ctx, answerCallbackQuery } = makeCtx(
-      `mrud:${TOKEN}:approve`,
-      111,
-      999999,
-    );
-
-    await handleApprovalCallback(ctx, deps(makeApplyReview(), applyUrlDriftReview));
-
-    expect(applyUrlDriftReview).not.toHaveBeenCalled();
-    expect(answerCallbackQuery).toHaveBeenCalledWith({ text: '无权限' });
-  });
+  // 注：mrud 的鉴权(非白名单 from.id)与通道绑定(非目标 chat)在 prefix 分流**之前**跑、与前缀无关，
+  // 已由上方 handleApprovalCallback 的 mrpr 版用例覆盖，不再按前缀各测一遍。
 
   it('mrud 非法 token → 拒、不调任一 apply（解析在鉴权/DB 之前）', async () => {
     const applyReview = makeApplyReview();
