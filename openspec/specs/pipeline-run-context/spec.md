@@ -1,7 +1,7 @@
 # pipeline-run-context 规范
 
 ## 目的
-待定 - 由归档变更 add-run-context-seam 创建。归档后请更新目的。
+定义流水线运行上下文接缝(run-context seam)的契约:driver 无关核心 + 薄 run(ctx) 包装,RunContext 镜像目标脊柱形状但不依赖它,lane 业务与 BullMQ driver 在直接 import 层解耦,按 lane 实有阶段发射 run-event 与结局。
 ## 需求
 ### 需求:driver 无关核心 + 薄 run(ctx) 包装
 

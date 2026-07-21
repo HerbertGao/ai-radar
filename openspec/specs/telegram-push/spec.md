@@ -1,7 +1,7 @@
 # telegram-push 规范
 
 ## 目的
-待定 - 由变更 minimal-intel-pipeline 同步创建。归档后请更新目的。
+定义 Telegram 推送契约:单通道日报推送、推送幂等按 event 粒度(UNIQUE 约束兜底防重发)、日报任务全局单例,防重复与刷屏。
 ## 需求
 ### 需求:Telegram 单通道日报推送
 

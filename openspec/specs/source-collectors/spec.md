@@ -1,7 +1,7 @@
 # source-collectors 规范
 
 ## 目的
-待定 - 由变更 minimal-intel-pipeline 同步创建。归档后请更新目的。
+定义源采集器契约:三源(RSS / arXiv / 官方 feed)确定性采集、源内幂等、外部调用带重试与错误日志、RSS 来源按厂商标记、arXiv 遵守限流与退避、RSS 源分层且次级源噪音治理。
 ## 需求
 ### 需求:三源确定性采集
 

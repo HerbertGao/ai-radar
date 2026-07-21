@@ -1,7 +1,7 @@
 # dedup-and-normalization 规范
 
 ## 目的
-待定 - 由变更 minimal-intel-pipeline 同步创建。归档后请更新目的。
+定义去重与规范化契约:URL 规范化生成 canonical_url(剥 utm/ref 等追踪参数)、标题归一化生成 title_hash、按 dedup_key 硬去重塌缩重复条目,不可处理条目有确定性兜底。
 ## 需求
 ### 需求:URL 规范化生成 canonical_url
 

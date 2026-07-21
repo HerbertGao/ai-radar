@@ -1,7 +1,7 @@
 # chinese-digest-agent 规范
 
 ## 目的
-待定 - 由变更 minimal-intel-pipeline 同步创建。归档后请更新目的。
+定义中文摘要 Agent 的契约:把入库事件生成结构化中文摘要(headline / summary / 要点),输出经 schema 校验、校验失败可观测且不污染推送,且摘要须以原文正文 grounding、无正文时不编造。
 
 ## 需求
 
