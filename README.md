@@ -240,7 +240,7 @@ flowchart LR
 | **P2** | 扩源 + 双通道 + 产品发现 | 多源、飞书也通、每日 AI 产品发现、实时告警、周报 |
 | **P3** | 语义去重 + 知识库 | 跨源/跨语言同事件合并、精选可检索 |
 | **P4** | MCP 查询入口 | 在 Claude/Cursor 里查情报、人工干预（与 P3 并行） |
-| **P5** ✅ | **Model Radar（编程订阅比价 + 选型）** | 编程订阅 / Coding Plan / Token 包比价页 + 「接 Claude Code 用哪个国产模型最划算」选型；10s 内答「谁含 GLM-4.6 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」；5a–5e + 答案优先 Web + 5e v2 RAG 证据解释层全部落地归档 |
+| **P5** ✅ | **Model Radar（编程订阅比价 + 选型）** | 编程订阅 / Coding Plan / Token 包比价页 + 「接 Claude Code 用哪个国产模型最划算」选型；10s 内答「谁含 GLM-4.6 / 谁支持 Claude Code / 同档谁最划算 / 谁最近变了」；5a–5e + 答案优先 Web + 5e v2 RAG 证据解释层 + browser 档 URL-drift agent（agent 提候选 → Telegram HITL 批准 → setSourceUrl 改源 URL）全部落地归档 |
 | **P6** | 泛化选型顾问（下一里程碑） | "做某事用哪个 AI 工具" 的首选/备选/不推荐/落地步骤（Model Radar 超集） |
 | P7 | Web 控制台（可选，延后） | 人工干预面板 |
 

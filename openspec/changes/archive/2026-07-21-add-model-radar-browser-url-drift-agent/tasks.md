@@ -72,5 +72,5 @@
 
 ## 12. 文档
 
-- [ ] 12.1 本变更归档后，更新 `openspec/specs/model-radar-ingestion/spec.md`（新增「mr_source.source_url 的授权写入口 setSourceUrl」需求 + 「browser 档 URL drift 由独立 agent lane 处理」场景）与 `openspec/specs/model-radar-price-curation/spec.md`（「mr_price_review 待批记录」需求加通用 capability token 段 + 「Telegram 一键批准」需求加前缀分流段 + 新增 `mrud` 路由场景）；`openspec/specs/model-radar-url-drift-agent/spec.md` 是新能力（归档时新建）
-- [ ] 12.2 README / ROADMAP（如有 Model Radar 段）：补一句「browser 档 URL-drift agent 已交付（agent propose 候选 + Telegram HITL gate 批准 + setSourceUrl 改 URL；C4 ruled fact 调和：同 allowlist 域内 drift 才参与、跨域走 PR 流程）」
+- [x] 12.1 本变更归档后，更新 `openspec/specs/model-radar-ingestion/spec.md`（新增「mr_source.source_url 的授权写入口 setSourceUrl」需求 + 「browser 档 URL drift 由独立 agent lane 处理」场景）与 `openspec/specs/model-radar-price-curation/spec.md`（「mr_price_review 待批记录」需求加通用 capability token 段 + 「Telegram 一键批准」需求加前缀分流段 + 新增 `mrud` 路由场景）；`openspec/specs/model-radar-url-drift-agent/spec.md` 是新能力（归档时新建）
+- [x] 12.2 README / ROADMAP（如有 Model Radar 段）：补一句「browser 档 URL-drift agent 已交付（agent propose 候选 + Telegram HITL gate 批准 + setSourceUrl 改 URL；C4 ruled fact 调和：同 allowlist 域内 drift 才参与、跨域走 PR 流程）」
