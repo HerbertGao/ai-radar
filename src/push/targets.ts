@@ -9,9 +9,11 @@
  *
  * 权威全集（spec platform-foundation 显式声明）：
  * - `target_type` = `{event, product, alert, weekly, experience}`
- *   —— `paper`/`repo` 不在范围（arXiv 论文仅采集沉淀、不推送）；`alert`/`weekly` 是 P2
- *      相对 QA §8.6 注释的有意新增（实时告警 / 周报各需独立幂等命名空间）；`experience`
- *      是 add-ai-blogger-experience-mining 新增（AI 博主经验的实践锦囊推送需独立幂等命名空间）。
+ *   —— `paper`/`repo` 不在范围（arXiv 论文仅采集沉淀、不推送）；`alert` 是 P2 相对 QA §8.6
+ *      注释的有意新增（实时告警需独立幂等命名空间）；`experience` 是
+ *      add-ai-blogger-experience-mining 新增（AI 博主经验的实践锦囊推送需独立幂等命名空间）。
+ *      **`weekly` 是保留成员、无写入方**——周报车道已删除，成员保留仅因删它要连带 DB CHECK
+ *      迁移；不得被新推送路径复用（新路径扩新成员，别蹭这个空位）。
  * - `channel` = `{telegram, feishu}`
  *   —— Telegram 必配、飞书可选。
  */
@@ -57,7 +59,7 @@ export const TARGET_TYPE = {
  *
  * 排除项各有各的理由——`ops-alert` 只是其中之一，别把它读成唯一排除项：
  * - `alert`：**业务**推送，但走实时重大发布告警链（06:00 起每 15 分钟一轮），不是日报内容；
- * - `weekly`：周报，独立幂等命名空间、独立一条消息；
+ * - `weekly`：保留成员、无写入方（周报车道已删除），排除它是防御性的、不因当前无写入方而省；
  * - `experience`：实践锦囊，独立一条消息；
  * - `ops-alert`：**运维**告警，与业务推送共用 push_records 的幂等地基，压根不是业务内容。
  *
