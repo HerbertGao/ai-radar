@@ -280,7 +280,7 @@ export interface RunDailyWorkflowResult {
   /**
    * 语义去重阶段统计（**仅可观测**，绝不影响 outcome / 熔断；P3 语义层，6.1）。
    * 语义降级（embedding/检索/LLM judge/合并冲突）一律「不合并」、不抛断、不计入 judge/digest
-   * 熔断分母（语义层独立）。`SEMANTIC_DEDUP_ENABLED=off` 或阶段未执行（如未抢到锁提前返回）时为 undefined。
+   * 熔断分母（语义层独立）。阶段未执行（如未抢到锁提前返回）时为 undefined。
    */
   semantic?: SemanticMergeResult;
   /**
@@ -601,12 +601,12 @@ export async function runDailyWorkflow(
     //    存活者通常为前日已 push 的较早事件，push 候选「从未以该 channel success」据此跳过、同事件次日不重推），
     //    且被吞 tombstone 须在 value-judge 候选 SELECT 前置就位才不会被复活评分（tombstone 排除已由组 4.7 收口）。
     //    **仅日报链调用**：实时告警链（alert-scan.ts）恒走硬去重快路径、不调本阶段（6.3）。
-    //    **SEMANTIC_DEDUP_ENABLED 开关**：为 'off' 时整阶段跳过，退回纯硬去重态、其余阶段照常（spec「开关关闭退回硬去重」）。
     //    **降级安全 + 不进熔断分母**：semanticMergeEvents 内部逐事件 catch（embedding/检索/LLM judge/合并冲突
     //    一律「不合并」、保留独立、不抛断），故本编排对语义阶段不构造 StageDegrade、不传 stageShouldAbort、
     //    绝不进 DEGRADE_ABORT_RATIO 分母（熔断分母仍只含 judge + digest 两阶段，语义层独立）；统计仅记日志（可观测）。
     let semanticResult: SemanticMergeResult | undefined;
-    if (env.SEMANTIC_DEDUP_ENABLED === 'on') {
+    // ponytail: 语义层无条件执行；裸块仅为限定下方临时变量（thisRoundDedupKeys / thisRoundEventIds）作用域。
+    {
       // 嵌入顺序须「先嵌本轮新事件」（保今日新事件本轮即可作查询对象，spec「嵌入顺序」）：把本轮 collapse
       // 可处理 outcomes 的 dedup_key 解析为「仍 embedding IS NULL 且非 tombstone」的事件 id 集传入。
       // collapse outcomes 不直接给 event_id（仅 dedup_key），故经 dedup_key 反查；空集时 bootstrap 退化为
@@ -646,8 +646,6 @@ export async function runDailyWorkflow(
           `LLM 不合并 ${semanticResult.llmNotMerged} 条, 护栏否决 ${semanticResult.vetoedByGuard} 条, 异常跳过 ${semanticResult.skippedError} 条, ` +
           `embedding(候选 ${semanticResult.embedding.candidates}/嵌入 ${semanticResult.embedding.embedded}/失败 ${semanticResult.embedding.failed})（不计入熔断）`,
       );
-    } else {
-      console.error('[pipeline] 语义去重: SEMANTIC_DEDUP_ENABLED=off，跳过语义层（退回纯硬去重）');
     }
 
     // ── 阶段 3：Value Judge 逐条（只送判未评分事件）。单条降级整批继续（G3 内已容错）。

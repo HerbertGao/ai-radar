@@ -373,10 +373,6 @@ const envSchema = z.object({
   // 整 job 重试次数（BullMQ 作整 job 重试外壳，不拆阶段队列，design D7）。
   DAILY_DIGEST_JOB_ATTEMPTS: z.coerce.number().int().positive().default(3),
 
-  // 周报调度开关：默认 'false'（暂禁用，待打磨后改 'true' 启用）。
-  // 关闭时 worker 不注册/启动 weekly-report 调度链；周报实现与测试保留、随时可开。
-  WEEKLY_REPORT_ENABLED: z.enum(['true', 'false']).default('false'),
-
   // --- Collector 源清单（source-collectors）---
   // 带 vendor 标记的 RSS feed 配置：逗号分隔多个 `url|vendor` 条目（vendor 可空），
   // 解析为 {url, vendor}[]；旧裸 URL 格式（无 `|`）启动即报错（design D2）。可为空（空则该源不采）。
@@ -499,10 +495,6 @@ const envSchema = z.object({
   // 语义去重候选时间窗（天数，design D4）：仅在 first_seen_at >= now()-此值 的窗内检索 KNN 候选 + 补嵌。
   // 默认 14（跨天去重需比历史存活者）。非法值（NaN/负/0）启动即报错。
   SEMANTIC_WINDOW_DAYS: z.coerce.number().int().positive().default(14),
-  // 语义去重总开关（design「迁移计划·回滚」）：'on' 启用语义合并阶段；'off' 跳过、退回硬去重态。
-  // 默认 'on'。仅日报链调用语义层（告警链恒走硬去重快路径，不受此开关影响）。
-  SEMANTIC_DEDUP_ENABLED: z.enum(['on', 'off']).default('on'),
-
   // 知识库语义检索 baseline（add-kb-retrieval-baseline，design D3）：searchKb top-k 缺省值。
   // 检索原语内还会双向归一化到 [1,50] 整数（防直调传 0/负/小数致非法 LIMIT），本值只是缺省起点。
   // 非法值（NaN/负/0/小数）启动即报错（守 env 不变量）。
@@ -632,7 +624,7 @@ const envSchema = z.object({
   // ─── Model Radar 5e（add-model-radar-recommender-rag-explanation）推荐器解释层选择 ───
   // 解释层：'template'（v1 纯模板、零成本、恒可回落）| 'llm'（v2 可选 LLM 证据叙述段，恒可回落模板）。
   // 默认 'template' ⇒ 部署即惰性（生产开启是独立运营动作）；权威结论与数字恒出程序侧（模板段），
-  // llm 仅补非权威背景叙述。仿本仓开关惯例（WEEKLY_REPORT_ENABLED / ALERT_SCAN_ENABLED）。
+  // llm 仅补非权威背景叙述。仿本仓开关惯例（ALERT_SCAN_ENABLED）。
   MR_RECOMMEND_EXPLAIN: z.enum(['template', 'llm']).default('template'),
 
   // ─── Model Radar 5e 成本边界（add-model-radar-explain-public-cost-bound，design D3）───
@@ -846,15 +838,6 @@ export const env: Env = parseEnv(process.env);
  */
 export function isFeishuEnabled(e: Env = env): boolean {
   return Boolean(e.FEISHU_WEBHOOK_URL && e.FEISHU_SIGN_SECRET);
-}
-
-/**
- * 周报调度是否启用。默认禁用（暂缓打磨）；启用时 worker 才注册/启动 weekly-report 调度链。
- *
- * @param e 已校验 env（默认全局 env；测试可注入局部 env）。
- */
-export function isWeeklyReportEnabled(e: Env = env): boolean {
-  return e.WEEKLY_REPORT_ENABLED === 'true';
 }
 
 export function isAlertScanEnabled(e: Env = env): boolean {

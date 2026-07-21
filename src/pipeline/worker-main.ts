@@ -1,16 +1,15 @@
 /**
- * BullMQ 常驻运行时入口（daily-intel-pipeline / realtime-alerts / product-discovery /
- * weekly-report）—— `npm run worker` 执行本文件。
+ * BullMQ 常驻运行时入口（daily-intel-pipeline / realtime-alerts / product-discovery）
+ * —— `npm run worker` 执行本文件。
  *
- * 把已有导出接成一个常驻进程：为三条**独立并列**的调度链各注册 cron 重复任务 + 启动 worker。
+ * 把已有导出接成一个常驻进程：为多条**独立并列**的调度链各注册 cron 重复任务 + 启动 worker。
  * 本文件只做 wiring（编排已实现的工厂），不含任何业务逻辑——业务全在各自的 run* 函数
- * （runDailyWorkflow / runAlertScan / runWeeklyReport，纯顺序，由 worker await）。
+ * （runDailyWorkflow / runAlertScan 等，纯顺序，由 worker await）。
  * 产品发现已合并进日报链（日报内含「新品段」），不再有独立 product-digest 调度链。
  *
- * 三条调度链（互不嵌套、各自独立队列/worker/cron）：
+ * 调度链（互不嵌套、各自独立队列/worker/cron；告警与各 Model Radar 链按 env 门控注册）：
  *   1. 日报      daily-digest    每日 DAILY_DIGEST_CRON（含新闻要闻段 + 产品新品段）
  *   2. 实时告警  alert-scan      每 ALERT_SCAN_CRON（默认 4-59/15，15 分钟节奏）
- *   3. 周报      weekly-report   每周 DEFAULT_WEEKLY_CRON（每周一 09:07）
  *
  * 用法：
  *   npm run worker   # 常驻：三条链按各自 cron 定时触发。Ctrl-C 退出。
@@ -34,11 +33,6 @@ import {
   createAlertScanWorker,
   buildAlertConnection,
 } from './alert-queue.js';
-import {
-  createWeeklyReportQueue,
-  scheduleWeeklyReport,
-  createWeeklyReportWorker,
-} from './weekly-queue.js';
 import {
   createEventReviewQueue,
   scheduleEventReview,
@@ -74,7 +68,6 @@ import { Bot } from 'grammy';
 import {
   env,
   isAlertScanEnabled,
-  isWeeklyReportEnabled,
   isMrEventReviewEnabled,
   isMrScrapeEnabled,
   isMrStalenessEnabled,
@@ -168,16 +161,6 @@ async function main(): Promise<void> {
     await scheduleAlertScan(queue);
     const worker = createAlertScanWorker({ connection });
     lanes.push({ name: 'alert-scan', worker, queue, connection });
-  }
-
-  // ── 链 3：周报 weekly-report（周级 cron，独立单例锁按 iso_week 兜底并发）。
-  //    默认禁用（WEEKLY_REPORT_ENABLED='false'，暂缓打磨）；实现与测试保留、改 env 即启用。
-  if (isWeeklyReportEnabled()) {
-    const connection = buildConnection();
-    const queue = createWeeklyReportQueue(connection);
-    await scheduleWeeklyReport(queue);
-    const worker = createWeeklyReportWorker({ connection });
-    lanes.push({ name: 'weekly-report', worker, queue, connection });
   }
 
   // ── 链 4：Model Radar 事件复核 mr-event-review（事件流触发复核，独立连接 buildEventReviewConnection）。

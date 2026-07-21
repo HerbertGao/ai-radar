@@ -12,13 +12,11 @@ import type { SelectedEvent } from '../../selection/top-n.js';
 import {
   buildDigestMessage,
   buildFeishuCard,
-  buildWeeklyFeishuCard,
   escapeLarkMdUrl,
   escapeMarkdownV2Url,
   renderDailyDigest,
   renderDigest,
   type FeishuCard,
-  type WeeklySelectedEvent,
 } from '../message.js';
 
 function ev(id: string, overrides: Partial<SelectedEvent> = {}): SelectedEvent {
@@ -485,22 +483,6 @@ describe('飞书渲染器 URL 段 percent-encode（4 渲染器）', () => {
     const productEl = card.elements[3] as { text: { content: string } };
     assertEscapedLink(eventEl.text.content, PARENS_URL);
     assertEscapedLink(productEl.text.content, BACKSLASH_URL);
-  });
-
-  it('周报 buildWeeklyFeishuCard：[原文] URL 段被 percent-encode', () => {
-    const item: WeeklySelectedEvent = {
-      ...ev('2026-W25'),
-      representativeTitle: 'AI Radar 周报',
-      canonicalUrl: null,
-      weeklyItems: {
-        events: [ev('we1', { canonicalUrl: PARENS_URL })],
-        products: [],
-      },
-    };
-    const rendered = buildWeeklyFeishuCard(item);
-    // elements: [本周要闻段标题, 要闻块]。
-    const el = rendered.card.elements[1] as { text: { content: string } };
-    assertEscapedLink(el.text.content, PARENS_URL);
   });
 
   it('防过度转义：干净 URL 渲染后原样（含 ? = / : 不被编码）', () => {
