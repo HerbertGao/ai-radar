@@ -33,6 +33,9 @@ coverage/
 .claude/settings.local.json
 .claude/**/settings.local.json
 
+# Trae 编辑器的 OpenSpec host 集成（个人编辑器、非团队跟踪集；仓库标准化在 .claude/ host）
+.trae/
+
 # Playwright MCP 工作目录（抓取/数据核对时的临时产物）
 .playwright-mcp/
 
