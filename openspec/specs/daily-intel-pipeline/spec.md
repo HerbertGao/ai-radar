@@ -13,7 +13,7 @@
 
 多通道分发必须**并发**（`Promise.allSettled`）各走一遍 telegram-push 定义的「待发集合→pending→原子送达→success/failed」状态机，单通道发送失败必须隔离（记录该 channel failed、不拖垮另一通道），各通道幂等按 channel 独立。整 job 由单例锁（`daily-digest:{push_date}`）防双实例，TTL 须覆盖含多通道并发分发的最坏时长（见 telegram-push「日报任务全局单例」）。**Telegram 为必配通道**：「已配置通道」集**至少含 `telegram`**、不可为空（飞书可选，见 feishu-push）；若 Telegram 必需配置缺失则按 P1 既有 env 校验启动快速失败，禁止「已配置通道集为空 → 日报静默无出口」。
 
-实时告警（realtime-alerts）、周报（weekly-report）必须由**独立的定时/触发任务**承载，**不得**塞进 `runDailyWorkflow()` 的单一顺序链，也不得与日报各阶段相互投递构成复杂队列图——它们是与日报并列的独立调度入口，各自遵守其能力规范的幂等口径。**产品发现（product-discovery）已并入日报链作为「新品段」**（见下），不再是独立调度任务。每日定时 cron 默认触发时刻不得卡在整点/半点（降低飞书 11232 限流）。
+实时告警（realtime-alerts）必须由**独立的定时/触发任务**承载，**不得**塞进 `runDailyWorkflow()` 的单一顺序链，也不得与日报各阶段相互投递构成复杂队列图——它是与日报并列的独立调度入口，遵守其能力规范的幂等口径。**产品发现（product-discovery）已并入日报链作为「新品段」**（见下），不再是独立调度任务。每日定时 cron 默认触发时刻不得卡在整点/半点（降低飞书 11232 限流）。
 
 **日报内承载产品「新品段」**：日报顺序子流程在新闻链之后、早退判断之前增产品子段，分两步（塌缩单实例、候选 per-channel）：① 产品 raw_items 已由采集阶段 `collectAndStore`（→`collectAllSources` 全集，含 PH/Show HN）覆盖，无需额外产品采集入口；② **产品塌缩一次（channel-blind）**：在 channel 展开之前调一次 `collapseUncollapsedProductRawItems`（import 自 `src/collectors/product-collapse.ts`；产品塌缩由单实例承载，绝不可随 per-channel 并发跑 N 次；须在产品候选查询之前，使 `merge_conflict` 标记对候选可见），包 try/catch 永不抛错；③ **per-channel 产品候选**：对每个已配置 channel 调既有导出 `selectProductCandidates(channel, dbh, limit)`，结果存 `productsByChannel: Map<Channel, SelectedEvent[]>`（算一次、贯穿早退判断与 dispatch，dispatch 不重算），候选查询包 try/catch 失败降级空段。产品子段不进新闻评分/摘要熔断分母（产品段拿不到 judge/digest 累加变量、作用域天然隔离）、不复用新闻 Top N 名额。塌缩与候选各自永不向上抛，「产品失败不拖垮新闻」由此结构契约保证。
 
@@ -43,9 +43,9 @@
 - **当** 多通道分发时某一通道（如飞书）发送失败
 - **那么** 该通道记录 failed 并隔离，另一通道照常完成推送，整 job 不因单通道失败而漏发另一通道
 
-#### 场景:告警/周报独立调度、产品并入日报新品段
-- **当** 检视产品发现、实时告警、周报的触发方式
-- **那么** 实时告警、周报由独立定时/触发任务承载，不嵌入 `runDailyWorkflow()` 单一顺序链、不与日报阶段构成相互投递队列；产品发现已并入日报链作为新品段（不再独立调度）
+#### 场景:告警独立调度、产品并入日报新品段
+- **当** 检视产品发现、实时告警的触发方式
+- **那么** 实时告警由独立定时/触发任务承载，不嵌入 `runDailyWorkflow()` 单一顺序链、不与日报阶段构成相互投递队列；产品发现已并入日报链作为新品段（不再独立调度）
 
 #### 场景:日报顺序子流程含产品塌缩与候选
 - **当** 日报触发

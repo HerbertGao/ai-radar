@@ -15,9 +15,9 @@
 - **当** 一条候选事件送入知识摘要 Agent
 - **那么** 返回经 Zod 校验的 `{ kb_title, summary_zh, tags, entities, source_urls, event_date, long_term_value }`
 
-#### 场景:新闻事件入库回写 summary_zh 供 weekly 复用
+#### 场景:新闻事件入库回写 summary_zh 供下游复用
 - **当** 一条已推送新闻事件经 KB 入库、其 `ai_news_events.summary_zh` 为空
-- **那么** 知识摘要 Agent grounding 于原文产出 `summary_zh`，程序以 `UPDATE ... WHERE event_id`（`set` 仅含 `summary_zh`）回写，weekly 报告后续零 LLM 复用该值；即便该事件 `long_term_value < 70` 未入 KB，回写仍发生
+- **那么** 知识摘要 Agent grounding 于原文产出 `summary_zh`，程序以 `UPDATE ... WHERE event_id`（`set` 仅含 `summary_zh`）回写，告警链渲染回退链（`alert-scan.ts` 的 headline_zh → summary_zh 回退）等下游后续零 LLM 复用该值；即便该事件 `long_term_value < 70` 未入 KB，回写仍发生
 
 #### 场景:summary_zh 已存在时 Agent 照常跑、回写不覆盖
 - **当** 某新闻事件入库时 `ai_news_events.summary_zh` 已非空（如告警链已产），知识摘要 Agent **仍照常运行**产出 `long_term_value`（供准入闸）

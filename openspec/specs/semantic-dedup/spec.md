@@ -111,15 +111,15 @@ published_at_authority = GREATEST(存活.published_at_authority, 被吞.publishe
 
 ### 需求:语义去重仅作用于日报链新闻事件
 
-系统的 embedding 相似度层、LLM 二次判断层与事件合并必须**仅在日报链**执行（在硬去重塌缩之后、value-judge 之前），实时告警高频链保持硬去重快路径、不做语义去重（对齐既有"仅日报链"的熔断模式）。语义层必须仅作用于 `ai_news_events`（新闻事件），不作用于 `ai_products`（产品仍沿用确定性硬规则合并）。系统必须提供 `SEMANTIC_DEDUP_ENABLED` 开关（默认开），关闭时退回纯硬去重而不影响其余链路。
+系统的 embedding 相似度层、LLM 二次判断层与事件合并必须**仅在日报链**执行（在硬去重塌缩之后、value-judge 之前），实时告警高频链保持硬去重快路径、不做语义去重（对齐既有"仅日报链"的熔断模式）。语义层必须仅作用于 `ai_news_events`（新闻事件），不作用于 `ai_products`（产品仍沿用确定性硬规则合并）。语义层必须**无条件执行**、不设启停开关（原 `SEMANTIC_DEDUP_ENABLED` 门控已随该层转正删除）；其正确性由阈值与确定性护栏保障，不由运行期开关兜底。
 
 #### 场景:告警链不触发语义合并
 - **当** 实时告警链运行硬去重塌缩
 - **那么** 不执行 embedding 相似度/LLM 判断/事件合并，仅按硬去重 + 一生一次幂等告警
 
-#### 场景:开关关闭退回硬去重
-- **当** `SEMANTIC_DEDUP_ENABLED` 为关
-- **那么** 日报链跳过语义层、仅做硬去重塌缩，流水线其余阶段照常运行
+#### 场景:日报链无条件执行语义层
+- **当** 日报链完成硬去重塌缩
+- **那么** 语义层照常执行，不存在可跳过它的运行期开关（grep 全仓无 `SEMANTIC_DEDUP_ENABLED`）
 
 ### 需求:tombstone 对所有下游消费者不可见（合并的核心闭环）
 
@@ -134,7 +134,6 @@ declared-coverage（合并闭环所需的全部受影响读点）必须覆盖以
 | `src/agents/value-judge/score-events.ts`（候选 SELECT `importance_score IS NULL`；claim CAS `UPDATE … WHERE event_id=? AND importance_score IS NULL …`；评分写 CAS `UPDATE … SET *_score/should_push WHERE event_id=?`） | 选未评分事件送判 | 候选 SELECT **与 claim CAS、评分写 CAS 三处 `WHERE` 都**加 `AND merged_into IS NULL`——**不可只在 SELECT/claim 收口**：告警链跑 `scoreUnscoredEvents` 不持日报锁，SELECT→claim→评分写均为分离语句，任一间隙日报链都可把 B 置 tombstone（TOCTOU）；谓词落每个 CAS 自身 `WHERE` 才使「tombstone 绝不被 claim/评分/复活」成立 |
 | `src/selection/top-n.ts`（Top N 候选 SELECT） | 选日报推送候选 | 加 `AND merged_into IS NULL`——tombstone 绝不入选推送 |
 | `src/agents/published-at-inference/backfill.ts`（候选 SELECT 与回填 CAS `UPDATE … WHERE event_id=? AND published_at IS NULL …`） | 回填 published_at | 候选 SELECT **与回填 CAS 的 `WHERE` 都**加 `AND merged_into IS NULL`——同 value-judge 的 TOCTOU 理由（告警链 `backfillPublishedAt` 不持日报锁），谓词必须落 CAS 自身 `WHERE`，不浪费推断预算、不在 tombstone 落 `published_at` |
-| `src/pipeline/weekly-report.ts`（周报 SELECT） | 周报聚合 | 加 `AND merged_into IS NULL`——不重复计数被合并事件 |
 | `src/pipeline/alert-scan.ts`（告警候选 SELECT） | 实时告警候选 | 加 `AND merged_into IS NULL`——不对已被日报链合并掉的死 event_id 告警 |
 | `src/mcp/tools/source-quality.ts`（`count(distinct event_id)`） | 来源质量统计 | 加 `AND merged_into IS NULL`——不因 tombstone 虚增「事件数」 |
 | `src/mcp/tools/search-events.ts` / `get-today.ts` / `mark-event.ts` / `push-event-now.ts` | MCP 查询/标记/手动推送 | 排除 tombstone——不向 agent/用户暴露重复行、不手动推 tombstone、不在 tombstone 上落写 |
@@ -152,9 +151,9 @@ declared-coverage（合并闭环所需的全部受影响读点）必须覆盖以
 - **当** 告警链（无日报锁）候选 SELECT 已选中 B，其后日报链把 B 置 `merged_into=A`，告警链再执行 claim CAS / 评分写 CAS / 回填 CAS（含 claim 成功后、评分写前 B 才被置 tombstone 的链内二次 TOCTOU）
 - **那么** 各 CAS 自身 `WHERE … AND merged_into IS NULL` 不满足、命中 0 行：B 不被 claim、不送 LLM 评分、`*_score`/`should_push` 不被写、`published_at` 不被回填，tombstone 绝不复活（SELECT→claim→评分写的每个 TOCTOU 间隙都被各 CAS 自带谓词兜住）
 
-#### 场景:tombstone 不出现在告警/周报/MCP 查询/KB/统计
+#### 场景:tombstone 不出现在告警/MCP 查询/KB/统计
 - **当** 一条 tombstone 事件存在于 `ai_news_events`
-- **那么** 告警候选、周报聚合、MCP `search-events`/`get-today` 结果、KB 入库候选、`source-quality` 的 `count(distinct event_id)` 统计均不包含它（各读点带 `merged_into IS NULL`）
+- **那么** 告警候选、MCP `search-events`/`get-today` 结果、KB 入库候选、`source-quality` 的 `count(distinct event_id)` 统计均不包含它（各读点带 `merged_into IS NULL`）
 
 ### 需求:合并前确定性精度护栏（数字/版本 token）
 

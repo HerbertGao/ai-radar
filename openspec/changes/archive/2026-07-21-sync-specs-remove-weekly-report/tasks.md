@@ -21,6 +21,6 @@
 ## 3. 验收与归档
 
 - [x] 3.1 `git diff` 逐份人工过一遍：确认**无运行时代码行为改动**（任务组 2 若做，diff 只含注释行）。
-- [ ] 3.2 走 `/opsx:archive`：delta 并入主规范，`openspec/specs/weekly-report/` 目录随归档删除。
-- [ ] 3.3 归档后 `openspec-cn validate --specs --strict` 全绿，且谱数为 **31**（原 32 减去 weekly-report 一谱）。数目对不上说明 REMOVED 没生效或误删了别的谱。
-- [ ] 3.4 归档后再跑一次 1.4 的 grep 复核（归档合并可能引入新的残留）。
+- [x] 3.2 走 `/opsx:archive`：delta 并入主规范，`openspec/specs/weekly-report/` 目录随归档删除。**实际走法**：归档器禁止 MODIFIED 删除/改名场景（`specs-apply.js` 的场景超集闸），而本变更有 2 个场景必须真删（`semantic-dedup` 的「开关关闭退回硬去重」、`pipeline-run-context` 的「weekly 时间线」——正文描述的东西已不存在）；`REMOVED + ADDED` 同名需求被判冲突、改名又会把需求块挪到 spec 末尾打乱顺序。经用户裁决改为 `archive --yes --skip-specs` + 脚本按 delta 逐块替换主规范（保序、不改需求名），并逐块断言主规范与 delta **逐字节一致**（11/11 通过）作为替代验收闸。
+- [x] 3.3 归档后 `openspec-cn validate --specs --strict` 全绿，且谱数为 **31**（原 32 减去 weekly-report 一谱）。数目对不上说明 REMOVED 没生效或误删了别的谱。
+- [x] 3.4 归档后再跑一次 1.4 的 grep 复核（归档合并可能引入新的残留）。
