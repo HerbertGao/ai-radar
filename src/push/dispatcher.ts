@@ -1,14 +1,18 @@
 /**
  * 推送 Dispatcher（telegram-push 9.2 / 9.3，design D6）。
  *
- * 输入：今日待发名单（事件/产品/告警/周报等，由各 selection 路径产出的 SelectedEvent 视图）。
+ * 输入：今日待发名单（事件/产品/告警/实践锦囊等，由各 selection 路径产出的 SelectedEvent 视图）。
  * 职责：算待发集合 → 事务内为无记录者 INSERT pending（ON CONFLICT DO NOTHING）→
  * 按 channel 渲染一条消息发送 → 单消息原子：成功整批 success / 失败整批 failed（留 error_message）。
  *
  * **(target_type, channel) 双向泛化（P2）**：状态机对所有 target_type ∈ {event,product,alert,
- * weekly,experience} 与 channel ∈ {telegram,feishu} 一致，由调用方传入幂等四元组的
- * `targetType`/`channel`（默认 `event`/`telegram` 向后兼容 P1 调用）。后续产品/告警/周报/实践锦囊
- * 推送只需以各自的 target_type+channel 调用本 dispatch 核心，**不必再编辑本文件**；不同 target_type
+ * weekly,experience} 与 channel ∈ {telegram,feishu} 一致（`weekly` 为保留成员、现无写入方），
+ * 由调用方传入幂等四元组的 `targetType`/`channel`（默认 `event`/`telegram` 向后兼容 P1 调用）。
+ * **此清单是本 dispatch 承载的子集，不是 `targetTypeEnum` 全集**——枚举里还有 `ops-alert`，
+ * 它**不走本文件**：运维告警在 `pipeline/ops-alert-sink.ts` 自带 INSERT + CAS 写 push_records
+ * （共用同一幂等地基、终态口径对齐，但不复用本 dispatch 状态机）。
+ * 后续产品/告警/实践锦囊推送只需以各自的 target_type+channel 调用本 dispatch 核心，
+ * **不必再编辑本文件**；不同 target_type
  * 的「候选谓词」差异在各自的 selection 查询里表达（候选窗口跨天排除，见 top-n / experience-chain），
  * dispatch 只承载「待发集合同日 success 排除 + pending → 原子送达 → success/failed」状态机。
  * `experience` 的渲染分支由 renderDigest 据传入的 targetType 路由（要点=headline_zh、正文=summary_zh）。

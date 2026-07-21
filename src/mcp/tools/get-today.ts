@@ -77,8 +77,8 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
 
     // 1. 当日 success 的推送记录（可按 channel 过滤）。
     //
-    // **必须按 target_type 收口到日报两段**：push_records 的幂等地基被 alert / weekly / experience /
-    // ops-alert 共用，它们都不是日报内容。不过滤时，其中任一条 success 行都会让 records 非空 ⇒ 本工具
+    // **必须按 target_type 收口到日报两段**：push_records 的幂等地基被 alert / experience /
+    // ops-alert 共用（外加保留成员 weekly，现无写入方），它们都不是日报内容。不过滤时，其中任一条 success 行都会让 records 非空 ⇒ 本工具
     // 不再返回「今日尚未推送」，而返回**空要闻段 + 空产品段**，且 channels 被污染成那条推送的通道
     // （见 TODAY_DIGEST_TARGET_TYPES 的排除项清单）。
     const whereConds = [

@@ -1039,7 +1039,7 @@ export async function runDailyWorkflow(
     // 产品段 productsByChannel 在阶段 5.5 **算一次**，此处直接复用 .get(channel)、不重算。
     //
     // 每通道分发**两条独立消息**：① 日报双段（要闻 + 新品，dispatchDailyDigest）；② 实践锦囊
-    // （经验候选，dispatchDigest + targetType='experience'，与 event/product/alert/weekly 各自独立
+    // （经验候选，dispatchDigest + targetType='experience'，与 event/product/alert 各自独立
     // 幂等命名空间、互不挤占）。任一条失败 → 该 channel 视为失败、整 job 抛错触发重试（重试时
     // computePendingSet 排除已 success 条目、只补未发，幂等安全；experience 候选 anti-join 同理跨天/同日不重推）。
     const settled = await Promise.allSettled(

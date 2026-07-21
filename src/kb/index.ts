@@ -12,8 +12,9 @@
  *    供准入闸），绝不因 summary_zh 已存在而跳过；校验不过 / 重试耗尽 → 记日志、**跳过该条不入库、不中止整批**。
  * 3. **回写 summary_zh（降级搬迁）**：Agent 产出的 summary_zh 原子条件回写 `ai_news_events`
  *    `UPDATE ... SET summary_zh WHERE event_id = ? AND summary_zh IS NULL`（幂等 + 抗并发告警链写，
- *    列已非空即不覆盖）——**在准入闸之前**，覆盖所有 push-success 候选（含 `< 70` 未入 KB 者），供 weekly 零 LLM
- *    复用；best-effort、never throw（失败隔离该条、不阻塞已成功推送）。
+ *    列已非空即不覆盖）——**在准入闸之前**，覆盖所有 push-success 候选（含 `< 70` 未入 KB 者），供告警链
+ *    渲染回退链（headline_zh → summary_zh 截断 → representative_title）零 LLM 复用；best-effort、
+ *    never throw（失败隔离该条、不阻塞已成功推送）。
  * 4. **准入闸（程序，5.2）**：仅 `long_term_value >= 70` 入库（QA §13.1 知识库不是垃圾桶）；
  *    准入闸为**程序判定**（非 LLM 决定是否入库）。低于阈值 → 记录为未达阈、跳过。
  * 5. **embedding**：对 `kb_title + summary_zh` 经 embedTexts（复用组 C 低层原语）生成；失败 → 记日志、
