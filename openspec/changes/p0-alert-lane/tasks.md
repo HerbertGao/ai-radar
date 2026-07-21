@@ -187,7 +187,7 @@
 - [x] A6.1 `npm run typecheck` / `lint` / `test` 全绿。
 - [x] A6.2 告警链既有集成测试不因 cron 默认值改动而回归。
 - [x] A6.3 守 `test-no-prod-sends`：本阶段不新增发送路径；确认新增/改动的测试不触真实飞书/Telegram。
-- [ ] A6.4 **合并，车道仍关**（`ALERT_SCAN_ENABLED` 保持 `false`，worker 完全跳过告警链，`src/pipeline/worker-main.ts:156`）。**独立 commit。**
+- [x] A6.4 **合并，车道仍关**（`ALERT_SCAN_ENABLED` 保持 `false`，worker 完全跳过告警链，`src/pipeline/worker-main.ts:156`）。**独立 commit。**
 
 ---
 
