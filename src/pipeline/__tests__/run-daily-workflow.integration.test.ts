@@ -42,10 +42,9 @@ function runDailyWorkflow(options: RunDailyWorkflowOptions = {}) {
 }
 // 产品段零件模块（供 vi.spyOn 注入塌缩/候选桩，验证日报产品段编排：塌缩只调一次、候选失败降级等）。
 const productDigestModule = await import('../product-digest.js');
-// 已校验 env（可变对象，非 frozen）：6.1 off-switch 用例临时改 SEMANTIC_DEDUP_ENABLED 后还原。
 // ALERT_JUDGE_MAX_PER_RUN：告警链判分预算 N（p0-alert-lane A5）——A5.2b 回归钉直接 import 真值，
 // 断言其 fixture 条数 > N（禁抄字面量副本，常量变了用例跟着红）。
-const { env, ALERT_JUDGE_MAX_PER_RUN } = await import('../../config/env.js');
+const { ALERT_JUDGE_MAX_PER_RUN } = await import('../../config/env.js');
 
 const databaseUrl = process.env.DATABASE_URL;
 const redisUrl = process.env.REDIS_URL;
@@ -2086,7 +2085,6 @@ describe.skipIf(!canRun)('runDailyWorkflow 产品中文化编排（阶段 5.5，
  * - 6.1 语义阶段在 collapse 之后、value-judge 之前运行：注入 embedManyFn 桩（恒同向量 → cosine_sim=1
  *   > 0.88 → high-auto 合并）使两个**不同 dedup_key（不硬塌缩）但语义同**的事件合并为一条，
  *   被吞者置 merged_into（tombstone），且 tombstone 不被 value-judge 复活、不进 Top N（组 4.7 闭环）。
- * - 6.1 SEMANTIC_DEDUP_ENABLED=off → 跳过语义层（不调 embedManyFn、不合并），其余阶段照常推送。
  * - 6.1 语义降级（embedding 调用抛错）不抛断、不进 judge/digest 熔断分母、不影响 outcome。
  * - 6.2 KB 入库在 push 成功之后运行：注入 KB Agent 桩产出 long_term_value>=70 → 写入 kb_documents；
  *   候选 = 当日 push success 且非 tombstone（被合并掉的事件不进 KB 候选）。
@@ -2189,48 +2187,6 @@ describe.skipIf(!canRun)('runDailyWorkflow 语义去重 + 知识库接线（组 
     );
     expect(pr).toHaveLength(1);
     expect(pr[0]!.target_id).toBe(survivors[0]!.event_id);
-  });
-
-  it('6.1 SEMANTIC_DEDUP_ENABLED=off → 跳过语义层（不调 embed、不合并），其余阶段照常推送', async () => {
-    const saved = env.SEMANTIC_DEDUP_ENABLED;
-    env.SEMANTIC_DEDUP_ENABLED = 'off';
-    const embedSpy = vi.fn(embedManySame());
-    try {
-      const items = [
-        item({ id: 'off-a', url: 'https://ex.com/off-a', title: 'OpenAI ships GPT' }),
-        item({ id: 'off-b', url: 'https://ex.com/off-b', title: 'OpenAI releases GPT model' }),
-      ];
-      const sender = okSender();
-      const result = await runDailyWorkflow({
-        now: NOW,
-        dbh: db!,
-        collect: { collectors: collectorsReturning(items) },
-        judge: { judge: { generateObjectFn: judgeMock(), maxAttempts: 1 } },
-        digest: { generateObjectFn: digestMock(), maxAttempts: 1 },
-        semantic: { embedding: { embed: { embedManyFn: embedSpy, maxAttempts: 1 } } },
-        kb: { agent: { generateObjectFn: kbAgentMock(), maxAttempts: 1 }, embed: { embedManyFn: embedManySame(), maxAttempts: 1 } },
-        sender,
-        channels: ['telegram'],
-        lock: LOCK_OPTS,
-        alert: vi.fn(),
-      });
-
-      // off：语义阶段整段跳过（result.semantic undefined、embed 桩未被调用、无合并）。
-      expect(result.semantic).toBeUndefined();
-      expect(embedSpy).not.toHaveBeenCalled();
-      // 两事件均无 embedding、均非 tombstone（纯硬去重态）。
-      const { rows } = await pool!.query<{ merged_into: string | null }>(
-        `SELECT merged_into FROM ai_news_events`,
-      );
-      expect(rows).toHaveLength(2);
-      expect(rows.every((r) => r.merged_into === null)).toBe(true);
-      // 其余阶段照常：两条独立事件都进 Top N、正常推送。
-      expect(result.topNCount).toBe(2);
-      expect(result.outcome).toBe('pushed');
-      expect(sender.calls).toBe(1);
-    } finally {
-      env.SEMANTIC_DEDUP_ENABLED = saved;
-    }
   });
 
   it('6.1 语义降级（embedding 抛错）不抛断、不进 judge/digest 熔断分母、不影响 outcome', async () => {

@@ -1,17 +1,17 @@
 /**
  * 出口闸守卫（add-run-context-seam 组 D，任务 4.1/4.2，design D7）。
  *
- * 断言三个 **lane 业务模块**（run-daily-workflow.ts / alert-scan.ts / weekly-report.ts）在
+ * 断言两个 **lane 业务模块**（run-daily-workflow.ts / alert-scan.ts）在
  * **直接 import 层面**无 BullMQ driver 耦合：
  *  - 无 `import ... from 'bullmq'`（含从 bullmq 导入的 `Job`）；
  *  - 无经 `./queue.js` 的连接符号 import（buildConnection 等）；
  *  - 无 `job.data` 用法；
  *  - 无原始 `process.env` 生产流程分支（`env` 单例经 Zod 校验，明确允许——见下 4.1）。
  *
- * driver 文件（queue/alert-queue/weekly-queue/worker.ts）**排除**在断言外——它们合法 import bullmq。
+ * driver 文件（queue/alert-queue/worker.ts）**排除**在断言外——它们合法 import bullmq。
  *
- * 4.1 确认（读码核实，非改码）：三个 lane 业务模块均经 `import { env } from '../config/env.js'`
- *   **就地**读 env 单例（run-daily-workflow.ts:31、alert-scan.ts:46、weekly-report.ts:53），
+ * 4.1 确认（读码核实，非改码）：两个 lane 业务模块均经 `import { env } from '../config/env.js'`
+ *   **就地**读 env 单例（run-daily-workflow.ts:31、alert-scan.ts:46），
  *   未把 env.* 搬进 ctx.config、未改评估时机（lazy-at-stage 不变，design D7 推论）。故本守卫允许 env 单例、
  *   只闸 process.env 原始读——三模块原始 process.env 命中数 = 0。
  *
@@ -26,11 +26,10 @@ import { fileURLToPath } from 'node:url';
 const PIPELINE_DIR = fileURLToPath(new URL('..', import.meta.url));
 const read = (file: string): string => readFileSync(PIPELINE_DIR + file, 'utf8');
 
-/** 三个 lane 业务模块（driver 文件 queue/alert-queue/weekly-queue/worker.ts 排除在外）。 */
+/** 两个 lane 业务模块（driver 文件 queue/alert-queue/worker.ts 排除在外）。 */
 const LANE_BUSINESS_MODULES = [
   'run-daily-workflow.ts',
   'alert-scan.ts',
-  'weekly-report.ts',
 ] as const;
 
 // import 上下文匹配（`from 'x'` 仅出现在 import 语句里，故不误伤裸标识符/类型名）。
@@ -48,7 +47,7 @@ describe('出口闸：lane 业务模块直接 import 无 BullMQ driver 耦合（
     expect(RAW_PROCESS_ENV.test(src), `${file} 含原始 process.env（应走 env 单例）`).toBe(false);
   });
 
-  it('4.1：三个 lane 业务模块就地读 env 单例（import { env } from ../config/env.js）', () => {
+  it('4.1：两个 lane 业务模块就地读 env 单例（import { env } from ../config/env.js）', () => {
     // env 单例读**不搬位置、不改评估时机**（design D7）：断言仍就地 import env（非搬进 ctx.config）。
     for (const file of LANE_BUSINESS_MODULES) {
       expect(/import\s+\{[^}]*\benv\b[^}]*\}\s+from\s+['"]\.\.\/config\/env\.js['"]/.test(read(file)), file).toBe(true);
@@ -56,8 +55,8 @@ describe('出口闸：lane 业务模块直接 import 无 BullMQ driver 耦合（
   });
 
   // 正例对照：守卫的 regex 必须真能在 known-positive driver 文件命中（防 regex 恒不匹配的假绿）。
-  it('正例对照：driver 文件 weekly-queue.ts 命中 bullmq + ./queue.js（证明 regex 有效）', () => {
-    const driver = read('weekly-queue.ts');
+  it('正例对照：driver 文件 worker.ts 命中 bullmq + ./queue.js（证明 regex 有效）', () => {
+    const driver = read('worker.ts');
     expect(BULLMQ_IMPORT.test(driver)).toBe(true);
     expect(QUEUE_CONN_IMPORT.test(driver)).toBe(true);
   });

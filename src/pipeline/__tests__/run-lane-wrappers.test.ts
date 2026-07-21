@@ -30,11 +30,6 @@ import {
   type RunAlertScanOptions,
   type RunAlertScanResult,
 } from '../alert-scan.js';
-import {
-  run as runWeekly,
-  type RunWeeklyReportOptions,
-  type RunWeeklyReportResult,
-} from '../weekly-report.js';
 import { consoleAlertSink } from '../ops-alert-sink.js';
 
 /** 收集 emit 落的 kind 序列（makeLocalCtx.emit → logger.info({ event: kind, ... })）。 */
@@ -120,18 +115,10 @@ const okAlertResult: RunAlertScanResult = {
   dispatched: [],
 };
 
-const okWeeklyResult: RunWeeklyReportResult = {
-  pushDate: '2020-02-03',
-  isoWeek: '2020-W06',
-  eventCount: 0,
-  productCount: 0,
-  channels: [],
-};
-
-describe('alert/weekly run(ctx)：ctx→options 映射（emit/now，补齐 daily 之外两 lane）', () => {
+describe('alert run(ctx)：ctx→options 映射（emit/now，补齐 daily 之外的 alert lane）', () => {
   // ponytail: 只跑 run(ctx, spyCore)（桩核心）验 ctx→options 映射半；生产路径 run(ctx) 单参→真实默认核心
   // 不在此端到端跑——test-no-prod-sends：测试环境加载 .env，真实 senders 会真发飞书/TG。默认核心绑定由类型
-  // 系统保证（core: typeof runAlertScan / runWeeklyReport），本用例覆盖映射半，两半合起来即全路径。
+  // 系统保证（core: typeof runAlertScan），本用例覆盖映射半，两半合起来即全路径。
   it('alert run(ctx) 映射：emit=ctx.emit、now=ctx.input.now', async () => {
     const now = new Date('2020-02-02T00:00:00Z');
     const ctx = makeLocalCtx({ trigger: 'alert-scan', input: { now } });
@@ -141,19 +128,6 @@ describe('alert/weekly run(ctx)：ctx→options 映射（emit/now，补齐 daily
       return okAlertResult;
     });
     expect(r).toBe(okAlertResult);
-    expect(captured?.emit).toBe(ctx.emit); // emit: ctx.emit
-    expect(captured?.now).toBe(now); // now: ctx.input.now
-  });
-
-  it('weekly run(ctx) 映射：emit=ctx.emit、now=ctx.input.now', async () => {
-    const now = new Date('2020-02-02T00:00:00Z');
-    const ctx = makeLocalCtx({ trigger: 'weekly-report', input: { now } });
-    let captured: RunWeeklyReportOptions | undefined;
-    const r = await runWeekly(ctx, async (opts: RunWeeklyReportOptions = {}) => {
-      captured = opts;
-      return okWeeklyResult;
-    });
-    expect(r).toBe(okWeeklyResult);
     expect(captured?.emit).toBe(ctx.emit); // emit: ctx.emit
     expect(captured?.now).toBe(now); // now: ctx.input.now
   });
@@ -174,23 +148,12 @@ describe('alert/weekly run(ctx)：ctx→options 映射（emit/now，补齐 daily
   });
 });
 
-describe('alert/weekly run(ctx)：抛错 → run.failed + re-throw（2.3/2.4）', () => {
+describe('alert run(ctx)：抛错 → run.failed + re-throw（2.3/2.4）', () => {
   it('alert 核心抛错 → emit run.failed 后 re-throw 原错误', async () => {
     const { ctx, kinds } = spyCtx();
     const boom = new Error('alert boom');
     await expect(
       runAlert(ctx, async () => {
-        throw boom;
-      }),
-    ).rejects.toBe(boom);
-    expect(kinds()).toContain('run.failed');
-  });
-
-  it('weekly 核心抛错 → emit run.failed 后 re-throw 原错误', async () => {
-    const { ctx, kinds } = spyCtx();
-    const boom = new Error('weekly boom');
-    await expect(
-      runWeekly(ctx, async () => {
         throw boom;
       }),
     ).rejects.toBe(boom);

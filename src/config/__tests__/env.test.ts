@@ -10,12 +10,8 @@
  * 纯函数测试，不触发 import 期的 `env` 单例校验（直接调用导出的 parseEnv）。
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-// 两个零依赖叶子模块（静态 import 不触发 env 单例校验）：展开器 = 避整点判据的共享文法；
-// DEFAULT_WEEKLY_CRON 是模块常量非 env（本体在叶子、weekly-queue re-export），直接 import
-// 断言真值——禁抄字面量副本（副本与真值静默漂移，守卫失效），也不经 weekly-queue（driver
-// top-level import bullmq，纯函数测试不宜拖入其依赖图）。
+// 零依赖叶子模块（静态 import 不触发 env 单例校验）：展开器 = 避整点判据的共享文法。
 import { expandCronMinutes } from '../cron-minutes.js';
-import { DEFAULT_WEEKLY_CRON } from '../weekly-cron.js';
 
 // env.ts 在 import 期会以 process.env 评估 `env` 单例（缺关键变量即 throw）。
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
@@ -237,7 +233,7 @@ describe('parseEnv —— 飞书 cron 默认避整点/半点（feishu-push / p0-
     }
   }
 
-  it('全部 4 条走飞书发送的定时 cron 默认值：分钟展开集 ∩ {0,30} = ∅（任一违反即失败）', () => {
+  it('全部 3 条走飞书发送的定时 cron 默认值：分钟展开集 ∩ {0,30} = ∅（任一违反即失败）', () => {
     const env = parseEnv(validEnv());
     // 覆盖清单 = 全部会触发飞书发送的定时 cron；新增飞书 cron 时 MUST 同步加进本清单
     // （清单是判据唯一的强制手段）。不发飞书的 4 条（MR_EVENT_REVIEW / MR_SCRAPE_HTTP /
@@ -245,7 +241,6 @@ describe('parseEnv —— 飞书 cron 默认避整点/半点（feishu-push / p0-
     const feishuCrons: Record<string, string> = {
       DAILY_DIGEST_CRON: env.DAILY_DIGEST_CRON, // {3}
       ALERT_SCAN_CRON: env.ALERT_SCAN_CRON, // {4,19,34,49}
-      DEFAULT_WEEKLY_CRON, // {7}（模块常量非 env，直接 import 真值）
       MR_PRICE_CURATION_CRON: env.MR_PRICE_CURATION_CRON, // {53}
     };
     for (const [name, cron] of Object.entries(feishuCrons)) {
@@ -395,7 +390,6 @@ describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-sem
     expect(env.SEMANTIC_DEDUP_HIGH).toBe(0.88);
     expect(env.SEMANTIC_DEDUP_LLM).toBe(0.82);
     expect(env.SEMANTIC_WINDOW_DAYS).toBe(14);
-    expect(env.SEMANTIC_DEDUP_ENABLED).toBe('on');
   });
 
   it('自定义合法值生效', () => {
@@ -407,7 +401,6 @@ describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-sem
       SEMANTIC_DEDUP_HIGH: '0.9',
       SEMANTIC_DEDUP_LLM: '0.8',
       SEMANTIC_WINDOW_DAYS: '7',
-      SEMANTIC_DEDUP_ENABLED: 'off',
     } as NodeJS.ProcessEnv;
     const env = parseEnv(source);
     expect(env.EMBEDDING_MODEL).toBe('text-embedding-3-large');
@@ -416,7 +409,6 @@ describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-sem
     expect(env.SEMANTIC_DEDUP_HIGH).toBe(0.9);
     expect(env.SEMANTIC_DEDUP_LLM).toBe(0.8);
     expect(env.SEMANTIC_WINDOW_DAYS).toBe(7);
-    expect(env.SEMANTIC_DEDUP_ENABLED).toBe('off');
   });
 
   it('EMBEDDING_TEXT_MAX_CHARS 非正（"0"）→ 报错', () => {
@@ -447,14 +439,6 @@ describe('parseEnv —— P3 语义去重 + 知识库 embedding 配置（add-sem
     const source = {
       ...validEnv(),
       SEMANTIC_WINDOW_DAYS: '-1',
-    } as NodeJS.ProcessEnv;
-    expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
-  });
-
-  it('SEMANTIC_DEDUP_ENABLED 非枚举值（"true"）→ 报错', () => {
-    const source = {
-      ...validEnv(),
-      SEMANTIC_DEDUP_ENABLED: 'true',
     } as NodeJS.ProcessEnv;
     expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
   });

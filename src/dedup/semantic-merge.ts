@@ -14,7 +14,7 @@
  *   `same_product` 本期**仅采集不消费**，绝不触发 ai_products 合并。
  * - **降级一律 = 不合并、不抛断**：embedding 失败（runEmbeddingBootstrap 内部已降级跳过）/ 检索异常 /
  *   LLM judge 降级 / 合并冲突——任一逐事件 catch、记日志、保留独立，绝不中止整批（欠合并安全）。
- * - `SEMANTIC_DEDUP_ENABLED` 开关由组 F 在 run-daily 层处理（本模块只导出函数，不读开关、不改 pipeline）。
+ * - 本模块只导出函数，不读任何开关、不改 pipeline（是否调用由 run-daily 层决定）。
  *
  * **合并对待判集的影响（迭代安全）**：一轮内待判事件可能在前序合并中被吞为 tombstone。逐事件处理前
  * 重读其当前 embedding/merged_into：若已成 tombstone（merged_into 非空）则跳过（已被合并、不再作查询

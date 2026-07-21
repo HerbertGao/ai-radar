@@ -344,127 +344,6 @@ export function buildFeishuCard(events: readonly SelectedEvent[]): FeishuRendere
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// 周报渲染（weekly-report 10.1，design D6）
-//
-// 周报幂等粒度是「一周一份」（target_id=iso_week，一个 push_record/周/通道），故 dispatcher 收到的
-// 待发集合是**单条**汇总条目（eventId=iso_week），其 `weeklyItems` 挂着该周入选的事件 + 产品明细。
-// 周报正文由本处 weekly 分支展开 weeklyItems 列表（复用各条已落库 headline_zh/summary_zh，不触 LLM）；
-// includedIds 恒为 `[iso_week]`——整份周报状态同生共死（成功整批 success / 失败整批 failed），与
-// 日报「单消息原子」口径一致，dispatcher 状态机不必改。
-// ──────────────────────────────────────────────────────────────────────────
-
-/** 周报汇总条目（dispatcher 输入）：在 SelectedEvent 基础上挂该周入选明细。仅 weekly target_type 用。 */
-export interface WeeklySelectedEvent extends SelectedEvent {
-  weeklyItems: {
-    events: SelectedEvent[];
-    products: SelectedEvent[];
-  };
-}
-
-/** 类型守卫：待发集合是否为「单条周报汇总条目」（带 weeklyItems）。 */
-function isWeeklySummary(
-  events: readonly SelectedEvent[],
-): events is readonly [WeeklySelectedEvent] {
-  return (
-    events.length === 1 &&
-    typeof (events[0] as Partial<WeeklySelectedEvent>).weeklyItems === 'object' &&
-    (events[0] as Partial<WeeklySelectedEvent>).weeklyItems !== null
-  );
-}
-
-/** 渲染一条「序号 标题 + 要点 + 链接」明细行的纯文本（转义前），供周报正文复用回退链。 */
-function weeklyLineText(e: SelectedEvent, idx: number): {
-  title: string;
-  headline: string | null;
-  url: string | null;
-} {
-  const rawTitle = e.representativeTitle?.trim() || '(无标题)';
-  const title = `${idx}. ${truncateByCodePoint(rawTitle, TITLE_MAX)}`;
-  const headline = resolveHeadlineText(e); // headline_zh → summary_zh 截断 → null（复用已落库摘要）。
-  const url = e.canonicalUrl?.trim();
-  return {
-    title,
-    headline,
-    url: url && url.length <= MAX_URL_LENGTH ? url : null,
-  };
-}
-
-/** 周报 Telegram 渲染（MarkdownV2）：分「本周要闻」「本周新品」两段展开列表。 */
-export function buildWeeklyTelegramMessage(
-  item: WeeklySelectedEvent,
-): { text: string; parseMode: 'MarkdownV2'; includedIds: string[] } {
-  const { events, products } = item.weeklyItems;
-  const lines: string[] = [
-    `*${escapeMarkdownV2(item.representativeTitle?.trim() || 'AI Radar 周报')}*`,
-  ];
-
-  const renderSection = (heading: string, list: readonly SelectedEvent[]) => {
-    if (list.length === 0) return;
-    lines.push('', `*${escapeMarkdownV2(heading)}*`);
-    list.forEach((e, i) => {
-      const { title, headline, url } = weeklyLineText(e, i + 1);
-      let block = escapeMarkdownV2(title);
-      if (headline) block += `\n${escapeMarkdownV2(headline)}`;
-      if (url) block += `\n[原文](${escapeMarkdownV2Url(url)})`;
-      lines.push(block);
-    });
-  };
-
-  renderSection('本周要闻', events);
-  renderSection('本周新品', products);
-
-  let text = lines.join('\n');
-  if (text.length > MAX_MESSAGE_LENGTH) {
-    // 极端兜底：整份周报超 Telegram 上限时按 code point 截断并标注（一份周报一条消息原子送达，
-    // 不拆多条；正常 Top N×2 段远低于上限）。
-    text = truncateByCodePoint(text, MAX_MESSAGE_LENGTH);
-  }
-  // includedIds 恒为 [iso_week]：整份周报作单条 target 原子送达。
-  return { text, parseMode: 'MarkdownV2', includedIds: [item.eventId] };
-}
-
-/** 周报飞书卡片渲染：两段（要闻/新品）div 列表，文字链跳转，不依赖回调。 */
-export function buildWeeklyFeishuCard(item: WeeklySelectedEvent): FeishuRendered {
-  const { events, products } = item.weeklyItems;
-  const elements: unknown[] = [];
-
-  const pushSection = (heading: string, list: readonly SelectedEvent[]) => {
-    if (list.length === 0) return;
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${escapeLarkMdText(heading)}**` } });
-    list.forEach((e, i) => {
-      const { title, headline, url } = weeklyLineText(e, i + 1);
-      const blockLines = [`**${escapeLarkMdText(title)}**`];
-      if (headline) blockLines.push(escapeLarkMdText(headline));
-      if (url) blockLines.push(`[原文](${escapeLarkMdUrl(url)})`);
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: blockLines.join('\n') } });
-    });
-  };
-
-  pushSection('本周要闻', events);
-  pushSection('本周新品', products);
-
-  const card: FeishuCard = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: item.representativeTitle?.trim() || 'AI Radar 周报',
-      },
-      template: 'turquoise',
-    },
-    elements,
-  };
-
-  return {
-    channel: 'feishu',
-    text: JSON.stringify({ card }),
-    parseMode: 'MarkdownV2',
-    includedIds: [item.eventId], // 整份周报作单条 target 原子送达。
-    card,
-  };
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // 实践锦囊渲染（add-ai-blogger-experience-mining，design D6，组 E 5.1）
 //
 // 一条「AI Radar 实践锦囊」= 若干经验卡片（target_type='experience'）。与要闻段的区别仅在
@@ -563,10 +442,6 @@ function buildExperienceFeishuCard(
  * 目标 channel 分派到对应渲染器。所有 channel 渲染结果都带 `includedIds`——dispatcher 据此
  * 仅对实际发出的事件改状态（截断者保持 pending），渲染细节由各 channel 自理、状态机口径统一。
  *
- * **周报分支**：待发集合若为「单条周报汇总条目」（带 weeklyItems，见 isWeeklySummary），按 channel
- * 走周报渲染器展开「本周要闻 + 本周新品」列表（复用各条已落库 headline/summary，不触 LLM）；
- * includedIds 恒为 [iso_week]，整份周报原子送达（dispatcher 状态机不变）。
- *
  * **实践锦囊分支**：`targetType='experience'` 时走经验卡片渲染器（标题=headline_zh、要点行=summary_zh、
  * 来源链接）——dispatcher 调用时传入 targetType，渲染分支不同但状态机口径与其它 target_type 一致。
  */
@@ -578,20 +453,14 @@ export function renderDigest(
   targetType: TargetType = TARGET_TYPE.event,
 ): RenderedDigest {
   const isExperience = targetType === TARGET_TYPE.experience;
-  const weekly = isWeeklySummary(events) ? events[0] : null;
   switch (channel) {
     case 'telegram': {
-      if (weekly) {
-        const { text, parseMode, includedIds } = buildWeeklyTelegramMessage(weekly);
-        return { channel: 'telegram', text, parseMode, includedIds };
-      }
       const { text, parseMode, includedIds } = isExperience
         ? buildExperienceMessage(events)
         : buildDigestMessage(events);
       return { channel: 'telegram', text, parseMode, includedIds };
     }
     case 'feishu':
-      if (weekly) return buildWeeklyFeishuCard(weekly);
       return isExperience
         ? buildExperienceFeishuCard(events)
         : buildFeishuCard(events);
@@ -606,13 +475,9 @@ export function renderDigest(
 // ──────────────────────────────────────────────────────────────────────────
 // 日报双段渲染（merge-products-into-daily-digest，design D3）
 //
-// 一条「AI Radar 每日情报」=「要闻段（events）+ 新品段（products）」。与 weekly 的区别：
-// weekly 是「整份一条 push_record（target_id=iso_week）」整份 truncateByCodePoint 截断，
-// includedIds 恒为 [iso_week]；本处是**逐条** event/product 各自幂等——截断采
-// buildDigestMessage 的「按块累加遇超限即停」语义，两段**共享** MAX_MESSAGE_LENGTH 预算，
-// 要闻段在前、新品段顺延（顺延者不进 includedIds）。
-//
-// 与 weekly 共享的只有**视觉分段排版**（标题块 + 列表），不复用 WeeklySelectedEvent 单条结构。
+// 一条「AI Radar 每日情报」=「要闻段（events）+ 新品段（products）」。**逐条** event/product 各自
+// 幂等——截断采 buildDigestMessage 的「按块累加遇超限即停」语义，两段**共享** MAX_MESSAGE_LENGTH
+// 预算，要闻段在前、新品段顺延（顺延者不进 includedIds）。
 //
 // 返回分段 includedIds（eventIncludedIds / productIncludedIds），让 dispatcher 只对「真发出的」
 // 按各自 target_type 置 success（否则被截断未发的产品误标 success → 永久漏推，design D3）。

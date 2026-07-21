@@ -27,7 +27,6 @@ process.env.PRODUCT_HUNT_TOKEN ||= 'test-ph-token';
 const { scoreUnscoredEvents, claimEventForJudging } = await import('../../agents/value-judge/score-events.js');
 const { selectTopN } = await import('../../selection/top-n.js');
 const { selectAlertCandidates } = await import('../../pipeline/alert-scan.js');
-const { selectWeeklyEvents, weeklyAnchor } = await import('../../pipeline/weekly-report.js');
 const { backfillPublishedAt } = await import('../../agents/published-at-inference/backfill.js');
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -148,20 +147,6 @@ describe.skipIf(!databaseUrl)('A. tombstone 读路径不可见', () => {
 
     const cands = await selectAlertCandidates(85, db!, ['telegram'], new Date(), 30, 50);
     const ids = cands.map((c) => c.eventId);
-    expect(ids).toContain(survivor);
-    expect(ids).not.toContain(tomb);
-  });
-
-  it('tombstone 不进周报候选（selectWeeklyEvents 排除）', async () => {
-    // 周报窗口 = 上周一..本周一；用 weeklyAnchor 反推一个落在窗口内的 first_seen_at。
-    const anchor = weeklyAnchor(new Date());
-    const inWindow = new Date(anchor.windowStart.getTime() + 24 * 3600 * 1000);
-    const ts = Date.now();
-    const survivor = await seedEvent({ dedupKey: `${SOURCE}-wk-surv-${ts}`, title: 'wk survivor', firstSeenAt: inWindow, importanceScore: 90, shouldPush: true });
-    const tomb = await seedEvent({ dedupKey: `${SOURCE}-wk-tomb-${ts}`, title: 'wk tombstone', firstSeenAt: inWindow, importanceScore: 95, shouldPush: true, mergedInto: survivor });
-
-    const events = await selectWeeklyEvents(anchor, db!, 50, 60);
-    const ids = events.map((e) => e.eventId);
     expect(ids).toContain(survivor);
     expect(ids).not.toContain(tomb);
   });
