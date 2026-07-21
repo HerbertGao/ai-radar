@@ -27,5 +27,5 @@
 
 - [x] 3.1 `git diff` 复核：**未触发超时、且无并发双 attempt 交错时**行为与今天等价。**注意两处有意的差异**：慢库被重新分类为故障；吸收态改变了既有并发倒写场景的最终状态。人眼动作，机械保证来自 2.6/2.7。
 - [x] 3.2 `npm run spec:validate harden-ops-alert-sink-db-timeout` 通过。
-- [ ] 3.3 提 PR；合并后 `/opsx:archive`。
+- [x] 3.3 提 PR；合并后 `/opsx:archive`。
 - [x] 3.4 **部署无动作**：无迁移、无新 env。
