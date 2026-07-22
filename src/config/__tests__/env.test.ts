@@ -12,6 +12,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 // 零依赖叶子模块（静态 import 不触发 env 单例校验）：展开器 = 避整点判据的共享文法。
 import { expandCronMinutes } from '../cron-minutes.js';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // env.ts 在 import 期会以 process.env 评估 `env` 单例（缺关键变量即 throw）。
 // 本套件只测纯函数 parseEnv，注入占位让 import 期单例校验通过后再动态取 parseEnv，
@@ -21,6 +26,8 @@ let isFeishuEnabled: typeof import('../env.js').isFeishuEnabled;
 let alertMinPublishedAt: typeof import('../env.js').alertMinPublishedAt;
 
 beforeAll(async () => {
+  // 本地试用该新特性的人若在 shell 里设了引导键，下面的占位块会整体失效、套件在 import 期崩。
+  delete process.env.AI_RADAR_ENV_FILE;
   process.env.DATABASE_URL ||= 'postgres://u:p@localhost:5432/test';
   process.env.REDIS_URL ||= 'redis://localhost:6379';
   process.env.LLM_API_KEY ||= 'test-key';
@@ -70,7 +77,7 @@ describe('parseEnv —— 关键变量缺失快速失败', () => {
     'TELEGRAM_BOT_TOKEN',
     'TELEGRAM_CHAT_ID',
     'PRODUCT_HUNT_TOKEN',
-  ])('缺失 %s 时抛错', (key) => {
+  ])('[场景:缺关键变量时启动即报错] 缺失 %s 时抛错', (key) => {
     const source = validEnv();
     delete source[key];
     expect(() => parseEnv(source)).toThrow(/环境配置校验失败/);
@@ -888,5 +895,262 @@ describe('parseEnv —— claim 回收阈值 T > F + A×L + W（unify-judge-stag
   it('未显式设置 → 默认 300000、通过', () => {
     const env = parseEnv(validEnv());
     expect(env.JUDGE_CLAIM_RECLAIM_MS).toBe(300000);
+  });
+});
+
+/**
+ * 自有 env 文件来源（add-env-file-overlay）。
+ *
+ * 两条路都要走：纯函数压 `loadEnvFile` / `resolveEnvSource`；**装配期行为压子进程**——
+ * 顶层 dotenv 的条件化只在 import 期发生，而 `vi.resetModules()` 不复位外部化 CJS 的副作用，
+ * 「换 DOTENV_CONFIG_PATH 再重载」对忠实实现不可达（写出来只会是假绿）。
+ */
+describe('自有 env 文件来源 —— 纯函数', () => {
+  let loadEnvFile: typeof import('../env.js').loadEnvFile;
+  let resolveEnvSource: typeof import('../env.js').resolveEnvSource;
+  let dir: string;
+
+  beforeAll(async () => {
+    ({ loadEnvFile, resolveEnvSource } = await import('../env.js'));
+    dir = mkdtempSync(join(tmpdir(), 'env-file-'));
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('[场景:引导键必须是绝对路径] 相对路径 → 抛错且信息含「绝对路径」', () => {
+    expect(() => loadEnvFile('relative/.env')).toThrow(/绝对路径/);
+  });
+
+  it('[场景:引导键指向的文件不存在时启动即失败] 文件不存在 → 抛出【包装过的】错误且含该路径', () => {
+    const missing = join(dir, 'nope.env');
+    // 断包装文案而不是路径正则，一箭三雕：
+    // ① 钉住 loadEnvFile 的 try/catch —— 删掉整块、或改成 `catch { return {} }`（读失败当空文件
+    //    继续）都会让这条红；此前这两个变异都能全绿通过，那整块生产代码是零覆盖的。
+    // ② toThrow(string) 本就是子串匹配，不必 new RegExp(路径)——后者在 tmpdir 含 + ( [ 时会误红
+    //    （macOS /var/folders 那段是 base64 派生，确会出现 +）。
+    expect(() => loadEnvFile(missing)).toThrow(/AI_RADAR_ENV_FILE 指向的文件无法读取/);
+    expect(() => loadEnvFile(missing)).toThrow(missing);
+  });
+
+  it('[场景:引导键指向符号链接时跟随到目标文件] 软链指普通文件 → 读到目标内容', () => {
+    const target = join(dir, 'link-target.env');
+    const link = join(dir, 'link.env');
+    writeFileSync(target, 'DATABASE_URL=postgres://via-symlink/db\n');
+    symlinkSync(target, link);
+    // 跟随语义：lstatSync 会判 isFile()===false，从而拒掉每一个 k8s/docker secret 挂载。
+    expect(loadEnvFile(link)).toEqual({ DATABASE_URL: 'postgres://via-symlink/db' });
+  });
+
+  it('[场景:自有文件缺必填键时启动即失败，而不是回落共享环境] 文件缺 DATABASE_URL 而 procEnv 有 → 抛错并指明该键', () => {
+    const f = join(dir, 'missing-db.env');
+    const { DATABASE_URL: _omit, ...rest } = validEnv();
+    writeFileSync(f, Object.entries(rest).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
+    // procEnv 备齐【全部】必填键：任何「文件缺某键就从 procEnv 补」的实现都会让它通过而漏红。
+    expect(() => parseEnv(resolveEnvSource(f, validEnv()))).toThrow(/DATABASE_URL/);
+  });
+
+  it('[场景:读取自有文件不污染共享环境] 读文件前后 process.env 逐键不变', () => {
+    const f = join(dir, 'a.env');
+    writeFileSync(f, 'SOME_KEY_XYZ=v\n');
+    // 比对摘要而不是原文：点燃这条断言的正是「有人让 loadEnvFile 写了 process.env」，
+    // 而此刻 process.env 里有真 .env（套件 beforeAll 已 import 过 env.ts）。仓库是 public，
+    // 失败输出常被贴进 PR / issue，整串打印等于泄漏 LLM_API_KEY / BOT_TOKEN / 带口令的 DSN。
+    const digest = () => createHash('sha256').update(JSON.stringify(process.env)).digest('hex');
+    const before = digest();
+    expect(loadEnvFile(f)).toEqual({ SOME_KEY_XYZ: 'v' });
+    expect(digest()).toBe(before);
+  });
+
+  it('[场景:设了引导键时只读自有文件，不继承共享环境] 返回的【就是】文件内容，与 procEnv 无任何叠加', () => {
+    const f = join(dir, 'b.env');
+    writeFileSync(f, 'DATABASE_URL=postgres://own/db\n');
+    // 深度相等，不是「不含某个键」——后者挡不住选择性叠加。
+    expect(resolveEnvSource(f, { LLM_BASE_URL: 'sibling', PATH: '/x' })).toEqual(loadEnvFile(f));
+  });
+
+  it('[场景:空值的引导键等同未设] boot 为 undefined 时原样返回传入的 procEnv', () => {
+    const procEnv = { A: '1' } as NodeJS.ProcessEnv;
+    expect(resolveEnvSource(undefined, procEnv)).toBe(procEnv);
+  });
+});
+
+/**
+ * 自有 env 文件来源 —— 装配期（子进程）。
+ *
+ * 形态钉死：直接跑 `node_modules/.bin/tsx`，**不用 `npx`**——从临时 cwd 解析不到 tsx 会转去
+ * registry 安装（联网、慢，且自己往 stdout 打字，会打掉下面的 stdout 断言）。
+ * `tsx -e` 走 cjs、**不支持顶层 await**，故探针一律用 `.then()`。
+ * 断言载荷走 **stderr**，stdout 留给「必须洁净」那条。
+ */
+describe('自有 env 文件来源 —— 装配期（子进程）', () => {
+  const repoRoot = join(__dirname, '..', '..', '..');
+  const tsx = join(repoRoot, 'node_modules', '.bin', 'tsx');
+  const envTs = join(repoRoot, 'src', 'config', 'env.ts');
+  /** 自足 fixture：7 个必填键 + 满足全部跨字段 superRefine。 */
+  const SELF_SUFFICIENT = [
+    'DATABASE_URL=postgres://own:own@own-host:5432/own',
+    'REDIS_URL=redis://own-host:6379',
+    'LLM_API_KEY=own-key',
+    'LLM_MODEL=own/model',
+    'TELEGRAM_BOT_TOKEN=111:own',
+    'TELEGRAM_CHAT_ID=-100111',
+    'PRODUCT_HUNT_TOKEN=own-ph',
+  ].join('\n');
+
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'env-boot-'));
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  function probe(cwd: string, env: NodeJS.ProcessEnv, expr: string) {
+    const script = `import(${JSON.stringify(envTs)}).then(m => { process.stderr.write(String(${expr})); }).catch(e => { process.stderr.write('THREW:' + e.message); process.exitCode = 1; });`;
+    return spawnSync(tsx, ['-e', script], {
+      cwd,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, VITEST: '1', ...env },
+      encoding: 'utf8',
+      // spawnSync 阻塞事件循环，vitest 的 it(…, 60_000) 抢占不了它——防挂死必须落在这里。
+      // VITEST 上面一并注入：将来 env.ts 若长出带出口副作用的 import，子进程不会以生产态跑。
+      timeout: 30_000,
+    });
+  }
+
+  it('[场景:设了引导键时不加载工作目录 `.env`] 端到端：唯一来源 + cwd .env 未被灌入', () => {
+    const own = join(dir, 'own.env');
+    writeFileSync(own, SELF_SUFFICIENT + '\n');
+    // cwd 必须有一份带 sentinel 的 .env：没有它，删掉 `if (!bootPath)` 也无可观测差异，
+    // 「设了引导键就不加载 cwd .env」这条就没有任何机械证明。
+    const sub = mkdtempSync(join(dir, 'set-'));
+    writeFileSync(join(sub, '.env'), 'CWD_DOTENV_SENTINEL=leaked\n');
+    // 兄弟值放进【子进程自己的 process.env】。放 cwd .env 是无效的判别点——
+    // 设了引导键时 dotenv 根本不跑，那些值本就进不来，断言会结构上不可能红。
+    const r = probe(sub, {
+      AI_RADAR_ENV_FILE: own,
+      LLM_BASE_URL: 'https://SIBLING.example/v1',
+      DATABASE_URL: 'postgres://SIBLING/db',
+    }, `m.env.LLM_BASE_URL + '|' + m.env.DATABASE_URL + '|' + (process.env.LLM_MODEL === 'own/model') + '|' + (process.env.CWD_DOTENV_SENTINEL ?? 'absent')`);
+
+    expect(r.status).toBe(0);
+    const [baseUrl, dbUrl, polluted, sentinel] = r.stderr.split('|');
+    expect(baseUrl).toBe('https://openrouter.ai/api/v1'); // schema 默认，不是兄弟值
+    expect(dbUrl).toBe('postgres://own:own@own-host:5432/own'); // 文件里那份
+    expect(polluted).toBe('false'); // process.env 未被写入文件里的键
+    expect(sentinel).toBe('absent'); // 顶层 dotenv 未跑 ⇒ cwd .env 未被灌进共享环境
+  }, 60_000);
+
+  it('[场景:引导键指向非普通文件时在读取之前失败] FIFO → 有界失败，不是挂死', () => {
+    // FIFO 而非目录：目录会被 readFileSync 自己以 EISDIR 抛掉，删了 statSync 守卫也照绿。
+    // 但 FIFO 无写端时 readFileSync 会**同步永久阻塞**，而 vitest 的 it(…, 60_000) 是定时器、
+    // 抢占不了同步 syscall——这条若留在同进程里，删守卫的后果不是变红，是 runner 无声挂到 CI
+    // job 超时、reporter 不指认任何用例、afterAll 不跑（本轮 review 真实发生过一次）。
+    // 故必须走 probe()：挂死被 spawnSync 的 timeout 收敛成 30s 内的红。
+    const fifo = join(dir, 'fifo');
+    execFileSync('mkfifo', [fifo]);
+    const r = probe(dir, { AI_RADAR_ENV_FILE: fifo }, `m.env.DATABASE_URL`);
+
+    expect(r.signal).toBeNull(); // 被 timeout 杀掉 ⇒ 守卫没拦住 ⇒ 红
+    expect(r.stderr).toContain('普通文件');
+    expect(r.status).not.toBe(0);
+  }, 60_000);
+
+  it('[场景:未设引导键时行为与本变更前一致] 加载 cwd .env，进程环境仍优先，且 stdout 洁净', () => {
+    const sub = mkdtempSync(join(dir, 'unset-'));
+    writeFileSync(join(sub, '.env'), SELF_SUFFICIENT + '\nLLM_BASE_URL=https://from-cwd.example/v1\n');
+    // 场景承诺的是「取值来源【与优先级】不变」。只断言「.env 的值读到了」证不到优先级那半：
+    // 改成 dotenv.config({ override: true, quiet: true }) 时 banner 照样抑制、值照样读到，全绿。
+    // 优先级反了的生产后果是真的：compose 的 environment: 覆盖层会被 .env 里的 localhost 顶掉。
+    const r = probe(sub, { LLM_BASE_URL: 'https://from-proc.example/v1' },
+      `m.env.LLM_BASE_URL + '|' + m.env.DATABASE_URL`);
+
+    expect(r.status).toBe(0);
+    const [baseUrl, dbUrl] = r.stderr.split('|');
+    expect(baseUrl).toBe('https://from-proc.example/v1'); // 进程环境赢（dotenv 不覆盖已存在键）
+    expect(dbUrl).toBe('postgres://own:own@own-host:5432/own'); // cwd .env 确实被加载了
+    expect(r.stdout).toBe(''); // 裸调 dotenv.config() 会在此处打 banner ⇒ 必红
+  }, 60_000);
+
+  it('[场景:引导键只认进程环境，写在 `.env` 里无效] 走「未设」路径，不出现半生效态', () => {
+    const sub = mkdtempSync(join(dir, 'viadotenv-'));
+    const own = join(dir, 'own.env');
+    writeFileSync(own, SELF_SUFFICIENT + '\n');
+    writeFileSync(
+      join(sub, '.env'),
+      SELF_SUFFICIENT.replace('postgres://own:own@own-host:5432/own', 'postgres://cwd/db') +
+        `\nAI_RADAR_ENV_FILE=${own}\n`,
+    );
+    const r = probe(sub, {}, `m.env.DATABASE_URL`);
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('postgres://cwd/db'); // 取 cwd .env，未切到 own.env
+  }, 60_000);
+
+  it('[场景:空值的引导键等同未设] 纯空白 → 走未设路径', () => {
+    const sub = mkdtempSync(join(dir, 'blank-'));
+    writeFileSync(join(sub, '.env'), SELF_SUFFICIENT + '\n');
+    const r = probe(sub, { AI_RADAR_ENV_FILE: '   ' }, `m.env.DATABASE_URL`);
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('postgres://own:own@own-host:5432/own');
+  }, 60_000);
+
+  it('[场景:被进程内托管时，配置不合法只让本应用失败] 加载失败 → 非零退出，不回落共享环境', () => {
+    const r = probe(dir, {
+      AI_RADAR_ENV_FILE: join(dir, 'missing.env'),
+      DATABASE_URL: 'postgres://SIBLING/db',
+      REDIS_URL: 'redis://s:6379', LLM_API_KEY: 'k', LLM_MODEL: 'm',
+      TELEGRAM_BOT_TOKEN: '1:1', TELEGRAM_CHAT_ID: '-1', PRODUCT_HUNT_TOKEN: 'p',
+    }, `m.env.DATABASE_URL`);
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('THREW');
+  }, 60_000);
+
+  it('[场景:被进程内托管时，配置不合法只让本应用失败] 配置加载路径不得出现 process.exit', () => {
+    const src = readFileSync(envTs, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+    expect(src).not.toMatch(/process\s*\.\s*exit/);
+  });
+});
+
+/**
+ * 元用例：spec 的 `#### 场景:` 表 ↔ 本文件用例标题里的 `[场景:X]` 标签，双向覆盖。
+ *
+ * 存在的理由：此前每一条承重性质都要等某个 reviewer 单独指着它才获得机械证明，而下一轮总能再点出
+ * 没被点过的——判据「不存在能逃逸的变异」是无界的、永不满足。换成「spec 的场景表」后判据有界可数。
+ *
+ * **它证明的是标签存在，不是用例会红**：静态文本检查够不到后者（掏空成 `expect(1).toBe(1)` 照绿）。
+ * 变异测试因此降级为编写手法，不再是通过条件。下面那条 `.skip` 断言补的是唯一能整块归零覆盖的洞。
+ *
+ * 约束：场景标签必须住在**本文件**（`bound` 只扫 `__filename`）。加了 scenario 没写用例 ⇒ 红；
+ * 写了用例而 scenario 里没有 ⇒ 也红（逼「只活在代码注释里的承诺」要么进 scenario、要么删掉声称）。
+ */
+describe('spec 场景 ↔ 用例 双向覆盖', () => {
+  it('本变更 requirement 的每条场景都至少被一条用例标签绑定，且无孤儿标签', () => {
+    const specPath = join(
+      __dirname, '..', '..', '..',
+      // 归档时该 delta 会并入主规范并搬走：那时把此常量指向 openspec/specs/platform-foundation/spec.md。
+      // 切片不依赖邻居 requirement 的名字，故除此常量外无需再改（早前按「下一条具名 requirement」
+      // 切，在主规范里两者之间夹着 2 条无关 requirement / 5 条场景 ⇒ 归档后会红成「你漏写了 5 条用例」）。
+      'openspec/changes/add-env-file-overlay/specs/platform-foundation/spec.md',
+    );
+    const spec = readFileSync(specPath, 'utf8');
+
+    // 只取本变更负责的那条 requirement 的场景，边界是「下一条 `### ` 或文件尾」。
+    const section = spec.match(/### 需求:环境配置校验[\s\S]*?(?=\n### |$)/)?.[0] ?? '';
+    expect(section).not.toBe(''); // requirement 被改名 ⇒ 这里就红，不会静默退化成空集
+    const declared = new Set(
+      [...section.matchAll(/^#### 场景:(.+)$/gm)].map((m) => m[1]!.trim()),
+    );
+    const self = readFileSync(__filename, 'utf8');
+    const bound = new Set(
+      [...self.matchAll(/it(?:\.each\([\s\S]*?\))?\(\s*'\[场景:(.+?)\]/g)].map((m) => m[1]!.trim()),
+    );
+
+    expect([...declared].filter((x) => !bound.has(x))).toEqual([]); // 场景无用例
+    expect([...bound].filter((x) => !declared.has(x))).toEqual([]); // 标签无场景
+    // 标签存在 ≠ 用例真跑：单条用例加跳过修饰符会让标签一起消失（自然变红），但整块 describe 加
+    // 上去时标签仍在源码里 ⇒ 上面两条照绿而覆盖已归零。本文件禁用这三个修饰符，堵掉这个洞。
+    // （正则字面量自身不自命中：交替语法里 `it` 后面跟的是 `)` 而不是字面点号。）
+    expect(self).not.toMatch(/\b(?:describe|it)\.(?:skip|todo|only)\b/);
   });
 });
