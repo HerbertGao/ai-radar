@@ -1128,10 +1128,9 @@ describe('spec 场景 ↔ 用例 双向覆盖', () => {
   it('本变更 requirement 的每条场景都至少被一条用例标签绑定，且无孤儿标签', () => {
     const specPath = join(
       __dirname, '..', '..', '..',
-      // 归档时该 delta 会并入主规范并搬走：那时把此常量指向 openspec/specs/platform-foundation/spec.md。
-      // 切片不依赖邻居 requirement 的名字，故除此常量外无需再改（早前按「下一条具名 requirement」
-      // 切，在主规范里两者之间夹着 2 条无关 requirement / 5 条场景 ⇒ 归档后会红成「你漏写了 5 条用例」）。
-      'openspec/changes/add-env-file-overlay/specs/platform-foundation/spec.md',
+      // 已归档：本变更的 delta 已并入主规范。切片正则「到下一条 `### ` 或文件尾」不依赖邻居
+      // requirement 的名字，故主规范里此 requirement 后面紧跟 2 条无关 requirement 也切得干净。
+      'openspec/specs/platform-foundation/spec.md',
     );
     const spec = readFileSync(specPath, 'utf8');
 

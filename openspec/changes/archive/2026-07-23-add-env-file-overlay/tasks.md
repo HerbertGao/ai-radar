@@ -43,5 +43,5 @@
 - [x] 4.1 `git diff` 复核：未设引导键时无行为差异。3.7 钉住取值与 stdout；**加载时序的等价性依赖一个未被断言钉住的前提**——被提升的静态 import 均不在求值期读 `process.env`（今日人工核过：zod / dotenv / cron-minutes 零依赖、collectors/types 是 `import type`）。工作区无探针遗留文件。
 - [x] 4.2 `npm run spec:validate add-env-file-overlay` 通过。
 - [x] 4.3 **同步 `docs/hangar-migration-plan-a.md`**：它仍写着被本变更否决的叠加式 `{...process.env, ...自己那份 .env}`，改为「文件即唯一来源」并指向本 requirement。（一行文档修正；留着不改等于归档后仍有一份权威文档教人用错做法。）
-- [ ] 4.4 提 PR；合并后 `/opsx:archive`。
-- [ ] 4.5 **部署无动作**（引导键可选、未设即现状；无新增必填 env、无迁移、无新依赖）。启用托管前须**逐条核对** proposal Impact 的前置清单（不在此重复誊抄）。
+- [x] 4.4 提 PR（#103，已合并）；归档时元用例路径常量已改指主规范。
+- [x] 4.5 **部署无动作**（引导键可选、未设即现状；无新增必填 env、无迁移、无新依赖）。启用托管前须**逐条核对** proposal Impact 的前置清单（不在此重复誊抄）。
