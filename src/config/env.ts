@@ -1,8 +1,32 @@
-// 先加载 .env（若存在）到 process.env，再做下方校验。
-// dotenv 默认不覆盖已存在的 process.env，故 CI / shell 注入的变量仍优先，
-// 本地 `cp .env.example .env` 填好后 `npm run dev` 等脚本即可读到（修复 README 快速开始）。
-import 'dotenv/config';
+// 取值来源有两条路，由引导键 AI_RADAR_ENV_FILE 二选一。权威表述在主规范
+// platform-foundation「环境配置校验」，此处只写代码做什么、不复制论证。
+//
+// **未设引导键（默认）**：加载工作目录 .env 到 process.env，再做下方校验。dotenv 默认不覆盖已存在
+// 的 process.env，故 CI / shell 注入的变量仍优先；本地 `cp .env.example .env` 填好后即可读到。
+// **设了引导键**：该文件是取值的唯一来源，process.env 一个键都不参与（含 CI / shell 注入的），
+// 且不加载工作目录 .env、不写回 process.env。
+import { createRequire } from 'node:module';
+import { statSync, readFileSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
+import { parse as parseDotenv } from 'dotenv';
 import { z } from 'zod';
+
+/**
+ * 引导键，**在任何 dotenv 之前取一次，全模块只此一次**。
+ *
+ * 判据是「本行求值时它在不在 process.env 里」，不是「它写在哪个文件里」：写进工作目录 .env 在
+ * `npm run dev` 下无效（此处已先读完），而 compose 的 `env_file:` 在 node 启动前就把它注入为真
+ * 进程环境变量、必然早于本行，是生效的。
+ *
+ * 二次读取会坏：那时 dotenv 已经跑过，.env 里若有同名键就会先污染共享环境、再切换来源——
+ * 两个决策各生效一半，正是本机制要消灭的形态。
+ */
+const bootPath = process.env.AI_RADAR_ENV_FILE?.trim() || undefined;
+
+// 未设引导键时加载**同一个模块**（`dotenv/config`），而不是改调 dotenv.config() 自拼选项：
+// 该模块经 cli-options 注入 quiet:'true'，手抄一份会漏掉它、每次启动多打一行 stdout banner，
+// 污染把 stdout 当数据通道的 CLI（如 kb:search）。等价性由「加载同一个模块」保证。
+if (!bootPath) createRequire(import.meta.url)('dotenv/config');
 // cron 分钟展开器（零依赖叶子 cron-minutes.ts，与 env.test.ts 的避整点判据同一份文法，绝不抄第二份）：
 // 本文件只消费「cron 周期计算」这一个生产路径（告警侧判分预算 superRefine，p0-alert-lane A5.1c）。
 import { expandCronMinutes } from './cron-minutes.js';
@@ -824,10 +848,60 @@ export function parseEnv(source: NodeJS.ProcessEnv): Env {
 }
 
 /**
- * 类型化、已校验的 env。其他模块直接 `import { env }`。
- * 模块首次被 import 时即执行校验——缺关键变量则在启动阶段立即 throw。
+ * 读一份自有 env 文件作为取值来源。**纯函数：只返回解析结果，绝不写 `process.env`。**
+ *
+ * `statSync` 必须先于 `readFileSync`：FIFO 上无写端时 `readFileSync` 会**永久挂起**（不抛、不超时）。
+ * 用 `statSync` 而非 `lstatSync` 是有意的——它跟随符号链接，而 secret 挂载普遍是 symlink。
+ *
+ * 不存在 / 不可读 / 非普通文件一律抛，**绝不回落 `process.env`**：防御性回落会把「引导键指错时
+ * 启动即失败」这条缓解整个抹掉，退回静默走错目标。
  */
-export const env: Env = parseEnv(process.env);
+export function loadEnvFile(absPath: string): NodeJS.ProcessEnv {
+  if (!isAbsolute(absPath)) {
+    throw new Error(
+      `AI_RADAR_ENV_FILE 必须是绝对路径（收到：${absPath}）——托管态下工作目录属于宿主，` +
+        `相对路径的解析结果不受本应用控制。`,
+    );
+  }
+  try {
+    if (!statSync(absPath).isFile()) {
+      throw new Error(`AI_RADAR_ENV_FILE 指向的不是普通文件：${absPath}`);
+    }
+    return parseDotenv(readFileSync(absPath));
+  } catch (err) {
+    // 裸的 ENOENT / EACCES 只给路径，看不出是哪个旋钮设的——托管态下这是 pilot 被 brick 前唯一的线索。
+    // 判据用 `code` 而不是消息子串：fs 错误必带 code，上面两条自造的 Error 不带。用子串判会在
+    // 路径本身含该键名时翻转（前置③ 要求路径含应用标识，`/etc/hangar/…/AI_RADAR_ENV_FILE` 在预期分布内），
+    // 恰好在最需要线索时退回裸 ENOENT；解析错误也会被误贴成「无法读取」。
+    if (err instanceof Error && 'code' in err) {
+      throw new Error(`AI_RADAR_ENV_FILE 指向的文件无法读取：${err.message}`, { cause: err });
+    }
+    throw err;
+  }
+}
+
+/**
+ * 取值来源选择。**`boot` 由调用方给，本函数绝不自己去读引导键**——自读版会在装配处二次读活的
+ * `process.env`（那时 dotenv 已跑过），产出上面 `bootPath` 注释里说的半生效态。
+ *
+ * 这一行是「文件即唯一来源」的**唯一杠杆点**，也是唯一需要机械证明的性质：设了引导键时返回的
+ * 必须**就是** `loadEnvFile` 的结果，不能与 `procEnv` 有任何叠加。
+ */
+export function resolveEnvSource(
+  boot: string | undefined,
+  procEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return boot ? loadEnvFile(boot) : procEnv;
+}
+
+/**
+ * 类型化、已校验的 env。其他模块直接 `import { env }`。
+ * 模块首次被 import 时即执行校验——配置不合法则在启动阶段立即 throw。
+ *
+ * **绝不 `process.exit`**：同进程托管下那会拖垮兄弟应用。抛错在独立进程下兑现为非零退出，
+ * 在托管下兑现为 `await import()` reject。
+ */
+export const env: Env = parseEnv(resolveEnvSource(bootPath, process.env));
 
 /**
  * 飞书通道是否已配置（enabled）。已校验完整性（superRefine 保证不会半配），
